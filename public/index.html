@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#1a1d24">
+  <title>POS Restaurante</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="banner"></div>
+  <header id="cabecera" class="oculto">
+    <span id="titulo-app">POS</span>
+    <span id="usuario-activo"></span>
+    <button id="btn-red" class="btn-mini" title="Dirección para conectar teléfonos">📶</button>
+    <button id="btn-salir" class="btn-mini">Cambiar usuario</button>
+  </header>
+  <main id="vista"></main>
+  <nav id="tabs" class="oculto"></nav>
+  <div id="toast"></div>
+  <script src="/vendor/qrcode.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

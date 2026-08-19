@@ -1,0 +1,14 @@
+# Dependencias
+node_modules/
+
+# Datos del restaurante (ventas, usuarios, PINs): NUNCA subir al repositorio
+data/
+
+# Registros y archivos temporales
+*.log
+*.tmp
+*.bin
+
+# Sistema operativo
+Thumbs.db
+Desktop.ini
