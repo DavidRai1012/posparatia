@@ -25,7 +25,7 @@ const state = {
   jornada: null, jornadaCerrada: false,
   vista: 'tomar',
   // toma de pedido: 3 pantallas (entrada→proteína→extras); cada toque agrega 1 unidad
-  sel: { entrada: [], proteina: [], extra: [] }, uidSeq: 1,
+  sel: { entrada: [], proteina: [], bebida: [], extra: [] }, uidSeq: 1,
   notas: {},                                // uid de proteína -> {chips, custom} (nota del almuerzo)
   notaExtras: { chips: [], custom: '' },    // nota del bloque de extras sueltos
   pantalla: 'entrada', itemAbierto: null, ticketAbierto: false,
@@ -296,7 +296,10 @@ function renderVista() {
 // y el extra i; los extras que sobren van en su propio bloque al final.
 
 function claveListaDeTipo(tipo) {
-  return tipo === 'entrada' ? 'entrada' : tipo === 'extra' ? 'extra' : 'proteina';
+  if (tipo === 'entrada') return 'entrada';
+  if (tipo === 'bebida') return 'bebida';
+  if (tipo === 'extra') return 'extra';
+  return 'proteina';
 }
 
 function platoDe(id) { return state.platos.find(p => p.id === id); }
@@ -313,11 +316,16 @@ function totalCarrito() {
 // Regla acordada: el ticket solo se habilita con SOLO extras, o con almuerzos
 // completos (misma cantidad de entradas y proteinas).
 function estadoTicket() {
-  const nE = state.sel.entrada.length, nP = state.sel.proteina.length, nX = state.sel.extra.length;
-  if (nE === 0 && nP === 0 && nX === 0) return { ok: false, motivo: 'Toque los platos para armar el pedido' };
-  if (nE === 0 && nP === 0) return { ok: true, modo: 'extras' };
-  if (nE === nP) return { ok: true, modo: 'almuerzos' };
-  return { ok: false, motivo: `Almuerzos incompletos: ${nE} entrada(s) y ${nP} proteína(s)` };
+  const nE = state.sel.entrada.length, nP = state.sel.proteina.length,
+        nB = state.sel.bebida.length, nX = state.sel.extra.length;
+  if (!nE && !nP && !nB && !nX) return { ok: false, motivo: 'Toque los platos para armar el pedido' };
+  if (!nE && !nP) {
+    if (nB) return { ok: false, motivo: 'Las bebidas incluidas van con un almuerzo (para vender bebida sola, créela como Extra)' };
+    return { ok: true, modo: 'extras' };
+  }
+  if (nE !== nP) return { ok: false, motivo: `Almuerzos incompletos: ${nE} entrada(s) y ${nP} proteína(s)` };
+  if (nB > nE) return { ok: false, motivo: `Hay ${nB} bebida(s) incluida(s) para solo ${nE} almuerzo(s)` };
+  return { ok: true, modo: 'almuerzos' };
 }
 
 function derivarBloques() {
@@ -325,6 +333,7 @@ function derivarBloques() {
   const bloques = [];
   for (let i = 0; i < n; i++) {
     const items = [state.sel.entrada[i], state.sel.proteina[i]];
+    if (state.sel.bebida[i]) items.push(state.sel.bebida[i]);
     if (state.sel.extra[i]) items.push(state.sel.extra[i]);
     bloques.push({ items, proteinaUid: state.sel.proteina[i].uid });
   }
@@ -367,25 +376,23 @@ function beep(frec, dur) {
 const PANTALLAS = {
   entrada: { paso: '1', titulo: 'Entradas', secciones: [['entrada', null]] },
   proteina: { paso: '2', titulo: 'Proteínas', secciones: [['proteina_dia', 'Del día'], ['proteina_especial', 'Especiales']] },
-  extras: { paso: '3', titulo: 'Extras', secciones: [['extra', null]] }
+  extras: { paso: '3', titulo: 'Bebida y extras', secciones: [['bebida', 'Bebida incluida (del almuerzo)'], ['extra', 'Extras (se cobran aparte)']] }
 };
 
 function renderTomar() {
   if (state.ticketAbierto) return renderTicket();
   const def = PANTALLAS[state.pantalla];
-  const lista = state.pantalla === 'entrada' ? 'entrada' : state.pantalla === 'extras' ? 'extra' : 'proteina';
   const est = estadoTicket();
-  const nE = state.sel.entrada.length, nP = state.sel.proteina.length, nX = state.sel.extra.length;
+  const nE = state.sel.entrada.length, nP = state.sel.proteina.length,
+        nB = state.sel.bebida.length, nX = state.sel.extra.length;
 
   const filaPlato = (p) => {
-    const enSel = state.sel[lista].filter(it => it.platoId === p.id).length;
-    const agotado = !p.disponible;
+    const enSel = state.sel[claveListaDeTipo(p.tipo)].filter(it => it.platoId === p.id).length;
     return `
     <div class="pr-wrap">
-      <button class="plato-row ${agotado ? 'agotado' : ''} ${enSel ? 'en-orden' : ''}"
-              data-plato="${p.id}" ${agotado ? 'disabled' : ''}>
+      <button class="plato-row ${enSel ? 'en-orden' : ''}" data-plato="${p.id}">
         <span class="pr-nombre">${esc(p.nombre)}</span>
-        ${agotado ? '<span class="pb-agotado">AGOTADO</span>' : `<span class="pr-precio">${p.precio ? fmt(p.precio) : ''}</span>`}
+        <span class="pr-precio">${p.precio ? fmt(p.precio) : ''}</span>
         ${enSel ? `<span class="pb-badge">${enSel}</span>` : ''}
       </button>
       ${enSel ? `<button class="pr-menos" data-menos-plato="${p.id}">−</button>` : ''}
@@ -398,10 +405,10 @@ function renderTomar() {
       <button class="btn-mini" id="btn-cancelar-edicion">Descartar</button></div>` : ''}
     <div class="paso-titulo">
       <span class="paso-num">${def.paso}</span> ${def.titulo}
-      <span class="der resumen-sel">🥣${nE} · 🍗${nP} · 🧃${nX}</span>
+      <span class="der resumen-sel">🥣${nE} · 🍗${nP} · 🥤${nB} · 🧃${nX}</span>
     </div>
     ${def.secciones.map(([tipo, subtitulo]) => {
-      const platos = state.platos.filter(p => p.tipo === tipo);
+      const platos = state.platos.filter(p => p.tipo === tipo && p.disponible);
       if (!platos.length) return '';
       return `${subtitulo ? `<div class="cat-titulo">${esc(subtitulo)}</div>` : ''}
         <div class="lista-platos">${platos.map(filaPlato).join('')}</div>`;
@@ -415,7 +422,7 @@ function renderTomar() {
         <button class="btn btn-nav" id="btn-ir-proteina">Proteínas →</button>` : ''}
       ${state.pantalla === 'proteina' ? `
         <button class="btn gris btn-nav" id="btn-ir-entrada">← Entradas</button>
-        <button class="btn btn-nav" id="btn-ir-extras">Extras →</button>` : ''}
+        <button class="btn btn-nav" id="btn-ir-extras">Bebida y extras →</button>` : ''}
       ${state.pantalla === 'extras' ? `
         <button class="btn gris btn-nav" id="btn-volver-proteina">← Anterior</button>
         <button class="btn ok btn-nav ${est.ok ? '' : 'nav-bloqueado'}" id="btn-ver-ticket">
@@ -424,16 +431,20 @@ function renderTomar() {
   </div>`;
 
   $('#vista').querySelectorAll('[data-plato]').forEach(b => b.onclick = () => {
-    state.sel[lista].push({ uid: state.uidSeq++, platoId: Number(b.dataset.plato) });
+    const plato = platoDe(Number(b.dataset.plato));
+    if (!plato) return;
+    state.sel[claveListaDeTipo(plato.tipo)].push({ uid: state.uidSeq++, platoId: plato.id });
     vibrar(25); renderTomar();
   });
   $('#vista').querySelectorAll('[data-menos-plato]').forEach(b => b.onclick = () => {
-    const id = Number(b.dataset.menosPlato);
-    // quitar la ULTIMA unidad de ese plato en la lista de esta pantalla
-    for (let i = state.sel[lista].length - 1; i >= 0; i--) {
-      if (state.sel[lista][i].platoId === id) {
-        delete state.notas[state.sel[lista][i].uid];
-        state.sel[lista].splice(i, 1);
+    const plato = platoDe(Number(b.dataset.menosPlato));
+    if (!plato) return;
+    const lista = state.sel[claveListaDeTipo(plato.tipo)];
+    // quitar la ULTIMA unidad de ese plato
+    for (let i = lista.length - 1; i >= 0; i--) {
+      if (lista[i].platoId === plato.id) {
+        delete state.notas[lista[i].uid];
+        lista.splice(i, 1);
         break;
       }
     }
@@ -581,7 +592,7 @@ function renderTicket() {
     delete state.notas[uid];
     state.itemAbierto = null;
     vibrar(25);
-    const quedan = state.sel.entrada.length + state.sel.proteina.length + state.sel.extra.length;
+    const quedan = state.sel.entrada.length + state.sel.proteina.length + state.sel.bebida.length + state.sel.extra.length;
     if (!quedan) { state.ticketAbierto = false; state.pantalla = 'entrada'; renderTomar(); }
     else if (!estadoTicket().ok) {
       state.ticketAbierto = false; state.pantalla = 'extras';
@@ -621,7 +632,7 @@ function actualizarVueltasTicket() {
 }
 
 function limpiarFormulario() {
-  state.sel = { entrada: [], proteina: [], extra: [] };
+  state.sel = { entrada: [], proteina: [], bebida: [], extra: [] };
   state.notas = {}; state.notaExtras = { chips: [], custom: '' };
   state.pantalla = 'entrada'; state.itemAbierto = null; state.ticketAbierto = false;
   state.comensal = ''; state.tipoEntrega = 'mesa';
@@ -634,6 +645,7 @@ function tomarBorrador() {
     sel: {
       entrada: state.sel.entrada.map(x => ({ ...x })),
       proteina: state.sel.proteina.map(x => ({ ...x })),
+      bebida: state.sel.bebida.map(x => ({ ...x })),
       extra: state.sel.extra.map(x => ({ ...x }))
     },
     notas: JSON.parse(JSON.stringify(state.notas)),
@@ -792,7 +804,7 @@ function cargarParaEditar(pedidoId) {
   state.editandoNumero = '#-' + String(p.numero_comanda).padStart(3, '0');
   state.comensal = p.comensal;
   state.tipoEntrega = p.tipo_entrega;
-  state.sel = { entrada: [], proteina: [], extra: [] };
+  state.sel = { entrada: [], proteina: [], bebida: [], extra: [] };
   state.notas = {}; state.notaExtras = { chips: [], custom: '' };
   state.itemAbierto = null;
   const sinMatch = [];
@@ -943,7 +955,12 @@ const TIPOS_UI = [
   ['entrada', '🥣 Entradas (incluidas en el almuerzo)'],
   ['proteina_dia', '🍗 Proteínas del día (precio del almuerzo completo)'],
   ['proteina_especial', '⭐ Especiales (precio propio, no llevan principio)'],
+  ['bebida', '🥤 Bebidas incluidas (del almuerzo)'],
   ['extra', '🧃 Extras (se cobran aparte)']
+];
+const OPCIONES_TIPO = [
+  ['entrada', 'Entrada'], ['proteina_dia', 'Proteína del día'],
+  ['proteina_especial', 'Especial'], ['bebida', 'Bebida incluida'], ['extra', 'Extra']
 ];
 
 function renderMenu() {
@@ -955,10 +972,7 @@ function renderMenu() {
       <div class="fila" style="margin-top:8px">
         <input id="np-precio" type="number" inputmode="numeric" placeholder="Precio" style="flex:1">
         <select id="np-tipo" style="flex:1.4">
-          <option value="entrada">Entrada</option>
-          <option value="proteina_dia" selected>Proteína del día</option>
-          <option value="proteina_especial">Especial</option>
-          <option value="extra">Extra</option>
+          ${OPCIONES_TIPO.map(([v, n]) => `<option value="${v}" ${v === 'proteina_dia' ? 'selected' : ''}>${n}</option>`).join('')}
         </select>
       </div>
       <button class="btn" id="btn-nuevo-plato" style="margin-top:10px">Agregar al menú</button>
@@ -967,18 +981,35 @@ function renderMenu() {
       const platos = state.platos.filter(p => p.tipo === tipo);
       if (!platos.length) return '';
       return `<h3>${titulo}</h3>` + platos.map(p => `
-      <div class="tarjeta">
+      <div class="tarjeta ${p.disponible ? '' : 'plato-oculto'}">
         <div class="fila">
           <div class="crece">
-            <div class="plato-nombre" style="${p.disponible ? '' : 'text-decoration:line-through;color:var(--texto2)'}">${esc(p.nombre)}</div>
-            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluida'}</div>
+            <div class="plato-nombre">${esc(p.nombre)}
+              ${p.disponible ? '' : '<span class="chip">OCULTO</span>'}</div>
+            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}</div>
           </div>
-          <button class="btn-mini ${p.disponible ? 'peligro' : 'ok'}" data-toggle="${p.id}">
-            ${p.disponible ? 'Marcar agotado' : 'Reactivar'}</button>
-          <button class="btn-mini" data-precio="${p.id}">💲</button>
-          <button class="btn-mini" data-tipo-cambiar="${p.id}">🔀</button>
+          <button class="btn-mini ${p.disponible ? '' : 'ok'}" data-visible="${p.id}">
+            ${p.disponible ? '🚫 Ocultar' : '👁 Mostrar'}</button>
+          <button class="btn-mini primario" data-editar-plato="${p.id}">✏️</button>
           <button class="btn-mini peligro" data-borrar="${p.id}">🗑</button>
         </div>
+        ${state.editandoPlatoId === p.id ? `
+        <div class="lt-detalle" style="border-top:1px dashed var(--borde);margin-top:8px">
+          <label>Nombre</label>
+          <input id="ep-nombre" value="${esc(p.nombre)}" autocomplete="off">
+          <div class="fila" style="margin-top:8px">
+            <div class="crece"><label>Precio</label>
+              <input id="ep-precio" type="number" inputmode="numeric" value="${p.precio}"></div>
+            <div class="crece"><label>Tipo</label>
+              <select id="ep-tipo">
+                ${OPCIONES_TIPO.map(([v, n]) => `<option value="${v}" ${p.tipo === v ? 'selected' : ''}>${n}</option>`).join('')}
+              </select></div>
+          </div>
+          <div class="fila" style="margin-top:10px">
+            <button class="btn-mini" id="ep-cancelar">Cancelar</button>
+            <button class="btn-mini ok" id="ep-guardar">💾 Guardar cambios</button>
+          </div>
+        </div>` : ''}
       </div>`).join('');
     }).join('')}`;
 
@@ -990,32 +1021,32 @@ function renderMenu() {
       toast('Plato agregado; visible en todos los teléfonos');
     } catch (e) { toast(e.message, true); }
   };
-  $('#vista').querySelectorAll('[data-tipo-cambiar]').forEach(b => b.onclick = async () => {
-    const p = state.platos.find(x => x.id === Number(b.dataset.tipoCambiar));
-    const opciones = 'entrada / proteina_dia / proteina_especial / extra';
-    const nuevo = prompt(`Tipo de "${p.nombre}" (${opciones}):`, p.tipo);
-    if (!nuevo || nuevo === p.tipo) return;
-    try { await api(`/platos/${p.id}`, { method: 'PUT', body: { tipo: nuevo.trim() } }); toast('Tipo actualizado'); }
-    catch (e) { toast(e.message, true); }
-  });
-  $('#vista').querySelectorAll('[data-toggle]').forEach(b => b.onclick = async () => {
-    const p = state.platos.find(x => x.id === Number(b.dataset.toggle));
+  $('#vista').querySelectorAll('[data-visible]').forEach(b => b.onclick = async () => {
+    const p = state.platos.find(x => x.id === Number(b.dataset.visible));
     try {
       await api(`/platos/${p.id}`, { method: 'PUT', body: { disponible: !p.disponible } });
-      toast(p.disponible ? `"${p.nombre}" marcado como agotado` : `"${p.nombre}" disponible de nuevo`);
+      toast(p.disponible ? `"${p.nombre}" oculto: ya no aparece al tomar pedidos` : `"${p.nombre}" visible de nuevo`);
     } catch (e) { toast(e.message, true); }
   });
-  $('#vista').querySelectorAll('[data-precio]').forEach(b => b.onclick = async () => {
-    const p = state.platos.find(x => x.id === Number(b.dataset.precio));
-    const nuevo = prompt(`Nuevo precio para "${p.nombre}" (los pedidos ya registrados conservan el precio anterior):`, p.precio);
-    if (nuevo === null) return;
-    try { await api(`/platos/${p.id}`, { method: 'PUT', body: { precio: Number(nuevo) } }); toast('Precio actualizado'); }
-    catch (e) { toast(e.message, true); }
+  $('#vista').querySelectorAll('[data-editar-plato]').forEach(b => b.onclick = () => {
+    const id = Number(b.dataset.editarPlato);
+    state.editandoPlatoId = state.editandoPlatoId === id ? null : id;
+    renderMenu();
   });
+  if ($('#ep-guardar')) $('#ep-guardar').onclick = async () => {
+    try {
+      await api(`/platos/${state.editandoPlatoId}`, { method: 'PUT', body: {
+        nombre: $('#ep-nombre').value, precio: $('#ep-precio').value || 0, tipo: $('#ep-tipo').value
+      }});
+      state.editandoPlatoId = null;
+      toast('Plato actualizado en todos los teléfonos');
+    } catch (e) { toast(e.message, true); }
+  };
+  if ($('#ep-cancelar')) $('#ep-cancelar').onclick = () => { state.editandoPlatoId = null; renderMenu(); };
   $('#vista').querySelectorAll('[data-borrar]').forEach(b => b.onclick = async () => {
     const p = state.platos.find(x => x.id === Number(b.dataset.borrar));
-    if (!confirm(`¿Quitar "${p.nombre}" del menú?`)) return;
-    try { await api(`/platos/${p.id}`, { method: 'DELETE' }); toast('Plato eliminado del menú'); }
+    if (!confirm(`¿Eliminar "${p.nombre}" del catálogo definitivamente?\n(Si el plato vuelve otro día, mejor use "Ocultar")`)) return;
+    try { await api(`/platos/${p.id}`, { method: 'DELETE' }); toast('Plato eliminado'); }
     catch (e) { toast(e.message, true); }
   });
 }

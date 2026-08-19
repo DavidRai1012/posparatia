@@ -102,7 +102,7 @@ app.get('/api/estado', requiere(1), (req, res) => {
 // ---------- Menú ----------
 app.get('/api/platos', requiere(1), (_req, res) => res.json(platosActivos()));
 
-const TIPOS_PLATO = ['entrada', 'proteina_dia', 'proteina_especial', 'extra'];
+const TIPOS_PLATO = ['entrada', 'proteina_dia', 'proteina_especial', 'bebida', 'extra'];
 
 // Pre-renderiza los nombres del menú como imagen x3 para que la comanda salga sin espera
 function precalentarMenu() {
@@ -118,7 +118,7 @@ function precalentarMenu() {
 app.post('/api/platos', requiere(1), (req, res) => {
   const { nombre, precio, categoria, tipo } = req.body;
   // Las entradas van incluidas en el precio del almuerzo: se permiten en $0
-  const precioMin = tipo === 'entrada' ? 0 : 1;
+  const precioMin = (tipo === 'entrada' || tipo === 'bebida') ? 0 : 1;
   if (!nombre || !(Number(precio) >= precioMin)) return res.status(400).json({ error: 'Nombre y precio válido son obligatorios' });
   if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
   const r = db.prepare('INSERT INTO platos (nombre, precio, categoria, tipo) VALUES (?, ?, ?, ?)')
@@ -137,7 +137,7 @@ app.put('/api/platos/:id', requiere(1), (req, res) => {
   const tipo = req.body.tipo !== undefined ? req.body.tipo : plato.tipo;
   const disponible = req.body.disponible !== undefined ? (req.body.disponible ? 1 : 0) : plato.disponible;
   if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
-  if (!nombre || !(precio >= (tipo === 'entrada' ? 0 : 1))) return res.status(400).json({ error: 'Datos de plato no válidos' });
+  if (!nombre || !(precio >= ((tipo === 'entrada' || tipo === 'bebida') ? 0 : 1))) return res.status(400).json({ error: 'Datos de plato no válidos' });
   db.prepare('UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ? WHERE id = ?')
     .run(nombre, precio, categoria, tipo, disponible, plato.id);
   emitirMenu();
@@ -166,7 +166,7 @@ function armarItems(itemsBody) {
   for (const it of itemsBody || []) {
     const plato = buscarPlato.get(it.plato_id);
     if (!plato) throw new Error('Uno de los platos ya no existe en el menú');
-    if (!plato.disponible) throw new Error(`El plato "${plato.nombre}" está agotado`);
+    if (!plato.disponible) throw new Error(`El plato "${plato.nombre}" no está visible en el menú de hoy`);
     const cantidad = Math.max(1, Math.round(Number(it.cantidad) || 1));
     // La nota puede traer "chips\nobservaciones": el \n inicial es significativo,
     // así que solo se descarta si no tiene ningún contenido real.

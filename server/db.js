@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS platos (
   precio INTEGER NOT NULL,
   categoria TEXT NOT NULL DEFAULT 'General',
   tipo TEXT NOT NULL DEFAULT 'proteina_dia'
-    CHECK(tipo IN ('entrada','proteina_dia','proteina_especial','extra')),
+    CHECK(tipo IN ('entrada','proteina_dia','proteina_especial','bebida','extra')),
   disponible INTEGER NOT NULL DEFAULT 1,
   activo INTEGER NOT NULL DEFAULT 1
 );
@@ -179,6 +179,28 @@ if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'tipo'))
 if (!db.prepare('PRAGMA table_info(pedido_items)').all().some(c => c.name === 'bloque')) {
   db.exec('ALTER TABLE pedido_items ADD COLUMN bloque INTEGER');
   console.log('[db] Migración aplicada: bloque de almuerzo en items');
+}
+
+// Migración: tipo "bebida" (jugo/limonada incluidos en el almuerzo)
+const esquemaPlatos = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'platos'").get();
+if (esquemaPlatos && !esquemaPlatos.sql.includes('bebida')) {
+  db.exec(`
+    CREATE TABLE platos_v2 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nombre TEXT NOT NULL,
+      precio INTEGER NOT NULL,
+      categoria TEXT NOT NULL DEFAULT 'General',
+      tipo TEXT NOT NULL DEFAULT 'proteina_dia'
+        CHECK(tipo IN ('entrada','proteina_dia','proteina_especial','bebida','extra')),
+      disponible INTEGER NOT NULL DEFAULT 1,
+      activo INTEGER NOT NULL DEFAULT 1
+    );
+    INSERT INTO platos_v2 (id, nombre, precio, categoria, tipo, disponible, activo)
+      SELECT id, nombre, precio, categoria, tipo, disponible, activo FROM platos;
+    DROP TABLE platos;
+    ALTER TABLE platos_v2 RENAME TO platos;
+  `);
+  console.log('[db] Migración aplicada: tipo bebida incluida');
 }
 
 // ---- Helpers de fecha/hora local ----

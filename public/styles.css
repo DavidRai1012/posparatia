@@ -318,6 +318,8 @@ td.num, th.num { text-align: right; }
 .lt-x { padding: 4px 9px; }
 /* botón impar final del pago ocupa el ancho completo */
 .pago-grid .pago-btn:last-child:nth-child(odd) { grid-column: 1 / -1; }
+/* platos ocultos en el catálogo del menú */
+.tarjeta.plato-oculto { opacity: .55; }
 
 /* ===== Overlay de dirección de red / QR ===== */
 #overlay-red {
