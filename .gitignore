@@ -12,3 +12,7 @@ data/
 # Sistema operativo
 Thumbs.db
 Desktop.ini
+
+# Instalador: binarios grandes no van al repositorio (se reconstruyen con crear-instalador.bat)
+instalador/node.exe
+instalador/salida/

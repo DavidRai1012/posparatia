@@ -12,6 +12,20 @@ en un búfer local y se envía cuando vuelva la conexión.
 
 ## 1. Instalación (una sola vez, en el PC del restaurante)
 
+### Opción A — Instalador (recomendada)
+
+Copiar `Instalar-POS-Restaurante.exe` (por USB) al PC del restaurante y ejecutarlo.
+El instalador hace TODO solo: copia la app con su propio Node.js a `C:\POS-Restaurante`,
+crea los accesos directos (Escritorio + autoarranque al prender el PC), abre el puerto
+3000 en el Firewall y ofrece iniciar el POS de una vez. Después solo se abre
+`http://localhost:3000` en el navegador del PC.
+
+> El instalador se genera con `instalador\crear-instalador.bat` (requiere Node.js
+> e Inno Setup en el PC donde se compila) y queda en `instalador\salida\`.
+> Al reinstalar o desinstalar, la base de datos `data\` (las ventas) se conserva.
+
+### Opción B — Manual (para desarrollo)
+
 1. Instalar [Node.js](https://nodejs.org) (versión LTS).
 2. Abrir una terminal en esta carpeta y ejecutar: `npm install`
 3. Permitir el puerto en el Firewall de Windows (terminal como **administrador**):
