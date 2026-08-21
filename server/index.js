@@ -194,7 +194,7 @@ function imprimirPedido(pedidoId, tipo) {
   const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(pedidoId);
   // El tipo del plato viaja al ticket para ordenar: entradas, proteínas, bebidas, extras
   const items = db.prepare(
-    `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre LIMIT 1) AS tipo
+    `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
      FROM pedido_items pi WHERE pi.pedido_id = ?`).all(pedidoId);
   const ticket = ticketCocina(pedido, items, tipo, opcionesTicket());
   impresion.encolar(pedidoId, tipo, ticket);
@@ -408,44 +408,121 @@ app.get('/api/reportes/dia', requiere(2), (req, res) => {
   res.json(reportes.resumenJornada(req.query.jornada || jornadaHoy()));
 });
 
-// Excel (CSV) con todas las comandas del día y su método de pago,
-// para cuadrar contra los movimientos de Nequi/Daviplata/datáfono.
+// Excel (.xlsx) con todas las comandas del día: columnas separadas por tipo
+// (Entrada/Proteína/Bebida/Extras) para poder filtrar, método de pago para
+// cuadrar contra Nequi/Daviplata/datáfono, y totales por método en otra hoja.
+const ETIQUETAS_METODO = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', nequi: 'Nequi', daviplata: 'Daviplata',
+  qr_bancolombia: 'QR Bancolombia', tarjeta_debito: 'Tarjeta débito', tarjeta_credito: 'Tarjeta crédito', billetera: 'Billetera' };
+const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+  'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+
+function enviarXlsx(res, libro, nombre) {
+  const XLSX = require('xlsx');
+  const buf = XLSX.write(libro, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename=${nombre}`);
+  res.send(buf);
+}
+
+function hojaConFiltro(XLSX, filas, anchos) {
+  const ws = XLSX.utils.aoa_to_sheet(filas);
+  if (filas.length > 1) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: filas.length - 1, c: filas[0].length - 1 } }) };
+  if (anchos) ws['!cols'] = anchos.map(w => ({ wch: w }));
+  return ws;
+}
+
 app.get('/api/reportes/excel', requiere(2), (req, res) => {
+  const XLSX = require('xlsx');
   const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jornada || '')) ? req.query.jornada : jornadaHoy();
-  const ETIQUETAS = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', nequi: 'Nequi', daviplata: 'Daviplata',
-    qr_bancolombia: 'QR Bancolombia', tarjeta_debito: 'Tarjeta débito', tarjeta_credito: 'Tarjeta crédito', billetera: 'Billetera' };
   const pedidos = db.prepare(
     `SELECT p.*, u.nombre AS vendedor, pg.metodo, pg.monto AS cobrado, pg.recargo_tarjeta, pg.creado_en AS pagado_en
      FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
      LEFT JOIN pagos pg ON pg.pedido_id = p.id
      WHERE p.jornada = ? ORDER BY p.numero_comanda`).all(jornada);
-  const itemsDe = db.prepare('SELECT * FROM pedido_items WHERE pedido_id = ?');
+  const itemsDe = db.prepare(
+    `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
+     FROM pedido_items pi WHERE pi.pedido_id = ?`);
 
-  const campo = (v) => {
-    const s = String(v ?? '');
-    return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
-  const filas = [['Comanda', 'Hora', 'Vendedor', 'Entrega', 'Detalle', 'Metodo de pago', 'Domicilio', 'Recargo tarjeta', 'Total', 'Estado']];
+  const filas = [['Comanda', 'Hora', 'Vendedor', 'Entrega', 'Entrada', 'Proteína', 'Bebida', 'Extras',
+    'Método de pago', 'Domicilio', 'Recargo tarjeta', 'Estado', 'Total']];
   for (const p of pedidos) {
-    const detalle = itemsDe.all(p.id).map(i => `${i.cantidad}x ${i.plato_nombre}`).join(' | ');
+    // Los items del pedido separados por tipo, para que el filtro de Excel sirva
+    const porTipo = { entrada: [], proteina: [], bebida: [], extra: [] };
+    for (const it of itemsDe.all(p.id)) {
+      const clave = it.tipo === 'entrada' ? 'entrada'
+        : (it.tipo === 'proteina_dia' || it.tipo === 'proteina_especial') ? 'proteina'
+        : it.tipo === 'bebida' ? 'bebida' : 'extra';
+      porTipo[clave].push(`${it.cantidad > 1 ? it.cantidad + 'x ' : ''}${it.plato_nombre}`);
+    }
     const estado = p.estado === 'cancelado' ? 'ANULADA' : (p.metodo ? 'PAGADA' : 'POR COBRAR');
     const hora = ((p.pagado_en || p.creado_en) || '').slice(11, 16);
     filas.push([p.numero_comanda, hora, p.vendedor, p.tipo_entrega === 'llevar' ? 'Domicilio' : 'Mesa',
-      detalle, p.metodo ? (ETIQUETAS[p.metodo] || p.metodo) : '', p.recargo, p.recargo_tarjeta || 0,
-      p.estado === 'cancelado' ? 0 : (p.cobrado ?? p.total), estado]);
+      porTipo.entrada.join(' | '), porTipo.proteina.join(' | '), porTipo.bebida.join(' | '), porTipo.extra.join(' | '),
+      p.metodo ? (ETIQUETAS_METODO[p.metodo] || p.metodo) : '', p.recargo, p.recargo_tarjeta || 0,
+      estado, p.estado === 'cancelado' ? 0 : (p.cobrado ?? p.total)]);
   }
-  // Totales por método al final, que es lo que se cuadra contra cada app/datáfono
-  filas.push([], ['TOTALES POR METODO']);
-  const porMetodo = db.prepare(
-    "SELECT metodo, COUNT(*) AS n, SUM(monto) AS total FROM pagos WHERE jornada = ? GROUP BY metodo").all(jornada);
-  for (const m of porMetodo) filas.push([ETIQUETAS[m.metodo] || m.metodo, `${m.n} pagos`, '', '', '', '', '', '', m.total]);
-  filas.push(['TOTAL COBRADO', '', '', '', '', '', '', '', porMetodo.reduce((s, m) => s + m.total, 0)]);
 
-  // BOM UTF-8 para que Excel abra las tildes bien; separador ';' por la configuración regional de Colombia
-  const csv = '\uFEFF' + filas.map(f => f.map(campo).join(';')).join('\r\n');
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename=ventas-${jornada}.csv`);
-  res.send(csv);
+  const porMetodo = db.prepare(
+    'SELECT metodo, COUNT(*) AS n, SUM(monto) AS total FROM pagos WHERE jornada = ? GROUP BY metodo').all(jornada);
+  const filasTotales = [['Método', 'Pagos', 'Total']];
+  for (const m of porMetodo) filasTotales.push([ETIQUETAS_METODO[m.metodo] || m.metodo, m.n, m.total]);
+  filasTotales.push(['TOTAL COBRADO', porMetodo.reduce((s, m) => s + m.n, 0), porMetodo.reduce((s, m) => s + m.total, 0)]);
+
+  const libro = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filas, [9, 6, 12, 10, 18, 20, 14, 18, 14, 9, 9, 11, 10]), 'Ventas');
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasTotales, [16, 8, 12]), 'Totales por método');
+  enviarXlsx(res, libro, `ventas-${jornada}.xlsx`);
+});
+
+// Excel de nómina del año: una hoja por empleado (como la tarjeta Kardex que
+// llevan a mano) + hoja RESUMEN con el total por empleado y mes.
+app.get('/api/nomina/excel', requiere(2), (req, res) => {
+  const XLSX = require('xlsx');
+  const anio = /^\d{4}$/.test(String(req.query.anio || '')) ? req.query.anio : jornadaHoy().slice(0, 4);
+  const pagosAnio = db.prepare(
+    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
+     WHERE n.estado = 'confirmado' AND n.jornada LIKE ? ORDER BY u.nombre, n.jornada, n.id`).all(anio + '-%');
+  if (!pagosAnio.length) return res.status(404).json({ error: `No hay pagos de nómina confirmados en ${anio}` });
+
+  const libro = XLSX.utils.book_new();
+
+  // Hoja RESUMEN: empleados x meses
+  const empleados = [...new Set(pagosAnio.map(p => p.empleado))];
+  const filasResumen = [['Empleado', ...MESES, 'TOTAL ' + anio]];
+  for (const emp of empleados) {
+    const fila = [emp];
+    let totalAnio = 0;
+    for (let m = 1; m <= 12; m++) {
+      const suma = pagosAnio.filter(p => p.empleado === emp && Number(p.jornada.slice(5, 7)) === m)
+        .reduce((s, p) => s + p.total, 0);
+      fila.push(suma || 0);
+      totalAnio += suma;
+    }
+    fila.push(totalAnio);
+    filasResumen.push(fila);
+  }
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasResumen, [16, ...MESES.map(() => 11), 13]), 'RESUMEN');
+
+  // Una hoja por empleado, estilo tarjeta Kardex
+  const usados = new Set(['RESUMEN']);
+  for (const emp of empleados) {
+    const filas = [['Fecha', 'Mes', 'Día', 'Turno', 'Descuento', 'Bono', 'Concepto', 'Total', 'Confirmado']];
+    let total = 0;
+    for (const p of pagosAnio.filter(x => x.empleado === emp)) {
+      filas.push([p.jornada, MESES[Number(p.jornada.slice(5, 7)) - 1], Number(p.jornada.slice(8, 10)),
+        p.valor_turno, p.descuento, p.bono, p.concepto || '', p.total, (p.confirmado_en || '').slice(0, 16)]);
+      total += p.total;
+    }
+    filas.push([]);
+    filas.push(['', '', '', '', '', '', 'TOTAL ' + anio, total, '']);
+    // nombre de hoja: máximo 31 caracteres, sin caracteres prohibidos, único
+    let nombre = emp.replace(/[\\\/\?\*\[\]:]/g, ' ').trim().slice(0, 28) || 'Empleado';
+    let n = 2;
+    while (usados.has(nombre)) nombre = nombre.slice(0, 25) + ' ' + (n++);
+    usados.add(nombre);
+    XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filas, [11, 11, 5, 10, 10, 10, 26, 10, 16]), nombre);
+  }
+  enviarXlsx(res, libro, `nomina-${anio}.xlsx`);
 });
 
 app.post('/api/cierre', requiere(2), async (req, res) => {

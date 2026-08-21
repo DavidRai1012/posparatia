@@ -974,6 +974,10 @@ function renderCaja() {
 
     <h3>👥 Nómina</h3>
     <div class="tarjeta" id="zona-nomina"><span class="suave">Cargando...</span></div>
+    <div class="fila" style="margin:8px 0 4px">
+      <input id="excel-anio" type="number" min="2026" max="2100" value="${state.jornada.slice(0, 4)}" style="flex:1">
+      <button class="btn-mini primario" id="btn-excel-nomina" style="flex:2">📥 Excel de nómina (hoja por empleado)</button>
+    </div>
 
     <h3>Cierre de caja</h3>
     <div class="tarjeta">
@@ -1044,18 +1048,31 @@ function renderCaja() {
     } catch (e) { toast(e.message, true); }
   };
 
+  async function descargarArchivo(ruta, nombre) {
+    const r = await fetch(ruta, { headers: { 'Authorization': 'Bearer ' + state.token } });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error || 'No se pudo generar el archivo');
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = nombre;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
   if ($('#btn-excel')) $('#btn-excel').onclick = async () => {
     const fecha = $('#excel-fecha').value || state.jornada;
     try {
-      const r = await fetch(`/api/reportes/excel?jornada=${fecha}`, { headers: { 'Authorization': 'Bearer ' + state.token } });
-      if (!r.ok) throw new Error('No se pudo generar el reporte');
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `ventas-${fecha}.csv`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-      toast('📥 Excel descargado: revise la carpeta Descargas');
+      await descargarArchivo(`/api/reportes/excel?jornada=${fecha}`, `ventas-${fecha}.xlsx`);
+      toast('📥 Excel de ventas descargado: revise Descargas');
+    } catch (e) { toast(e.message, true); }
+  };
+  if ($('#btn-excel-nomina')) $('#btn-excel-nomina').onclick = async () => {
+    const anio = $('#excel-anio').value || state.jornada.slice(0, 4);
+    try {
+      await descargarArchivo(`/api/nomina/excel?anio=${anio}`, `nomina-${anio}.xlsx`);
+      toast('📥 Excel de nómina descargado (una hoja por empleado)');
     } catch (e) { toast(e.message, true); }
   };
   if ($('#btn-gasto')) $('#btn-gasto').onclick = async () => {

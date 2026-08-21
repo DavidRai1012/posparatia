@@ -36,7 +36,7 @@ function resumenJornada(jornada) {
   // (normalmente en $0) suman al almuerzo; lo demás cuenta como extras
   const itemsJornada = db.prepare(
     `SELECT pi.precio, pi.cantidad,
-            (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre LIMIT 1) AS tipo
+            (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
      FROM pedido_items pi JOIN pedidos p ON p.id = pi.pedido_id
      WHERE p.jornada = ? AND p.estado != 'cancelado'`).all(jornada);
   let numAlmuerzos = 0, totalAlmuerzos = 0, totalExtras = 0;
