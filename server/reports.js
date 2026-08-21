@@ -32,6 +32,21 @@ function resumenJornada(jornada) {
   const totalGastos = gastos.reduce((s, g) => s + g.valor, 0);
   const totalNomina = nominaDia.reduce((s, n) => s + n.total, 0);
 
+  // Almuerzos vs extras: cada proteína vendida = un almuerzo; entradas y bebidas
+  // (normalmente en $0) suman al almuerzo; lo demás cuenta como extras
+  const itemsJornada = db.prepare(
+    `SELECT pi.precio, pi.cantidad,
+            (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre LIMIT 1) AS tipo
+     FROM pedido_items pi JOIN pedidos p ON p.id = pi.pedido_id
+     WHERE p.jornada = ? AND p.estado != 'cancelado'`).all(jornada);
+  let numAlmuerzos = 0, totalAlmuerzos = 0, totalExtras = 0;
+  for (const it of itemsJornada) {
+    const v = it.precio * it.cantidad;
+    if (it.tipo === 'proteina_dia' || it.tipo === 'proteina_especial') { numAlmuerzos += it.cantidad; totalAlmuerzos += v; }
+    else if (it.tipo === 'entrada' || it.tipo === 'bebida') totalAlmuerzos += v;
+    else totalExtras += v;
+  }
+
   return {
     jornada,
     totalVentas: efectivos.reduce((s, p) => s + p.total, 0),
@@ -45,8 +60,9 @@ function resumenJornada(jornada) {
     porCobrar: porCobrar.map(p => ({ id: p.id, numero_comanda: p.numero_comanda, comensal: p.comensal, total: p.total, vendedor: p.vendedor })),
     gastos: gastos.map(g => ({ id: g.id, concepto: g.concepto, valor: g.valor, usuario: g.usuario })),
     totalGastos,
-    nomina: nominaDia.map(n => ({ empleado: n.empleado, turno: n.valor_turno, descuento: n.descuento, bono: n.bono, total: n.total })),
+    nomina: nominaDia.map(n => ({ empleado: n.empleado, turno: n.valor_turno, descuento: n.descuento, bono: n.bono, concepto: n.concepto, total: n.total })),
     totalNomina,
+    numAlmuerzos, totalAlmuerzos, totalExtras,
     // Efectivo que debería haber físicamente: ventas en efectivo menos lo que salió de la caja
     efectivoEsperado: ventasEfectivo - totalGastos - totalNomina
   };
@@ -77,6 +93,8 @@ function textoReporte(resumen) {
     `REPORTE DIARIO - ${getConfig('nombre_restaurante')} - Jornada ${resumen.jornada}`,
     '',
     `Ventas totales: ${fmt(resumen.totalVentas)} (${resumen.numPedidos} pedidos)`,
+    `  - Almuerzos completos: ${resumen.numAlmuerzos} por ${fmt(resumen.totalAlmuerzos)}`,
+    `  - Extras: ${fmt(resumen.totalExtras)}`,
     `Cobrado: ${fmt(resumen.totalCobrado)}`,
     `Cancelados: ${resumen.numCancelados} por ${fmt(resumen.totalCancelado)}`,
     `Recargos por empaque: ${fmt(resumen.totalRecargos)}`,
@@ -96,7 +114,7 @@ function textoReporte(resumen) {
   if (resumen.nomina.length) {
     lineas.push('', `NOMINA PAGADA (${fmt(resumen.totalNomina)}):`);
     for (const n of resumen.nomina) {
-      lineas.push(`  - ${n.empleado}: turno ${fmt(n.turno)}${n.descuento ? `, descuento -${fmt(n.descuento)}` : ''}${n.bono ? `, bono +${fmt(n.bono)}` : ''} = ${fmt(n.total)}`);
+      lineas.push(`  - ${n.empleado}: turno ${fmt(n.turno)}${n.descuento ? `, descuento -${fmt(n.descuento)}` : ''}${n.bono ? `, bono +${fmt(n.bono)}` : ''} = ${fmt(n.total)}${n.concepto ? ` (${n.concepto})` : ''}`);
     }
   }
   lineas.push('', `Efectivo esperado en caja: ${fmt(resumen.efectivoEsperado)}`);

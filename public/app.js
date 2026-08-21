@@ -237,6 +237,7 @@ function mostrarConfirmacionNomina() {
       <div class="fila suave"><span>Turno</span><span class="der">${fmt(n.valor_turno)}</span></div>
       ${n.descuento ? `<div class="fila suave"><span>Descuento</span><span class="der">-${fmt(n.descuento)}</span></div>` : ''}
       ${n.bono ? `<div class="fila suave"><span>Bono</span><span class="der">+${fmt(n.bono)}</span></div>` : ''}
+      ${n.concepto ? `<div class="suave" style="margin:4px 0">📝 ${esc(n.concepto)}</div>` : ''}
       <div class="fila grande" style="margin:8px 0"><span>TOTAL</span><span class="der">${fmt(n.total)}</span></div>
       <button class="btn ok" id="btn-nomina-confirmar">✓ Confirmo que recibí este pago</button>
       <button class="enlace-suave" id="btn-nomina-despues">Después</button>
@@ -949,10 +950,18 @@ function renderCaja() {
   $('#vista').innerHTML = `
     <h2>Caja</h2>
     ${htmlCobro}
+    <h3>Resumen del día</h3>
+    <div class="tarjeta" id="resumen-dia"><span class="suave">Cargando...</span></div>
+    <div class="fila" style="margin:8px 0 4px">
+      <input id="excel-fecha" type="date" value="${state.jornada}" style="flex:1">
+      <button class="btn-mini primario" id="btn-excel" style="flex:1">📥 Descargar Excel</button>
+    </div>
+
     <h3>Cuentas por cobrar (${sinPagar.length})</h3>
     ${sinPagar.length === 0 ? '<div class="tarjeta suave">Todo está cobrado. 🎉</div>' : ''}
     ${sinPagar.map(p => tarjetaPedido(p, state.jornadaCerrada ? '' :
       `<button class="btn-mini ok" data-cobrar2="${p.id}">💰 Cobrar</button>`)).join('')}
+
     <h3>💸 Gastos del local</h3>
     <div class="tarjeta">
       <input id="ga-concepto" placeholder="Concepto (ej: guantes para cocina, proveedor verduras)" autocomplete="off">
@@ -966,8 +975,6 @@ function renderCaja() {
     <h3>👥 Nómina</h3>
     <div class="tarjeta" id="zona-nomina"><span class="suave">Cargando...</span></div>
 
-    <h3>Resumen del día</h3>
-    <div class="tarjeta" id="resumen-dia"><span class="suave">Cargando...</span></div>
     <h3>Cierre de caja</h3>
     <div class="tarjeta">
       ${state.jornadaCerrada ? '<div class="suave">La jornada ya tiene cierre registrado.</div>' : `
@@ -1037,6 +1044,20 @@ function renderCaja() {
     } catch (e) { toast(e.message, true); }
   };
 
+  if ($('#btn-excel')) $('#btn-excel').onclick = async () => {
+    const fecha = $('#excel-fecha').value || state.jornada;
+    try {
+      const r = await fetch(`/api/reportes/excel?jornada=${fecha}`, { headers: { 'Authorization': 'Bearer ' + state.token } });
+      if (!r.ok) throw new Error('No se pudo generar el reporte');
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `ventas-${fecha}.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      toast('📥 Excel descargado: revise la carpeta Descargas');
+    } catch (e) { toast(e.message, true); }
+  };
   if ($('#btn-gasto')) $('#btn-gasto').onclick = async () => {
     try {
       await api('/gastos', { method: 'POST', body: { concepto: $('#ga-concepto').value, valor: $('#ga-valor').value } });
@@ -1084,13 +1105,15 @@ async function cargarNomina() {
         `<option value="${e.id}" data-turno="${e.valor_turno}">${esc(e.nombre)} (turno ${fmt(e.valor_turno)})</option>`).join('')}</select>
       <div class="fila" style="margin-top:8px">
         <div class="crece"><label>Fecha del turno</label><input id="no-fecha" type="date" value="${hoy}"></div>
-        <div class="crece"><label>Valor del turno</label><input id="no-turno" type="text" inputmode="numeric" pattern="[0-9]*"
-          value="${r.empleados.length ? r.empleados[0].valor_turno : 0}"></div>
+        <div class="crece"><label>Valor del turno${state.usuario.rol === 'admin' ? '' : ' (fijo)'}</label><input id="no-turno" type="text" inputmode="numeric" pattern="[0-9]*"
+          value="${r.empleados.length ? r.empleados[0].valor_turno : 0}" ${state.usuario.rol === 'admin' ? '' : 'readonly style="opacity:.65"'}></div>
       </div>
       <div class="fila" style="margin-top:8px">
         <div class="crece"><label>Descuento</label><input id="no-desc" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
         <div class="crece"><label>Bono</label><input id="no-bono" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
       </div>
+      <label>Concepto (opcional: motivo del bono o descuento)</label>
+      <input id="no-concepto" placeholder="Ej: bono por festivo, descuento por adelanto" autocomplete="off">
       <div class="fila" style="margin-top:8px"><span class="crece suave">Total a pagar</span><b id="no-total" class="grande" style="font-size:17px"></b></div>
       <button class="btn ok" id="btn-nomina-registrar" style="margin-top:8px">Registrar pago (el empleado confirma en su app)</button>
       <div class="suave" style="margin-top:4px">El valor del turno por empleado lo configura el admin en la pestaña Admin.</div>
@@ -1098,7 +1121,7 @@ async function cargarNomina() {
       ${r.pendientes.length ? `<hr class="sep"><b>Pendientes de confirmación:</b>
         ${r.pendientes.map(n => `
         <div class="fila suave" style="padding:4px 0">
-          <span class="crece">${esc(n.empleado)} · ${esc(n.jornada)}</span>
+          <span class="crece">${esc(n.empleado)} · ${esc(n.jornada)}${n.concepto ? ` · <em>${esc(n.concepto)}</em>` : ''}</span>
           <span>${fmt(n.total)}</span>
           ${state.usuario.rol === 'admin' ? `
             <button class="btn-mini ok" data-nomina-conf="${n.id}">✓</button>
@@ -1129,7 +1152,8 @@ async function cargarNomina() {
       try {
         await api('/nomina', { method: 'POST', body: {
           empleado_id: Number($('#no-emp').value), jornada: $('#no-fecha').value,
-          valor_turno: $('#no-turno').value, descuento: $('#no-desc').value || 0, bono: $('#no-bono').value || 0
+          valor_turno: $('#no-turno').value, descuento: $('#no-desc').value || 0, bono: $('#no-bono').value || 0,
+          concepto: $('#no-concepto').value
         }});
         toast('Pago registrado: el empleado debe confirmarlo en su teléfono');
         cargarNomina();
@@ -1154,9 +1178,12 @@ async function cargarResumenDia() {
     const cont = $('#resumen-dia');
     if (!cont) return;
     cont.innerHTML = `
-      <div class="fila"><span>Ventas (${r.numPedidos} pedidos)</span><span class="der grande" style="font-size:16px">${fmt(r.totalVentas)}</span></div>
+      <div class="fila"><span>🍛 Almuerzos completos (${r.numAlmuerzos})</span><span class="der grande" style="font-size:16px">${fmt(r.totalAlmuerzos)}</span></div>
+      <div class="fila suave"><span>🧃 Extras vendidos</span><span class="der">${fmt(r.totalExtras)}</span></div>
+      <div class="fila"><span><b>Total general</b> (${r.numPedidos} pedidos)</span><span class="der grande" style="font-size:16px">${fmt(r.totalVentas)}</span></div>
+      <hr class="sep">
       <div class="fila suave"><span>Cobrado</span><span class="der">${fmt(r.totalCobrado)}</span></div>
-      <div class="fila suave"><span>Recargos por empaque</span><span class="der">${fmt(r.totalRecargos)}</span></div>
+      <div class="fila suave"><span>Domicilios cobrados</span><span class="der">${fmt(r.totalRecargos)}</span></div>
       <div class="fila suave"><span>Cancelados (${r.numCancelados})</span><span class="der">${fmt(r.totalCancelado)}</span></div>
       <hr class="sep">
       ${Object.entries(r.porMetodo).map(([m, v]) =>

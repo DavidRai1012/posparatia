@@ -191,6 +191,7 @@ function ticketNomina(datos, opciones = {}) {
   t.linea(`Turno:      ${fmt(datos.valor_turno)}`);
   if (datos.descuento) t.linea(`Descuento: -${fmt(datos.descuento)}`);
   if (datos.bono) t.linea(`Bono:      +${fmt(datos.bono)}`);
+  if (datos.concepto) t.linea(`Motivo: ${datos.concepto}`);
   t.separador();
   t.linea(`TOTAL ${fmt(datos.total)}`, { anchoX2: true, altoX2: true, bold: true });
   t.linea('Confirmado por el empleado en la app', {});

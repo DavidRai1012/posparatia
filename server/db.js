@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS nomina (
   descuento INTEGER NOT NULL DEFAULT 0,
   bono INTEGER NOT NULL DEFAULT 0,
   total INTEGER NOT NULL,
+  concepto TEXT,
   estado TEXT NOT NULL DEFAULT 'pendiente' CHECK(estado IN ('pendiente','confirmado','anulado')),
   registrado_por INTEGER NOT NULL REFERENCES usuarios(id),
   confirmado_en TEXT,
@@ -214,6 +215,10 @@ if (!db.prepare('PRAGMA table_info(usuarios)').all().some(c => c.name === 'valor
 if (!db.prepare('PRAGMA table_info(pagos)').all().some(c => c.name === 'recargo_tarjeta')) {
   db.exec('ALTER TABLE pagos ADD COLUMN recargo_tarjeta INTEGER NOT NULL DEFAULT 0');
   console.log('[db] Migración aplicada: recargo de tarjeta en pagos');
+}
+if (!db.prepare('PRAGMA table_info(nomina)').all().some(c => c.name === 'concepto')) {
+  db.exec('ALTER TABLE nomina ADD COLUMN concepto TEXT');
+  console.log('[db] Migración aplicada: concepto en nómina');
 }
 
 // Migración: tipo "bebida" (jugo/limonada incluidos en el almuerzo)

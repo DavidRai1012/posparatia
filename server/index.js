@@ -408,6 +408,46 @@ app.get('/api/reportes/dia', requiere(2), (req, res) => {
   res.json(reportes.resumenJornada(req.query.jornada || jornadaHoy()));
 });
 
+// Excel (CSV) con todas las comandas del día y su método de pago,
+// para cuadrar contra los movimientos de Nequi/Daviplata/datáfono.
+app.get('/api/reportes/excel', requiere(2), (req, res) => {
+  const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jornada || '')) ? req.query.jornada : jornadaHoy();
+  const ETIQUETAS = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', nequi: 'Nequi', daviplata: 'Daviplata',
+    qr_bancolombia: 'QR Bancolombia', tarjeta_debito: 'Tarjeta débito', tarjeta_credito: 'Tarjeta crédito', billetera: 'Billetera' };
+  const pedidos = db.prepare(
+    `SELECT p.*, u.nombre AS vendedor, pg.metodo, pg.monto AS cobrado, pg.recargo_tarjeta, pg.creado_en AS pagado_en
+     FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
+     LEFT JOIN pagos pg ON pg.pedido_id = p.id
+     WHERE p.jornada = ? ORDER BY p.numero_comanda`).all(jornada);
+  const itemsDe = db.prepare('SELECT * FROM pedido_items WHERE pedido_id = ?');
+
+  const campo = (v) => {
+    const s = String(v ?? '');
+    return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const filas = [['Comanda', 'Hora', 'Vendedor', 'Entrega', 'Detalle', 'Metodo de pago', 'Domicilio', 'Recargo tarjeta', 'Total', 'Estado']];
+  for (const p of pedidos) {
+    const detalle = itemsDe.all(p.id).map(i => `${i.cantidad}x ${i.plato_nombre}`).join(' | ');
+    const estado = p.estado === 'cancelado' ? 'ANULADA' : (p.metodo ? 'PAGADA' : 'POR COBRAR');
+    const hora = ((p.pagado_en || p.creado_en) || '').slice(11, 16);
+    filas.push([p.numero_comanda, hora, p.vendedor, p.tipo_entrega === 'llevar' ? 'Domicilio' : 'Mesa',
+      detalle, p.metodo ? (ETIQUETAS[p.metodo] || p.metodo) : '', p.recargo, p.recargo_tarjeta || 0,
+      p.estado === 'cancelado' ? 0 : (p.cobrado ?? p.total), estado]);
+  }
+  // Totales por método al final, que es lo que se cuadra contra cada app/datáfono
+  filas.push([], ['TOTALES POR METODO']);
+  const porMetodo = db.prepare(
+    "SELECT metodo, COUNT(*) AS n, SUM(monto) AS total FROM pagos WHERE jornada = ? GROUP BY metodo").all(jornada);
+  for (const m of porMetodo) filas.push([ETIQUETAS[m.metodo] || m.metodo, `${m.n} pagos`, '', '', '', '', '', '', m.total]);
+  filas.push(['TOTAL COBRADO', '', '', '', '', '', '', '', porMetodo.reduce((s, m) => s + m.total, 0)]);
+
+  // BOM UTF-8 para que Excel abra las tildes bien; separador ';' por la configuración regional de Colombia
+  const csv = '\uFEFF' + filas.map(f => f.map(campo).join(';')).join('\r\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename=ventas-${jornada}.csv`);
+  res.send(csv);
+});
+
 app.post('/api/cierre', requiere(2), async (req, res) => {
   try {
     const efectivo = req.body.efectivo_contado === null || req.body.efectivo_contado === undefined
@@ -568,18 +608,23 @@ app.post('/api/nomina', requiere(2), (req, res) => {
   const empleado = db.prepare('SELECT * FROM usuarios WHERE id = ? AND activo = 1').get(req.body.empleado_id);
   if (!empleado) return res.status(404).json({ error: 'Empleado no encontrado' });
   const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.jornada || '')) ? req.body.jornada : jornadaHoy();
-  const turno = Math.max(0, Math.round(Number(req.body.valor_turno) || 0));
+  // El valor del turno es FIJO para el cajero (el que configuró el admin);
+  // solo el admin puede pagar un turno con un valor distinto
+  const turno = req.usuario.rol === 'admin'
+    ? Math.max(0, Math.round(Number(req.body.valor_turno) || 0))
+    : empleado.valor_turno;
   const descuento = Math.max(0, Math.round(Number(req.body.descuento) || 0));
   const bono = Math.max(0, Math.round(Number(req.body.bono) || 0));
+  const concepto = String(req.body.concepto || '').trim().slice(0, 80) || null;
   const total = turno - descuento + bono;
   if (total <= 0) return res.status(400).json({ error: 'El total del pago debe ser mayor a cero' });
   const r = db.prepare(
-    `INSERT INTO nomina (empleado_id, jornada, valor_turno, descuento, bono, total, estado, registrado_por, creado_en)
-     VALUES (?, ?, ?, ?, ?, ?, 'pendiente', ?, ?)`)
-    .run(empleado.id, jornada, turno, descuento, bono, total, req.usuario.usuarioId, ahora());
+    `INSERT INTO nomina (empleado_id, jornada, valor_turno, descuento, bono, total, concepto, estado, registrado_por, creado_en)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pendiente', ?, ?)`)
+    .run(empleado.id, jornada, turno, descuento, bono, total, concepto, req.usuario.usuarioId, ahora());
   // Aviso directo al teléfono del empleado para que confirme
   io.to(`usuario:${empleado.id}`).emit('nomina:pendiente', {
-    id: r.lastInsertRowid, empleado: empleado.nombre, jornada, valor_turno: turno, descuento, bono, total
+    id: r.lastInsertRowid, empleado: empleado.nombre, jornada, valor_turno: turno, descuento, bono, total, concepto
   });
   io.emit('nomina:actualizada');
   res.json({ id: r.lastInsertRowid });
