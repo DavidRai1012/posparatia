@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const { Server } = require('socket.io');
 
 const { db, ahora, jornadaHoy, horaLocal, getConfig, setConfig, getConfigAll, registrarHistorial, jornadaCerrada } = require('./db');
-const { ticketCocina, ticketAccesoQR } = require('./escpos');
+const { ticketCocina, ticketNomina, ticketAccesoQR } = require('./escpos');
 const impresion = require('./printing');
 const reportes = require('./reports');
 
@@ -92,9 +92,14 @@ app.get('/api/estado', requiere(1), (req, res) => {
     platos: platosActivos(),
     pedidos: pedidosDeJornada(jornadaHoy()),
     impresion: impresion.estadoCola(),
+    nominaPendienteMia: pendientesNominaDe(req.usuario.usuarioId),
     configPublica: {
       nombre_restaurante: getConfig('nombre_restaurante'),
-      recargo_empaque: Number(getConfig('recargo_empaque'))
+      recargo_empaque: Number(getConfig('recargo_empaque')),
+      chips_notas: chipsActuales(),
+      recargo_tarjeta_fijo: Number(getConfig('recargo_tarjeta_fijo')),
+      recargo_tarjeta_umbral: Number(getConfig('recargo_tarjeta_umbral')),
+      recargo_tarjeta_pct: Number(getConfig('recargo_tarjeta_pct'))
     }
   });
 });
@@ -187,14 +192,44 @@ function opcionesTicket() {
 
 function imprimirPedido(pedidoId, tipo) {
   const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(pedidoId);
-  const items = db.prepare('SELECT * FROM pedido_items WHERE pedido_id = ?').all(pedidoId);
+  // El tipo del plato viaja al ticket para ordenar: entradas, proteínas, bebidas, extras
+  const items = db.prepare(
+    `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre LIMIT 1) AS tipo
+     FROM pedido_items pi WHERE pi.pedido_id = ?`).all(pedidoId);
   const ticket = ticketCocina(pedido, items, tipo, opcionesTicket());
   impresion.encolar(pedidoId, tipo, ticket);
 }
 
+// Recargo por pago con tarjeta: fijo bajo el umbral, porcentaje desde el umbral
+function recargoTarjetaDe(metodo, monto) {
+  if (metodo !== 'tarjeta') return 0;
+  const fijo = Number(getConfig('recargo_tarjeta_fijo')) || 0;
+  const umbral = Number(getConfig('recargo_tarjeta_umbral')) || 0;
+  const pct = Number(getConfig('recargo_tarjeta_pct')) || 0;
+  return monto < umbral ? fijo : Math.round(monto * pct / 100);
+}
+
+// El valor del domicilio lo define el mesero por pedido (depende de la distancia);
+// si no manda nada, se usa el valor por defecto configurado
+function calcRecargoDomicilio(tipoEntrega, valor) {
+  if (tipoEntrega !== 'llevar') return 0;
+  const v = Number(valor);
+  return Number.isFinite(v) && String(valor).trim() !== '' ? Math.max(0, Math.round(v)) : Number(getConfig('recargo_empaque'));
+}
+
+function chipsActuales() {
+  try { return JSON.parse(getConfig('chips_notas') || '[]'); } catch { return []; }
+}
+
+function pendientesNominaDe(usuarioId) {
+  return db.prepare(
+    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
+     WHERE n.empleado_id = ? AND n.estado = 'pendiente' ORDER BY n.id`).all(usuarioId);
+}
+
 app.post('/api/pedidos', requiere(1), (req, res) => {
   if (!validarJornadaAbierta(res)) return;
-  const { uuid, comensal, tipo_entrega, items: itemsBody } = req.body;
+  const { uuid, comensal, tipo_entrega, items: itemsBody, imprimir, recargo_domicilio } = req.body;
   // Idempotencia: si el WiFi se cayó y la app reintenta, no se duplica la comanda
   if (uuid) {
     const existente = db.prepare('SELECT id, numero_comanda FROM pedidos WHERE uuid = ?').get(uuid);
@@ -212,14 +247,14 @@ app.post('/api/pedidos', requiere(1), (req, res) => {
   }
 
   const jornada = jornadaHoy();
-  const recargoPre = tipo_entrega === 'llevar' ? Number(getConfig('recargo_empaque')) : 0;
-  const totalPre = items.reduce((s, i) => s + i.precio * i.cantidad, 0) + recargoPre;
+  const recargo = calcRecargoDomicilio(tipo_entrega, recargo_domicilio);
+  const total = items.reduce((s, i) => s + i.precio * i.cantidad, 0) + recargo;
+  const recTarjeta = pagoExpress ? recargoTarjetaDe(pagoExpress.metodo, total) : 0;
+  const totalCobrar = total + recTarjeta;
   if (pagoExpress && pagoExpress.metodo === 'efectivo' && pagoExpress.recibido &&
-      Math.round(Number(pagoExpress.recibido)) < totalPre) {
+      Math.round(Number(pagoExpress.recibido)) < totalCobrar) {
     return res.status(400).json({ error: 'El monto recibido es menor al total' });
   }
-  const recargo = tipo_entrega === 'llevar' ? Number(getConfig('recargo_empaque')) : 0;
-  const total = items.reduce((s, i) => s + i.precio * i.cantidad, 0) + recargo;
 
   const uuidFinal = uuid || crypto.randomUUID();
   const crear = db.transaction(() => {
@@ -234,25 +269,27 @@ app.post('/api/pedidos', requiere(1), (req, res) => {
     return { id: r.lastInsertRowid, numero_comanda: num };
   });
   const creado = crear();
-  registrarHistorial(creado.id, req.usuario.usuarioId, 'crear', `Comanda ${creado.numero_comanda} para ${comensal}`);
+  // (sin nombre del cliente en el historial, por privacidad)
+  registrarHistorial(creado.id, req.usuario.usuarioId, 'crear', `Comanda ${creado.numero_comanda}`);
 
   let vueltas = null;
   if (pagoExpress) {
     let recibido = null;
     if (pagoExpress.metodo === 'efectivo') {
-      recibido = pagoExpress.recibido ? Math.round(Number(pagoExpress.recibido)) : total;
-      vueltas = recibido - total;
+      recibido = pagoExpress.recibido ? Math.round(Number(pagoExpress.recibido)) : totalCobrar;
+      vueltas = recibido - totalCobrar;
     }
-    db.prepare('INSERT INTO pagos (pedido_id, metodo, monto, recibido, vueltas, cajero_id, jornada, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(creado.id, pagoExpress.metodo, total, recibido, vueltas, req.usuario.usuarioId, jornada, ahora());
-    registrarHistorial(creado.id, req.usuario.usuarioId, 'pago', `${pagoExpress.metodo} por ${total} (express)`);
+    db.prepare('INSERT INTO pagos (pedido_id, metodo, monto, recibido, vueltas, recargo_tarjeta, cajero_id, jornada, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(creado.id, pagoExpress.metodo, totalCobrar, recibido, vueltas, recTarjeta, req.usuario.usuarioId, jornada, ahora());
+    registrarHistorial(creado.id, req.usuario.usuarioId, 'pago', `${pagoExpress.metodo} por ${totalCobrar} (express)`);
     const pedidoCompleto = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(creado.id);
-    const vendedor = req.usuario.nombre;
-    reportes.encolarVentaSheets(pedidoCompleto, items.map(i => ({ cantidad: i.cantidad, plato_nombre: i.plato_nombre })), { metodo: pagoExpress.metodo, creado_en: ahora() }, vendedor);
+    reportes.encolarVentaSheets(pedidoCompleto, items.map(i => ({ cantidad: i.cantidad, plato_nombre: i.plato_nombre })),
+      { metodo: pagoExpress.metodo, creado_en: ahora(), recargo_tarjeta: recTarjeta }, req.usuario.nombre);
     reportes.drenarSheets().catch(() => {});
   }
 
-  imprimirPedido(creado.id, 'comanda');
+  // Los pedidos de solo extras (una gaseosa, un postre) pueden no necesitar comanda en cocina
+  if (imprimir !== false) imprimirPedido(creado.id, 'comanda');
   emitirPedidos();
   // Aviso a todos los dispositivos conectados de que el PC recibió y guardó el pedido
   io.emit('pedido:guardado', {
@@ -262,7 +299,7 @@ app.post('/api/pedidos', requiere(1), (req, res) => {
     vendedor: req.usuario.nombre,
     pagado: !!pagoExpress
   });
-  res.json({ ...creado, vueltas });
+  res.json({ ...creado, vueltas, recargo_tarjeta: recTarjeta, total_cobrado: pagoExpress ? totalCobrar : null, impreso: imprimir !== false });
 });
 
 app.put('/api/pedidos/:id', requiere(1), (req, res) => {
@@ -273,11 +310,11 @@ app.put('/api/pedidos/:id', requiere(1), (req, res) => {
   if (db.prepare('SELECT id FROM pagos WHERE pedido_id = ?').get(pedido.id)) {
     return res.status(409).json({ error: 'El pedido ya está pagado; no se puede editar' });
   }
-  const { comensal, tipo_entrega, items: itemsBody } = req.body;
+  const { comensal, tipo_entrega, items: itemsBody, recargo_domicilio } = req.body;
   let items;
   try { items = armarItems(itemsBody); } catch (e) { return res.status(400).json({ error: e.message }); }
   const tipo = tipo_entrega === 'llevar' ? 'llevar' : 'mesa';
-  const recargo = tipo === 'llevar' ? Number(getConfig('recargo_empaque')) : 0;
+  const recargo = calcRecargoDomicilio(tipo, recargo_domicilio);
   const total = items.reduce((s, i) => s + i.precio * i.cantidad, 0) + recargo;
 
   const actualizar = db.transaction(() => {
@@ -300,8 +337,14 @@ app.post('/api/pedidos/:id/cancelar', requiere(1), (req, res) => {
   const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(req.params.id);
   if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado' });
   if (pedido.estado === 'cancelado') return res.status(409).json({ error: 'El pedido ya está cancelado' });
-  if (db.prepare('SELECT id FROM pagos WHERE pedido_id = ?').get(pedido.id)) {
-    return res.status(409).json({ error: 'El pedido ya está pagado; para anularlo hable con el administrador' });
+  const pago = db.prepare('SELECT * FROM pagos WHERE pedido_id = ?').get(pedido.id);
+  if (pago) {
+    // Anular una comanda ya pagada implica devolver la plata: solo cajero o admin
+    if (NIVEL[req.usuario.rol] < 2) {
+      return res.status(403).json({ error: 'La comanda ya está pagada: solo el cajero o el administrador pueden anularla' });
+    }
+    db.prepare('DELETE FROM pagos WHERE pedido_id = ?').run(pedido.id);
+    registrarHistorial(pedido.id, req.usuario.usuarioId, 'pago_devuelto', `${pago.metodo} por ${pago.monto}`);
   }
   db.prepare("UPDATE pedidos SET estado = 'cancelado', cancelado_en = ? WHERE id = ?").run(ahora(), pedido.id);
   registrarHistorial(pedido.id, req.usuario.usuarioId, 'cancelar', `Comanda ${pedido.numero_comanda} cancelada por ${req.usuario.nombre}`);
@@ -341,21 +384,23 @@ app.post('/api/pedidos/:id/pago', requiere(2), (req, res) => {
   if (!['efectivo', 'tarjeta', 'nequi', 'daviplata', 'qr_bancolombia', 'tarjeta_debito', 'tarjeta_credito', 'billetera'].includes(metodo)) {
     return res.status(400).json({ error: 'Método de pago no válido' });
   }
+  const recTarjeta = recargoTarjetaDe(metodo, pedido.total);
+  const totalCobrar = pedido.total + recTarjeta;
   let recibido = null, vueltas = null;
   if (metodo === 'efectivo') {
     recibido = Math.round(Number(req.body.recibido));
-    if (!(recibido >= pedido.total)) return res.status(400).json({ error: 'El monto recibido es menor al total' });
-    vueltas = recibido - pedido.total;
+    if (!(recibido >= totalCobrar)) return res.status(400).json({ error: 'El monto recibido es menor al total' });
+    vueltas = recibido - totalCobrar;
   }
-  db.prepare('INSERT INTO pagos (pedido_id, metodo, monto, recibido, vueltas, cajero_id, jornada, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(pedido.id, metodo, pedido.total, recibido, vueltas, req.usuario.usuarioId, pedido.jornada, ahora());
-  registrarHistorial(pedido.id, req.usuario.usuarioId, 'pago', `${metodo} por ${pedido.total}`);
+  db.prepare('INSERT INTO pagos (pedido_id, metodo, monto, recibido, vueltas, recargo_tarjeta, cajero_id, jornada, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(pedido.id, metodo, totalCobrar, recibido, vueltas, recTarjeta, req.usuario.usuarioId, pedido.jornada, ahora());
+  registrarHistorial(pedido.id, req.usuario.usuarioId, 'pago', `${metodo} por ${totalCobrar}`);
   const items = db.prepare('SELECT * FROM pedido_items WHERE pedido_id = ?').all(pedido.id);
   const vendedor = db.prepare('SELECT nombre FROM usuarios WHERE id = ?').get(pedido.vendedor_id).nombre;
-  reportes.encolarVentaSheets(pedido, items, { metodo, creado_en: ahora() }, vendedor);
+  reportes.encolarVentaSheets(pedido, items, { metodo, creado_en: ahora(), recargo_tarjeta: recTarjeta }, vendedor);
   reportes.drenarSheets().catch(() => {}); // intento inmediato; si no hay internet queda en búfer
   emitirPedidos();
-  res.json({ ok: true, vueltas });
+  res.json({ ok: true, vueltas, recargo_tarjeta: recTarjeta, total_cobrado: totalCobrar });
 });
 
 // ---------- Reportes y cierre (cajero o admin) ----------
@@ -414,7 +459,7 @@ app.post('/api/reportes/enviar-ahora', requiere(3), (req, res) => {
 
 // ---------- Usuarios (solo admin) ----------
 app.get('/api/usuarios', requiere(3), (_req, res) => {
-  res.json(db.prepare('SELECT id, nombre, rol, activo FROM usuarios ORDER BY nombre').all());
+  res.json(db.prepare('SELECT id, nombre, rol, valor_turno, activo FROM usuarios ORDER BY nombre').all());
 });
 
 app.post('/api/usuarios', requiere(3), (req, res) => {
@@ -441,8 +486,10 @@ app.put('/api/usuarios/:id', requiere(3), (req, res) => {
     if (otro) return res.status(409).json({ error: 'Ese PIN ya está asignado a otro usuario' });
     pin = String(req.body.pin);
   }
+  // El valor del turno solo lo cambia el admin (este endpoint ya exige admin)
+  const valorTurno = req.body.valor_turno !== undefined ? Math.max(0, Math.round(Number(req.body.valor_turno) || 0)) : u.valor_turno;
   // Desactivar no borra: sus ventas históricas quedan intactas
-  db.prepare('UPDATE usuarios SET nombre = ?, rol = ?, activo = ?, pin = ? WHERE id = ?').run(nombre, rol, activo, pin, u.id);
+  db.prepare('UPDATE usuarios SET nombre = ?, rol = ?, activo = ?, pin = ?, valor_turno = ? WHERE id = ?').run(nombre, rol, activo, pin, valorTurno, u.id);
   res.json({ ok: true });
 });
 
@@ -455,7 +502,8 @@ app.get('/api/config', requiere(3), (_req, res) => {
 
 app.put('/api/config', requiere(3), (req, res) => {
   const permitidas = ['nombre_restaurante', 'recargo_empaque', 'hora_reporte', 'correo_dueno', 'gmail_usuario',
-    'gmail_app_password', 'sheets_webhook_url', 'modo_impresion', 'impresora_share', 'puerto_com', 'ancho_ticket', 'tamano_platos', 'tamano_obs'];
+    'gmail_app_password', 'sheets_webhook_url', 'modo_impresion', 'impresora_share', 'puerto_com', 'ancho_ticket', 'tamano_platos', 'tamano_obs',
+    'recargo_tarjeta_fijo', 'recargo_tarjeta_umbral', 'recargo_tarjeta_pct'];
   for (const [clave, valor] of Object.entries(req.body || {})) {
     if (!permitidas.includes(clave)) continue;
     if (clave === 'gmail_app_password' && valor === '(guardada)') continue;
@@ -464,6 +512,119 @@ app.put('/api/config', requiere(3), (req, res) => {
   impresion.procesarCola(); // por si el cambio de modo destraba trabajos pendientes
   impresion.notificarEstado();
   res.json({ ok: true });
+});
+
+// ---------- Cambios rápidos (chips de notas): los editan meseros y cajeros ----------
+app.get('/api/chips', requiere(1), (_req, res) => res.json(chipsActuales()));
+
+app.put('/api/chips', requiere(1), (req, res) => {
+  const chips = Array.isArray(req.body.chips) ? req.body.chips : null;
+  if (!chips) return res.status(400).json({ error: 'Formato no válido' });
+  const limpios = [...new Set(chips.map(c => String(c).trim()).filter(c => c && c.length <= 30))].slice(0, 12);
+  setConfig('chips_notas', JSON.stringify(limpios));
+  io.emit('chips:actualizados', limpios);
+  res.json({ ok: true, chips: limpios });
+});
+
+// ---------- Gastos del local (cajero o admin) ----------
+app.get('/api/gastos', requiere(2), (_req, res) => {
+  res.json(db.prepare(
+    `SELECT g.*, u.nombre AS usuario FROM gastos g JOIN usuarios u ON u.id = g.usuario_id
+     WHERE g.jornada = ? ORDER BY g.id DESC`).all(jornadaHoy()));
+});
+
+app.post('/api/gastos', requiere(2), (req, res) => {
+  if (!validarJornadaAbierta(res)) return;
+  const concepto = String(req.body.concepto || '').trim();
+  const valor = Math.round(Number(req.body.valor));
+  if (!concepto || !(valor > 0)) return res.status(400).json({ error: 'Concepto y valor son obligatorios' });
+  db.prepare('INSERT INTO gastos (jornada, concepto, valor, usuario_id, creado_en) VALUES (?, ?, ?, ?, ?)')
+    .run(jornadaHoy(), concepto, valor, req.usuario.usuarioId, ahora());
+  io.emit('caja:actualizada');
+  res.json({ ok: true });
+});
+
+app.delete('/api/gastos/:id', requiere(3), (req, res) => {
+  db.prepare('DELETE FROM gastos WHERE id = ? AND jornada = ?').run(req.params.id, jornadaHoy());
+  io.emit('caja:actualizada');
+  res.json({ ok: true });
+});
+
+// ---------- Nómina ----------
+function inicioSemana() {
+  const d = new Date();
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // lunes de esta semana
+  return d.toLocaleDateString('sv-SE');
+}
+function inicioQuincena() {
+  const hoy = jornadaHoy();
+  return hoy.slice(0, 8) + (Number(hoy.slice(8)) <= 15 ? '01' : '16');
+}
+function inicioMes() { return jornadaHoy().slice(0, 8) + '01'; }
+
+// El cajero registra el pago; el empleado lo confirma desde su propia sesión
+app.post('/api/nomina', requiere(2), (req, res) => {
+  if (!validarJornadaAbierta(res)) return;
+  const empleado = db.prepare('SELECT * FROM usuarios WHERE id = ? AND activo = 1').get(req.body.empleado_id);
+  if (!empleado) return res.status(404).json({ error: 'Empleado no encontrado' });
+  const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.jornada || '')) ? req.body.jornada : jornadaHoy();
+  const turno = Math.max(0, Math.round(Number(req.body.valor_turno) || 0));
+  const descuento = Math.max(0, Math.round(Number(req.body.descuento) || 0));
+  const bono = Math.max(0, Math.round(Number(req.body.bono) || 0));
+  const total = turno - descuento + bono;
+  if (total <= 0) return res.status(400).json({ error: 'El total del pago debe ser mayor a cero' });
+  const r = db.prepare(
+    `INSERT INTO nomina (empleado_id, jornada, valor_turno, descuento, bono, total, estado, registrado_por, creado_en)
+     VALUES (?, ?, ?, ?, ?, ?, 'pendiente', ?, ?)`)
+    .run(empleado.id, jornada, turno, descuento, bono, total, req.usuario.usuarioId, ahora());
+  // Aviso directo al teléfono del empleado para que confirme
+  io.to(`usuario:${empleado.id}`).emit('nomina:pendiente', {
+    id: r.lastInsertRowid, empleado: empleado.nombre, jornada, valor_turno: turno, descuento, bono, total
+  });
+  io.emit('nomina:actualizada');
+  res.json({ id: r.lastInsertRowid });
+});
+
+// Confirma el propio empleado (desde su sesión) o el admin (para quien no usa la app)
+app.post('/api/nomina/:id/confirmar', requiere(1), (req, res) => {
+  const n = db.prepare('SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id WHERE n.id = ?').get(req.params.id);
+  if (!n) return res.status(404).json({ error: 'Pago no encontrado' });
+  if (n.estado !== 'pendiente') return res.status(409).json({ error: 'El pago ya no está pendiente' });
+  if (req.usuario.usuarioId !== n.empleado_id && req.usuario.rol !== 'admin') {
+    return res.status(403).json({ error: 'Solo el empleado (o el administrador) puede confirmar este pago' });
+  }
+  db.prepare("UPDATE nomina SET estado = 'confirmado', confirmado_en = ? WHERE id = ?").run(ahora(), n.id);
+  // Ticket físico de confirmación del pago
+  impresion.encolar(null, 'nomina', ticketNomina(n, { ancho: getConfig('ancho_ticket'), hora: horaLocal() }));
+  io.emit('nomina:actualizada');
+  io.emit('caja:actualizada');
+  res.json({ ok: true });
+});
+
+app.post('/api/nomina/:id/anular', requiere(3), (req, res) => {
+  db.prepare("UPDATE nomina SET estado = 'anulado' WHERE id = ?").run(req.params.id);
+  io.emit('nomina:actualizada');
+  io.emit('caja:actualizada');
+  res.json({ ok: true });
+});
+
+// Totales por empleado: hoy, semana (desde el lunes), quincena y mes
+app.get('/api/nomina/resumen', requiere(2), (_req, res) => {
+  const hoy = jornadaHoy();
+  const sumaDesde = db.prepare(
+    "SELECT COALESCE(SUM(total), 0) AS t FROM nomina WHERE empleado_id = ? AND estado = 'confirmado' AND jornada >= ? AND jornada <= ?");
+  const empleados = db.prepare('SELECT id, nombre, rol, valor_turno FROM usuarios WHERE activo = 1 ORDER BY nombre').all()
+    .map(u => ({
+      ...u,
+      dia: sumaDesde.get(u.id, hoy, hoy).t,
+      semana: sumaDesde.get(u.id, inicioSemana(), hoy).t,
+      quincena: sumaDesde.get(u.id, inicioQuincena(), hoy).t,
+      mes: sumaDesde.get(u.id, inicioMes(), hoy).t
+    }));
+  const pendientes = db.prepare(
+    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
+     WHERE n.estado = 'pendiente' ORDER BY n.id DESC`).all();
+  res.json({ empleados, pendientes });
 });
 
 // ---------- Impresión ----------
@@ -500,6 +661,7 @@ app.get('/api/historial/:pedidoId', requiere(1), (req, res) => {
 io.on('connection', (socket) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
   const u = usuarioDeToken(token);
+  if (u) socket.join(`usuario:${u.usuarioId}`);
   socket.on('impresora:registrar', () => {
     if (!u) return socket.emit('error:auth', 'Inicie sesión antes de registrar la estación de impresión');
     impresion.registrarPuente(socket);

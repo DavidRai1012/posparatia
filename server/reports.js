@@ -24,6 +24,14 @@ function resumenJornada(jornada) {
   const pagadosIds = new Set(pagos.map(pg => pg.pedido_id));
   const porCobrar = efectivos.filter(p => !pagadosIds.has(p.id));
 
+  const gastos = db.prepare('SELECT g.*, u.nombre AS usuario FROM gastos g JOIN usuarios u ON u.id = g.usuario_id WHERE g.jornada = ?').all(jornada);
+  const nominaDia = db.prepare(
+    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
+     WHERE n.jornada = ? AND n.estado = 'confirmado'`).all(jornada);
+  const ventasEfectivo = pagos.filter(pg => pg.metodo === 'efectivo').reduce((s, pg) => s + pg.monto, 0);
+  const totalGastos = gastos.reduce((s, g) => s + g.valor, 0);
+  const totalNomina = nominaDia.reduce((s, n) => s + n.total, 0);
+
   return {
     jornada,
     totalVentas: efectivos.reduce((s, p) => s + p.total, 0),
@@ -32,8 +40,15 @@ function resumenJornada(jornada) {
     numCancelados: cancelados.length,
     totalCancelado: cancelados.reduce((s, p) => s + p.total, 0),
     totalRecargos: efectivos.reduce((s, p) => s + p.recargo, 0),
+    totalRecargoTarjeta: pagos.reduce((s, pg) => s + (pg.recargo_tarjeta || 0), 0),
     porMetodo, porVendedor,
-    porCobrar: porCobrar.map(p => ({ id: p.id, numero_comanda: p.numero_comanda, comensal: p.comensal, total: p.total, vendedor: p.vendedor }))
+    porCobrar: porCobrar.map(p => ({ id: p.id, numero_comanda: p.numero_comanda, comensal: p.comensal, total: p.total, vendedor: p.vendedor })),
+    gastos: gastos.map(g => ({ id: g.id, concepto: g.concepto, valor: g.valor, usuario: g.usuario })),
+    totalGastos,
+    nomina: nominaDia.map(n => ({ empleado: n.empleado, turno: n.valor_turno, descuento: n.descuento, bono: n.bono, total: n.total })),
+    totalNomina,
+    // Efectivo que debería haber físicamente: ventas en efectivo menos lo que salió de la caja
+    efectivoEsperado: ventasEfectivo - totalGastos - totalNomina
   };
 }
 
@@ -42,13 +57,17 @@ function ejecutarCierre(jornada, efectivoContado, usuarioId) {
   const existente = db.prepare('SELECT id FROM cierres WHERE jornada = ?').get(jornada);
   if (existente) throw new Error('La jornada ya tiene cierre de caja registrado');
   const resumen = resumenJornada(jornada);
-  const efectivoSistema = resumen.porMetodo.efectivo || 0;
-  const descuadre = efectivoContado === null ? null : efectivoContado - efectivoSistema;
+  // El efectivo esperado ya descuenta gastos del local y nómina pagada
+  const descuadre = efectivoContado === null ? null : efectivoContado - resumen.efectivoEsperado;
   db.prepare('INSERT INTO cierres (jornada, datos, efectivo_contado, descuadre, creado_en) VALUES (?, ?, ?, ?, ?)')
     .run(jornada, JSON.stringify(resumen), efectivoContado, descuadre, ahora());
   db.prepare('INSERT INTO historial (pedido_id, usuario_id, accion, detalle, creado_en) VALUES (NULL, ?, ?, ?, ?)')
     .run(usuarioId, 'cierre_caja', `Jornada ${jornada}, descuadre: ${descuadre}`, ahora());
-  return { ...resumen, efectivoSistema, efectivoContado, descuadre };
+  // Privacidad: al cerrar la jornada se borran los nombres de los clientes de la
+  // base de datos y los tickets guardados en la cola de impresión que los contienen
+  db.prepare("UPDATE pedidos SET comensal = '' WHERE jornada = ?").run(jornada);
+  db.prepare('DELETE FROM cola_impresion WHERE pedido_id IN (SELECT id FROM pedidos WHERE jornada = ?)').run(jornada);
+  return { ...resumen, efectivoSistema: resumen.porMetodo.efectivo || 0, efectivoContado, descuadre };
 }
 
 // ---- Reporte diario por correo ----
@@ -65,13 +84,26 @@ function textoReporte(resumen) {
     'Por método de pago:'
   ];
   for (const [m, v] of Object.entries(resumen.porMetodo)) lineas.push(`  - ${m}: ${fmt(v)}`);
+  if (resumen.totalRecargoTarjeta) lineas.push(`  (incluye ${fmt(resumen.totalRecargoTarjeta)} de recargos por tarjeta)`);
   lineas.push('', 'Por vendedor:');
   for (const [v, d] of Object.entries(resumen.porVendedor)) {
     lineas.push(`  - ${v}: ${d.pedidos} pedidos, ${fmt(d.total)} (cancelados: ${d.cancelados})`);
   }
+  if (resumen.gastos.length) {
+    lineas.push('', `GASTOS DEL LOCAL (${fmt(resumen.totalGastos)}):`);
+    for (const g of resumen.gastos) lineas.push(`  - ${g.concepto}: ${fmt(g.valor)} (registró ${g.usuario})`);
+  }
+  if (resumen.nomina.length) {
+    lineas.push('', `NOMINA PAGADA (${fmt(resumen.totalNomina)}):`);
+    for (const n of resumen.nomina) {
+      lineas.push(`  - ${n.empleado}: turno ${fmt(n.turno)}${n.descuento ? `, descuento -${fmt(n.descuento)}` : ''}${n.bono ? `, bono +${fmt(n.bono)}` : ''} = ${fmt(n.total)}`);
+    }
+  }
+  lineas.push('', `Efectivo esperado en caja: ${fmt(resumen.efectivoEsperado)}`);
+  lineas.push('(ventas en efectivo menos gastos y nómina)');
   if (resumen.porCobrar.length) {
     lineas.push('', 'PENDIENTES DE COBRO:');
-    for (const p of resumen.porCobrar) lineas.push(`  - Comanda ${p.numero_comanda} ${p.comensal}: ${fmt(p.total)}`);
+    for (const p of resumen.porCobrar) lineas.push(`  - Comanda ${p.numero_comanda}: ${fmt(p.total)}`);
   }
   return lineas.join('\n');
 }
@@ -127,17 +159,18 @@ async function drenarCorreos() {
 
 // ---- Google Sheets (webhook de Apps Script, sin OAuth para mantenerlo simple) ----
 function encolarVentaSheets(pedido, items, pago, vendedor) {
+  // Privacidad: el nombre del comensal NUNCA se envía a Google Sheets
   const fila = {
     fecha: pedido.jornada,
     hora: (pago.creado_en || '').slice(11, 16),
     comanda: pedido.numero_comanda,
-    comensal: pedido.comensal,
     vendedor,
     tipo_entrega: pedido.tipo_entrega,
     detalle: items.map(i => `${i.cantidad}x ${i.plato_nombre}`).join('; '),
     metodo_pago: pago.metodo,
     recargo: pedido.recargo,
-    total: pedido.total
+    recargo_tarjeta: pago.recargo_tarjeta || 0,
+    total: pedido.total + (pago.recargo_tarjeta || 0)
   };
   db.prepare('INSERT INTO cola_sheets (payload, estado, creado_en) VALUES (?, ?, ?)')
     .run(JSON.stringify(fila), 'pendiente', ahora());

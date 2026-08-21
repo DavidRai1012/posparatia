@@ -15,8 +15,17 @@ const METODOS_COBRO = [
   ['nequi', '🟣 Nequi'], ['daviplata', '🔴 Daviplata'],
   ['qr_bancolombia', '🟡 QR Bancolombia']
 ];
-// Cambios rápidos por plato (1 toque en el ticket)
-const CHIPS_NOTAS = ['Sin arroz', 'Sin sopa', 'Sin ensalada'];
+// Cambios rápidos por plato: se cargan del servidor y los editan meseros/cajeros en Menú
+function chipsNotas() { return (state.config && state.config.chips_notas) || []; }
+
+// Recargo por pago con tarjeta (el servidor recalcula; esto es solo para mostrar)
+function recargoTarjetaCliente(monto) {
+  const c = state.config || {};
+  if (!monto) return 0;
+  return monto < (c.recargo_tarjeta_umbral || 0)
+    ? (c.recargo_tarjeta_fijo || 0)
+    : Math.round(monto * (c.recargo_tarjeta_pct || 0) / 100);
+}
 
 const state = {
   token: localStorage.getItem('pos_token') || null,
@@ -30,8 +39,9 @@ const state = {
   notaExtras: { chips: [], custom: '' },    // nota del bloque de extras sueltos
   pantalla: 'entrada', itemAbierto: null, ticketAbierto: false,
   comensal: '', tipoEntrega: 'mesa', editandoId: null,
+  valorDomicilio: '', imprimirExtras: false,
   enviandoPedido: false, pagoMetodo: null, pagoRecibido: '',
-  uuidsPropios: new Set(),
+  uuidsPropios: new Set(), nominaPendientes: [],
   cobrandoId: null, cobroMetodo: 'efectivo', cobroRecibido: '',
   // estación de impresión
   estacion: { activa: false, via: 'rawbt', bleChar: null, bleNombre: '', log: [] },
@@ -209,6 +219,40 @@ async function iniciarApp() {
   conectarSocket();
   renderTabs();
   cambiarVista(state.vista);
+  state.nominaPendientes = estado.nominaPendienteMia || [];
+  mostrarConfirmacionNomina();
+}
+
+// Modal para que el empleado confirme desde SU teléfono el pago de nómina
+function mostrarConfirmacionNomina() {
+  if (document.querySelector('#overlay-nomina')) return;
+  const n = state.nominaPendientes[0];
+  if (!n) return;
+  const div = document.createElement('div');
+  div.id = 'overlay-nomina';
+  div.innerHTML = `
+    <div class="red-caja">
+      <h2>💰 Pago de nómina</h2>
+      <div class="suave" style="margin:6px 0">Fecha del turno: ${esc(n.jornada)}</div>
+      <div class="fila suave"><span>Turno</span><span class="der">${fmt(n.valor_turno)}</span></div>
+      ${n.descuento ? `<div class="fila suave"><span>Descuento</span><span class="der">-${fmt(n.descuento)}</span></div>` : ''}
+      ${n.bono ? `<div class="fila suave"><span>Bono</span><span class="der">+${fmt(n.bono)}</span></div>` : ''}
+      <div class="fila grande" style="margin:8px 0"><span>TOTAL</span><span class="der">${fmt(n.total)}</span></div>
+      <button class="btn ok" id="btn-nomina-confirmar">✓ Confirmo que recibí este pago</button>
+      <button class="enlace-suave" id="btn-nomina-despues">Después</button>
+    </div>`;
+  document.body.appendChild(div);
+  $('#btn-nomina-confirmar').onclick = async () => {
+    try {
+      await api(`/nomina/${n.id}/confirmar`, { method: 'POST' });
+      beep(990, 0.12); vibrar(80);
+      toast('Pago confirmado; sale el ticket de nómina');
+      state.nominaPendientes.shift();
+      div.remove();
+      mostrarConfirmacionNomina();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#btn-nomina-despues').onclick = () => { state.nominaPendientes.shift(); div.remove(); mostrarConfirmacionNomina(); };
 }
 
 function conectarSocket() {
@@ -225,6 +269,10 @@ function conectarSocket() {
     beep(700, 0.1); vibrar(50);
     toast(`🔔 Comanda ${String(d.numero_comanda).padStart(3, '0')} guardada — ${d.comensal} (${d.vendedor})`);
   });
+  socket.on('chips:actualizados', (chips) => { state.config.chips_notas = chips; refrescarVistaEnVivo(['tomar', 'menu']); });
+  socket.on('caja:actualizada', () => refrescarVistaEnVivo(['caja']));
+  socket.on('nomina:actualizada', () => refrescarVistaEnVivo(['caja']));
+  socket.on('nomina:pendiente', (n) => { state.nominaPendientes.push(n); mostrarConfirmacionNomina(); });
   socket.on('trabajo:imprimir', manejarTrabajoImpresion);
   socket.on('connect', renderBanner);
   socket.on('disconnect', renderBanner);
@@ -309,8 +357,14 @@ function totalCarrito() {
   for (const lista of Object.values(state.sel)) {
     for (const it of lista) { const p = platoDe(it.platoId); if (p) total += p.precio; }
   }
-  if (state.tipoEntrega === 'llevar') total += Number(state.config.recargo_empaque || 0);
+  if (state.tipoEntrega === 'llevar') total += recargoDomicilioActual();
   return total;
+}
+
+function recargoDomicilioActual() {
+  if (state.tipoEntrega !== 'llevar') return 0;
+  const v = String(state.valorDomicilio).trim();
+  return v === '' ? Number(state.config.recargo_empaque || 0) : Math.max(0, Math.round(Number(v) || 0));
 }
 
 // Regla acordada: el ticket solo se habilita con SOLO extras, o con almuerzos
@@ -354,8 +408,8 @@ function parsearNota(nota) {
   const parteChips = i < 0 ? nota : nota.slice(0, i);
   const custom = i < 0 ? '' : nota.slice(i + 1);
   const partes = parteChips.split(', ').map(s => s.trim()).filter(Boolean);
-  const chips = partes.filter(p => CHIPS_NOTAS.includes(p));
-  const resto = partes.filter(p => !CHIPS_NOTAS.includes(p));
+  const chips = partes.filter(p => chipsNotas().includes(p));
+  const resto = partes.filter(p => !chipsNotas().includes(p));
   return { chips, custom: [...resto, custom.trim()].filter(Boolean).join(', ') };
 }
 
@@ -469,9 +523,10 @@ function renderTomar() {
 // tocar un PLATO abre sus cambios rápidos y observaciones propias.
 function renderTicket() {
   const llevar = state.tipoEntrega === 'llevar';
-  const recargo = llevar ? Number(state.config.recargo_empaque || 0) : 0;
+  const est = estadoTicket();
   const { bloques, sobrantes } = derivarBloques();
   const puedeConfirmar = state.editandoId || state.pagoMetodo;
+  const recTarjeta = state.pagoMetodo === 'tarjeta' ? recargoTarjetaCliente(totalCarrito()) : 0;
 
   const notaDe = (uid) => {
     if (!state.notas[uid]) state.notas[uid] = { chips: [], custom: '' };
@@ -497,7 +552,7 @@ function renderTicket() {
       ${abierto ? `
       <div class="lt-detalle">
         <div class="chips">
-          ${CHIPS_NOTAS.map(ch => `<button class="chip-nota ${nota.chips.includes(ch) ? 'sel' : ''}"
+          ${chipsNotas().map(ch => `<button class="chip-nota ${nota.chips.includes(ch) ? 'sel' : ''}"
             data-chip="${esc(ch)}" data-chip-uid="${it.uid}">${esc(ch)}</button>`).join('')}
         </div>
         <input class="nota-inline" data-obs-uid="${it.uid}" placeholder="Observaciones (ej: mas arroz en vez de platano)"
@@ -533,10 +588,19 @@ function renderTicket() {
       </button>
     </div>
 
+    ${llevar ? `<input id="in-domicilio" class="nota-inline" type="text" inputmode="numeric" pattern="[0-9]*"
+      placeholder="Valor del domicilio (vacío = ${fmt(Number(state.config.recargo_empaque || 0))})"
+      value="${esc(state.valorDomicilio)}" style="margin-top:8px">` : ''}
+
     <div class="tarjeta" style="margin-top:10px">
-      ${llevar ? `<div class="fila suave"><span>Recargo domiciliario</span><span class="der">${fmt(recargo)}</span></div>` : ''}
-      <div class="fila grande" style="font-size:18px"><span>Total</span><span class="der">${fmt(totalCarrito())}</span></div>
+      ${llevar ? `<div class="fila suave"><span>🛵 Domicilio</span><span class="der" id="linea-dom">${fmt(recargoDomicilioActual())}</span></div>` : ''}
+      <div class="fila grande" style="font-size:18px"><span>Total</span><span class="der" id="total-ticket">${fmt(totalCarrito())}</span></div>
+      ${recTarjeta ? `<div class="fila suave" style="color:var(--alerta)"><span>Recargo tarjeta</span><span class="der">+${fmt(recTarjeta)} → ${fmt(totalCarrito() + recTarjeta)}</span></div>` : ''}
     </div>
+
+    ${!state.editandoId && est.modo === 'extras' ? `
+    <button id="btn-imprimir-extras" class="btn-mini ${state.imprimirExtras ? 'primario' : ''}" style="margin-top:10px;width:100%">
+      ${state.imprimirExtras ? '🖨 Se imprimirá comanda en cocina' : '🔕 Sin comanda en cocina (solo registrar la venta)'}</button>` : ''}
 
     ${!state.editandoId ? `
     <div class="cat-titulo">Forma de pago</div>
@@ -557,7 +621,7 @@ function renderTicket() {
       <span>${state.enviandoPedido ? 'ENVIANDO...' : (state.editandoId ? 'GUARDAR Y REIMPRIMIR' : 'CONFIRMAR PEDIDO')}</span>
       <span class="be-total">
         ${llevar ? '<span class="badge-llevar">DOMICILIO</span>' : ''}
-        ${fmt(totalCarrito())}
+        <span id="total-boton">${fmt(totalCarrito() + recTarjeta)}</span>
       </span>
     </button>
     ${!state.editandoId ? `<button id="btn-pagar-despues" class="enlace-suave">Enviar sin pago (cobrar en caja después)</button>` : ''}
@@ -567,6 +631,20 @@ function renderTicket() {
   $('#btn-volver').onclick = () => { state.ticketAbierto = false; state.itemAbierto = null; renderTomar(); };
   $('#in-comensal').oninput = (e) => { state.comensal = e.target.value; };
   $('#btn-llevar').onclick = () => { state.tipoEntrega = llevar ? 'mesa' : 'llevar'; vibrar(30); renderTicket(); };
+  // El valor del domicilio actualiza los totales EN SU SITIO (re-dibujar rompe el cursor)
+  if ($('#in-domicilio')) $('#in-domicilio').oninput = (e) => {
+    state.valorDomicilio = e.target.value.replace(/[^0-9]/g, '');
+    if (e.target.value !== state.valorDomicilio) e.target.value = state.valorDomicilio;
+    const rt = state.pagoMetodo === 'tarjeta' ? recargoTarjetaCliente(totalCarrito()) : 0;
+    if ($('#linea-dom')) $('#linea-dom').textContent = fmt(recargoDomicilioActual());
+    if ($('#total-ticket')) $('#total-ticket').textContent = fmt(totalCarrito());
+    if ($('#total-boton')) $('#total-boton').textContent = fmt(totalCarrito() + rt);
+    actualizarVueltasTicket();
+  };
+  if ($('#btn-imprimir-extras')) $('#btn-imprimir-extras').onclick = () => {
+    state.imprimirExtras = !state.imprimirExtras;
+    vibrar(25); renderTicket();
+  };
 
   $('#vista').querySelectorAll('[data-item]').forEach(b => b.onclick = () => {
     const uid = Number(b.dataset.item);
@@ -638,6 +716,7 @@ function limpiarFormulario() {
   state.comensal = ''; state.tipoEntrega = 'mesa';
   state.editandoId = null; state.editandoNumero = null;
   state.pagoMetodo = null; state.pagoRecibido = '';
+  state.valorDomicilio = ''; state.imprimirExtras = false;
 }
 
 function tomarBorrador() {
@@ -651,7 +730,8 @@ function tomarBorrador() {
     notas: JSON.parse(JSON.stringify(state.notas)),
     notaExtras: JSON.parse(JSON.stringify(state.notaExtras)),
     comensal: state.comensal, tipoEntrega: state.tipoEntrega,
-    pagoMetodo: state.pagoMetodo, pagoRecibido: state.pagoRecibido
+    pagoMetodo: state.pagoMetodo, pagoRecibido: state.pagoRecibido,
+    valorDomicilio: state.valorDomicilio, imprimirExtras: state.imprimirExtras
   };
 }
 
@@ -674,6 +754,10 @@ async function enviarPedido(conPago) {
   });
 
   const cuerpo = { comensal: state.comensal.trim(), tipo_entrega: state.tipoEntrega, items };
+  if (state.tipoEntrega === 'llevar' && String(state.valorDomicilio).trim() !== '') {
+    cuerpo.recargo_domicilio = Number(state.valorDomicilio);
+  }
+  if (!state.editandoId && est.modo === 'extras' && !state.imprimirExtras) cuerpo.imprimir = false;
   if (!state.editandoId && conPago && state.pagoMetodo) {
     if (state.pagoMetodo === 'efectivo' && state.pagoRecibido && Number(state.pagoRecibido) < totalCarrito()) {
       vibrar([60, 40, 60]); return toast('El monto recibido es menor al total', true);
@@ -706,7 +790,9 @@ async function enviarPedido(conPago) {
   try {
     const creado = await enviarConReintentos(cuerpo);
     beep(990, 0.12); vibrar(80);
-    toast(`✅ Comanda ${String(creado.numero_comanda).padStart(3, '0')} guardada en el PC` +
+    toast(`✅ Comanda ${String(creado.numero_comanda).padStart(3, '0')} registrada` +
+      (creado.impreso === false ? ' (sin comanda en cocina)' : '') +
+      (creado.recargo_tarjeta ? ` · Con recargo tarjeta: ${fmt(creado.total_cobrado)}` : '') +
       (creado.vueltas ? ` · Vueltas: ${fmt(creado.vueltas)}` : ''));
   } catch (e) {
     Object.assign(state, borrador);
@@ -767,9 +853,8 @@ function renderHistorial() {
     ${comandas.length === 0 ? '<div class="tarjeta suave">Aún no hay comandas en esta jornada.</div>' : ''}
     ${comandas.map(p => tarjetaPedido(p, bloqueada ? '' : `
       ${!p.pagado && puedeCobrar ? `<button class="btn-mini ok" data-cobrar="${p.id}">💰 Cobrar</button>` : ''}
-      ${!p.pagado ? `
-      <button class="btn-mini primario" data-editar="${p.id}">✏️ Editar</button>
-      <button class="btn-mini peligro" data-cancelar="${p.id}">✕ Anular</button>` : ''}
+      ${!p.pagado ? `<button class="btn-mini primario" data-editar="${p.id}">✏️ Editar</button>` : ''}
+      <button class="btn-mini peligro" data-cancelar="${p.id}">✕ Anular</button>
       <button class="btn-mini" data-reimprimir="${p.id}">🖨️ Reimprimir</button>
     `)).join('')}
     ${anuladas.length ? `<h3>Anuladas (${anuladas.length})</h3>${anuladas.map(p => tarjetaPedido(p, '')).join('')}` : ''}`;
@@ -781,9 +866,14 @@ function conectarBotonesPedidos() {
   const v = $('#vista');
   v.querySelectorAll('[data-cancelar]').forEach(b => b.onclick = async () => {
     const p = state.pedidos.find(x => x.id === Number(b.dataset.cancelar));
-    if (!confirm(`¿Cancelar la comanda #${String(p.numero_comanda).padStart(3, '0')} de ${p.comensal}?\nSe imprimirá un aviso de ANULADO en cocina.`)) return;
-    try { await api(`/pedidos/${b.dataset.cancelar}/cancelar`, { method: 'POST' }); toast('Pedido cancelado; aviso enviado a cocina'); }
-    catch (e) { toast(e.message, true); }
+    const aviso = p.pagado
+      ? `¿Anular la comanda #${String(p.numero_comanda).padStart(3, '0')} YA PAGADA?\nEl pago se descuenta de la caja (devolución) y se imprime ANULADO en cocina.`
+      : `¿Anular la comanda #${String(p.numero_comanda).padStart(3, '0')}?\nSe imprimirá un aviso de ANULADO en cocina.`;
+    if (!confirm(aviso)) return;
+    try {
+      await api(`/pedidos/${b.dataset.cancelar}/cancelar`, { method: 'POST' });
+      toast(p.pagado ? 'Comanda anulada y pago devuelto' : 'Comanda anulada; aviso enviado a cocina');
+    } catch (e) { toast(e.message, true); }
   });
   v.querySelectorAll('[data-reimprimir]').forEach(b => b.onclick = async () => {
     try { await api(`/pedidos/${b.dataset.reimprimir}/reimprimir`, { method: 'POST' }); toast('Reimpresión enviada'); }
@@ -804,6 +894,7 @@ function cargarParaEditar(pedidoId) {
   state.editandoNumero = '#-' + String(p.numero_comanda).padStart(3, '0');
   state.comensal = p.comensal;
   state.tipoEntrega = p.tipo_entrega;
+  state.valorDomicilio = p.tipo_entrega === 'llevar' ? String(p.recargo) : '';
   state.sel = { entrada: [], proteina: [], bebida: [], extra: [] };
   state.notas = {}; state.notaExtras = { chips: [], custom: '' };
   state.itemAbierto = null;
@@ -833,6 +924,7 @@ function renderCaja() {
 
   let htmlCobro = '';
   if (cobrando) {
+    const recTCobro = state.cobroMetodo === 'tarjeta' ? recargoTarjetaCliente(cobrando.total) : 0;
     htmlCobro = `
       <div class="tarjeta" style="border-color: var(--primario)">
         <h3 style="margin-top:0">Cobrar comanda #${String(cobrando.numero_comanda).padStart(3, '0')} — ${esc(cobrando.comensal)}</h3>
@@ -841,6 +933,8 @@ function renderCaja() {
           ${METODOS_COBRO.map(([k, v]) =>
             `<button class="pago-btn ${state.cobroMetodo === k ? 'sel' : ''}" data-metodo="${k}">${v}</button>`).join('')}
         </div>
+        ${recTCobro ? `<div class="aviso-vueltas" style="color:var(--alerta);font-size:15px">
+          Recargo tarjeta +${fmt(recTCobro)} · Total a cobrar: ${fmt(cobrando.total + recTCobro)}</div>` : ''}
         ${state.cobroMetodo === 'efectivo' ? `
           <label>Recibido en efectivo</label>
           <input id="in-recibido" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="Ej: 50000" value="${esc(state.cobroRecibido)}">
@@ -859,6 +953,19 @@ function renderCaja() {
     ${sinPagar.length === 0 ? '<div class="tarjeta suave">Todo está cobrado. 🎉</div>' : ''}
     ${sinPagar.map(p => tarjetaPedido(p, state.jornadaCerrada ? '' :
       `<button class="btn-mini ok" data-cobrar2="${p.id}">💰 Cobrar</button>`)).join('')}
+    <h3>💸 Gastos del local</h3>
+    <div class="tarjeta">
+      <input id="ga-concepto" placeholder="Concepto (ej: guantes para cocina, proveedor verduras)" autocomplete="off">
+      <div class="fila" style="margin-top:8px">
+        <input id="ga-valor" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="Valor" style="flex:1">
+        <button class="btn-mini ok" id="btn-gasto" style="flex:1">Registrar gasto</button>
+      </div>
+      <div id="lista-gastos" style="margin-top:8px"><span class="suave">Cargando...</span></div>
+    </div>
+
+    <h3>👥 Nómina</h3>
+    <div class="tarjeta" id="zona-nomina"><span class="suave">Cargando...</span></div>
+
     <h3>Resumen del día</h3>
     <div class="tarjeta" id="resumen-dia"><span class="suave">Cargando...</span></div>
     <h3>Cierre de caja</h3>
@@ -900,7 +1007,9 @@ function renderCaja() {
           method: 'POST',
           body: { metodo: state.cobroMetodo, recibido: state.cobroMetodo === 'efectivo' ? Number(state.cobroRecibido) : undefined }
         });
-        toast(r.vueltas != null ? `Pago registrado. Vueltas: ${fmt(r.vueltas)}` : 'Pago registrado');
+        toast('Pago registrado' +
+          (r.recargo_tarjeta ? ` (cobrado ${fmt(r.total_cobrado)} con recargo tarjeta)` : '') +
+          (r.vueltas != null ? ` · Vueltas: ${fmt(r.vueltas)}` : ''));
         state.cobrandoId = null;
       } catch (e) { toast(e.message, true); }
     };
@@ -928,7 +1037,115 @@ function renderCaja() {
     } catch (e) { toast(e.message, true); }
   };
 
+  if ($('#btn-gasto')) $('#btn-gasto').onclick = async () => {
+    try {
+      await api('/gastos', { method: 'POST', body: { concepto: $('#ga-concepto').value, valor: $('#ga-valor').value } });
+      toast('Gasto registrado (se descuenta del efectivo esperado)');
+      $('#ga-concepto').value = ''; $('#ga-valor').value = '';
+      cargarGastos(); cargarResumenDia();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  cargarGastos();
+  cargarNomina();
   cargarResumenDia();
+}
+
+async function cargarGastos() {
+  try {
+    const gastos = await api('/gastos');
+    const cont = $('#lista-gastos');
+    if (!cont) return;
+    const total = gastos.reduce((s, g) => s + g.valor, 0);
+    cont.innerHTML = gastos.length ? gastos.map(g => `
+      <div class="fila suave" style="padding:3px 0">
+        <span class="crece">${esc(g.concepto)} <em>(${esc(g.usuario)})</em></span>
+        <span>${fmt(g.valor)}</span>
+        ${state.usuario.rol === 'admin' ? `<button class="btn-mini peligro" data-gasto-borrar="${g.id}">✕</button>` : ''}
+      </div>`).join('') + `<div class="fila" style="margin-top:4px"><b class="crece">Total gastos hoy</b><b>${fmt(total)}</b></div>`
+      : '<span class="suave">Sin gastos registrados hoy</span>';
+    cont.querySelectorAll('[data-gasto-borrar]').forEach(b => b.onclick = async () => {
+      if (!confirm('¿Eliminar este gasto?')) return;
+      try { await api(`/gastos/${b.dataset.gastoBorrar}`, { method: 'DELETE' }); cargarGastos(); cargarResumenDia(); }
+      catch (e) { toast(e.message, true); }
+    });
+  } catch { /* la vista pudo cambiar */ }
+}
+
+async function cargarNomina() {
+  try {
+    const r = await api('/nomina/resumen');
+    const cont = $('#zona-nomina');
+    if (!cont) return;
+    const hoy = new Date().toLocaleDateString('sv-SE');
+    cont.innerHTML = `
+      <label>Empleado</label>
+      <select id="no-emp">${r.empleados.map(e =>
+        `<option value="${e.id}" data-turno="${e.valor_turno}">${esc(e.nombre)} (turno ${fmt(e.valor_turno)})</option>`).join('')}</select>
+      <div class="fila" style="margin-top:8px">
+        <div class="crece"><label>Fecha del turno</label><input id="no-fecha" type="date" value="${hoy}"></div>
+        <div class="crece"><label>Valor del turno</label><input id="no-turno" type="text" inputmode="numeric" pattern="[0-9]*"
+          value="${r.empleados.length ? r.empleados[0].valor_turno : 0}"></div>
+      </div>
+      <div class="fila" style="margin-top:8px">
+        <div class="crece"><label>Descuento</label><input id="no-desc" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
+        <div class="crece"><label>Bono</label><input id="no-bono" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
+      </div>
+      <div class="fila" style="margin-top:8px"><span class="crece suave">Total a pagar</span><b id="no-total" class="grande" style="font-size:17px"></b></div>
+      <button class="btn ok" id="btn-nomina-registrar" style="margin-top:8px">Registrar pago (el empleado confirma en su app)</button>
+      <div class="suave" style="margin-top:4px">El valor del turno por empleado lo configura el admin en la pestaña Admin.</div>
+
+      ${r.pendientes.length ? `<hr class="sep"><b>Pendientes de confirmación:</b>
+        ${r.pendientes.map(n => `
+        <div class="fila suave" style="padding:4px 0">
+          <span class="crece">${esc(n.empleado)} · ${esc(n.jornada)}</span>
+          <span>${fmt(n.total)}</span>
+          ${state.usuario.rol === 'admin' ? `
+            <button class="btn-mini ok" data-nomina-conf="${n.id}">✓</button>
+            <button class="btn-mini peligro" data-nomina-anular="${n.id}">✕</button>` : ''}
+        </div>`).join('')}` : ''}
+
+      <hr class="sep">
+      <b>Totales pagados por empleado:</b>
+      <div style="overflow-x:auto"><table>
+        <tr><th>Empleado</th><th class="num">Hoy</th><th class="num">Semana</th><th class="num">Quincena</th><th class="num">Mes</th></tr>
+        ${r.empleados.map(e => `
+        <tr><td>${esc(e.nombre)}</td><td class="num">${fmt(e.dia)}</td><td class="num">${fmt(e.semana)}</td>
+        <td class="num">${fmt(e.quincena)}</td><td class="num">${fmt(e.mes)}</td></tr>`).join('')}
+      </table></div>`;
+
+    const actualizarTotalNomina = () => {
+      const t = (Number($('#no-turno').value) || 0) - (Number($('#no-desc').value) || 0) + (Number($('#no-bono').value) || 0);
+      $('#no-total').textContent = fmt(t);
+    };
+    $('#no-emp').onchange = () => {
+      $('#no-turno').value = $('#no-emp').selectedOptions[0].dataset.turno;
+      actualizarTotalNomina();
+    };
+    ['#no-turno', '#no-desc', '#no-bono'].forEach(s => { $(s).oninput = actualizarTotalNomina; });
+    actualizarTotalNomina();
+
+    $('#btn-nomina-registrar').onclick = async () => {
+      try {
+        await api('/nomina', { method: 'POST', body: {
+          empleado_id: Number($('#no-emp').value), jornada: $('#no-fecha').value,
+          valor_turno: $('#no-turno').value, descuento: $('#no-desc').value || 0, bono: $('#no-bono').value || 0
+        }});
+        toast('Pago registrado: el empleado debe confirmarlo en su teléfono');
+        cargarNomina();
+      } catch (e) { toast(e.message, true); }
+    };
+    cont.querySelectorAll('[data-nomina-conf]').forEach(b => b.onclick = async () => {
+      if (!confirm('¿Confirmar este pago en nombre del empleado? (para quien no usa la app)')) return;
+      try { await api(`/nomina/${b.dataset.nominaConf}/confirmar`, { method: 'POST' }); toast('Pago confirmado; sale el ticket'); cargarNomina(); cargarResumenDia(); }
+      catch (e) { toast(e.message, true); }
+    });
+    cont.querySelectorAll('[data-nomina-anular]').forEach(b => b.onclick = async () => {
+      if (!confirm('¿Anular este registro de pago?')) return;
+      try { await api(`/nomina/${b.dataset.nominaAnular}/anular`, { method: 'POST' }); cargarNomina(); }
+      catch (e) { toast(e.message, true); }
+    });
+  } catch { /* la vista pudo cambiar */ }
 }
 
 async function cargarResumenDia() {
@@ -946,7 +1163,12 @@ async function cargarResumenDia() {
         `<div class="fila suave"><span>${METODOS[m] || m}</span><span class="der">${fmt(v)}</span></div>`).join('') || '<div class="suave">Sin pagos aún</div>'}
       <hr class="sep">
       ${Object.entries(r.porVendedor).map(([v, d]) =>
-        `<div class="fila suave"><span>👤 ${esc(v)} (${d.pedidos} pedidos)</span><span class="der">${fmt(d.total)}</span></div>`).join('')}`;
+        `<div class="fila suave"><span>👤 ${esc(v)} (${d.pedidos} pedidos)</span><span class="der">${fmt(d.total)}</span></div>`).join('')}
+      <hr class="sep">
+      <div class="fila suave"><span>💸 Gastos del local</span><span class="der">-${fmt(r.totalGastos)}</span></div>
+      <div class="fila suave"><span>👥 Nómina pagada</span><span class="der">-${fmt(r.totalNomina)}</span></div>
+      ${r.totalRecargoTarjeta ? `<div class="fila suave"><span>Recargos tarjeta cobrados</span><span class="der">${fmt(r.totalRecargoTarjeta)}</span></div>` : ''}
+      <div class="fila" style="font-weight:800"><span>Efectivo esperado en caja</span><span class="der">${fmt(r.efectivoEsperado)}</span></div>`;
   } catch { /* la vista pudo cambiar */ }
 }
 
@@ -976,6 +1198,15 @@ function renderMenu() {
         </select>
       </div>
       <button class="btn" id="btn-nuevo-plato" style="margin-top:10px">Agregar al menú</button>
+    </div>
+    <div class="tarjeta">
+      <h3 style="margin-top:0">⚡ Cambios rápidos (notas de 1 toque en el ticket)</h3>
+      <div class="chips">${chipsNotas().map(c =>
+        `<button class="chip-nota" data-chip-borrar="${esc(c)}">${esc(c)} ✕</button>`).join('') || '<span class="suave">No hay cambios rápidos aún</span>'}</div>
+      <div class="fila" style="margin-top:8px">
+        <input id="chip-nuevo" placeholder="Nuevo (ej: Sin cebolla)" style="flex:2" autocomplete="off">
+        <button class="btn-mini ok" id="btn-chip-agregar" style="flex:1">Agregar</button>
+      </div>
     </div>
     ${TIPOS_UI.map(([tipo, titulo]) => {
       const platos = state.platos.filter(p => p.tipo === tipo);
@@ -1021,6 +1252,18 @@ function renderMenu() {
       toast('Plato agregado; visible en todos los teléfonos');
     } catch (e) { toast(e.message, true); }
   };
+  $('#btn-chip-agregar').onclick = async () => {
+    const v = $('#chip-nuevo').value.trim();
+    if (!v) return;
+    try { await api('/chips', { method: 'PUT', body: { chips: [...chipsNotas(), v] } }); toast('Cambio rápido agregado en todos los teléfonos'); }
+    catch (e) { toast(e.message, true); }
+  };
+  $('#vista').querySelectorAll('[data-chip-borrar]').forEach(b => b.onclick = async () => {
+    const c = b.dataset.chipBorrar;
+    if (!confirm(`¿Quitar el cambio rápido "${c}"?`)) return;
+    try { await api('/chips', { method: 'PUT', body: { chips: chipsNotas().filter(x => x !== c) } }); toast('Cambio rápido eliminado'); }
+    catch (e) { toast(e.message, true); }
+  });
   $('#vista').querySelectorAll('[data-visible]').forEach(b => b.onclick = async () => {
     const p = state.platos.find(x => x.id === Number(b.dataset.visible));
     try {
@@ -1310,8 +1553,10 @@ async function renderAdmin() {
         <div class="fila">
           <div class="crece">
             <b>${esc(u.nombre)}</b> <span class="chip">${esc(u.rol)}</span>
+            <span class="chip">turno ${fmt(u.valor_turno || 0)}</span>
             ${u.activo ? '' : '<span class="chip porcobrar">INACTIVO</span>'}
           </div>
+          <button class="btn-mini" data-uturno="${u.id}">💰</button>
           <button class="btn-mini" data-upin="${u.id}">🔑 PIN</button>
           <button class="btn-mini ${u.activo ? 'peligro' : 'ok'}" data-uactivo="${u.id}" data-estado="${u.activo}">
             ${u.activo ? 'Desactivar' : 'Reactivar'}</button>
@@ -1358,6 +1603,13 @@ async function renderAdmin() {
       toast('Usuario creado'); renderAdmin();
     } catch (e) { toast(e.message, true); }
   };
+  $('#vista').querySelectorAll('[data-uturno]').forEach(b => b.onclick = async () => {
+    const u = usuarios.find(x => x.id === Number(b.dataset.uturno));
+    const v = prompt(`Valor del turno de ${u.nombre} (para nómina):`, u.valor_turno || 0);
+    if (v === null) return;
+    try { await api(`/usuarios/${u.id}`, { method: 'PUT', body: { valor_turno: Number(v) } }); toast('Turno actualizado'); renderAdmin(); }
+    catch (e) { toast(e.message, true); }
+  });
   $('#vista').querySelectorAll('[data-upin]').forEach(b => b.onclick = async () => {
     const pin = prompt('Nuevo PIN de 4 dígitos:');
     if (!pin) return;

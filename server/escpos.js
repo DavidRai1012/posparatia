@@ -95,7 +95,8 @@ function lineaEscalada(t, texto, mult, negrita) {
 
 // Parte un texto largo en líneas que quepan en el papel al multiplicador dado
 function partirParaAncho(texto, mult) {
-  const porLinea = Math.max(6, Math.floor(384 / (ALTO_BASE * mult * 0.55)));
+  // ~0.5 del alto por carácter en Arial Bold; si algo queda largo, el raster se encoge solo
+  const porLinea = Math.max(8, Math.floor(384 / (ALTO_BASE * mult * 0.5)));
   const palabras = String(texto).split(/\s+/).filter(Boolean);
   const lineas = [];
   let actual = '';
@@ -116,16 +117,17 @@ function partesDeNota(nota) {
   return { chips: nota.slice(0, i).trim(), obs: nota.slice(i + 1).trim() };
 }
 
-function agruparEnBloques(items) {
-  const conBloque = items.some(it => it.bloque !== null && it.bloque !== undefined);
-  if (!conBloque) return [items]; // compatibilidad: pedidos viejos o ticket de prueba
-  const mapa = new Map();
+// Agrupa items IGUALES (mismo plato y misma nota) y los ordena por tipo:
+// entradas, proteínas, bebidas, extras — formato pedido por cocina el 2026-08-19.
+const ORDEN_TIPO = { entrada: 0, proteina_dia: 1, proteina_especial: 1, bebida: 2, extra: 3 };
+function agruparIguales(items) {
+  const grupos = new Map();
   for (const it of items) {
-    const b = it.bloque ?? 0;
-    if (!mapa.has(b)) mapa.set(b, []);
-    mapa.get(b).push(it);
+    const clave = `${it.plato_nombre}|${it.nota || ''}`;
+    if (!grupos.has(clave)) grupos.set(clave, { nombre: it.plato_nombre, nota: it.nota, tipo: it.tipo, n: 0 });
+    grupos.get(clave).n += it.cantidad || 1;
   }
-  return [...mapa.keys()].sort((a, b) => a - b).map(k => mapa.get(k));
+  return [...grupos.values()].sort((a, b) => (ORDEN_TIPO[a.tipo] ?? 1.5) - (ORDEN_TIPO[b.tipo] ?? 1.5));
 }
 
 function ticketCocina(pedido, items, tipo, opciones = {}) {
@@ -156,27 +158,43 @@ function ticketCocina(pedido, items, tipo, opciones = {}) {
   const tamPlatos = Number(opciones.tamPlatos || 3);
   const tamObs = Number(opciones.tamObs || 2);
 
-  for (const bloque of agruparEnBloques(items)) {
-    t.separador();
-    let bloqueSinNotas = true;
-    for (const it of bloque) {
-      // El plato, al tamaño configurado (imagen: soporta tildes y tamaños intermedios)
-      const nombre = `${it.cantidad > 1 ? it.cantidad + 'X ' : ''}${it.plato_nombre}`.toUpperCase();
-      lineaEscalada(t, nombre, tamPlatos, false);
-      // Sus notas, justo debajo, al tamaño de observaciones configurado
-      const { chips, obs } = partesDeNota(it.nota);
-      if (chips) { bloqueSinNotas = false; lineaEscalada(t, `>>${chips}`, tamObs, true); }
-      if (obs) {
-        bloqueSinNotas = false;
-        lineaEscalada(t, '>>OBSERVACIONES:', tamObs, true);
-        for (const lin of partirParaAncho(obs.toUpperCase(), tamObs)) lineaEscalada(t, lin, tamObs, true);
-      }
+  t.separador();
+  for (const g of agruparIguales(items)) {
+    // "4 CREMA DE ESPINACA" — cantidad + plato al tamaño configurado
+    lineaEscalada(t, `${g.n} ${g.nombre}`.toUpperCase(), tamPlatos, false);
+    // Su nota justo debajo, entre >> <<  (los iguales CON nota distinta van por aparte)
+    const { chips, obs } = partesDeNota(g.nota);
+    const notaTexto = [chips, obs].filter(Boolean).join(', ');
+    if (notaTexto) {
+      const lineasNota = partirParaAncho(notaTexto, tamObs);
+      lineasNota[0] = '>>' + lineasNota[0];
+      lineasNota[lineasNota.length - 1] += '<<';
+      for (const lin of lineasNota) lineaEscalada(t, lin, tamObs, true);
     }
-    if (bloqueSinNotas) t.linea('>>', { altoX2: true, bold: true });
   }
+  t.separador();
 
   t.saltos(1);
   t.linea(`Nombre: ${pedido.comensal}`, { altoX2: true });
+  t.cortar();
+  return t.resultado();
+}
+
+// Ticket de confirmación de pago de nómina
+function ticketNomina(datos, opciones = {}) {
+  const fmt = (n) => '$' + Number(n || 0).toLocaleString('es-CO');
+  const t = new TicketBuilder(Number(opciones.ancho || 32));
+  t.linea('PAGO DE NOMINA', { anchoX2: true, altoX2: true, bold: true, centrar: true });
+  t.separador();
+  t.linea(`Empleado: ${datos.empleado}`, { altoX2: true });
+  t.linea(`Fecha del turno: ${datos.jornada}`);
+  t.linea(`Turno:      ${fmt(datos.valor_turno)}`);
+  if (datos.descuento) t.linea(`Descuento: -${fmt(datos.descuento)}`);
+  if (datos.bono) t.linea(`Bono:      +${fmt(datos.bono)}`);
+  t.separador();
+  t.linea(`TOTAL ${fmt(datos.total)}`, { anchoX2: true, altoX2: true, bold: true });
+  t.linea('Confirmado por el empleado en la app', {});
+  t.linea(`Hora: ${opciones.hora || ''}`);
   t.cortar();
   return t.resultado();
 }
@@ -205,4 +223,4 @@ function ticketAccesoQR(url, nombreRestaurante, ancho) {
   return t.resultado();
 }
 
-module.exports = { ticketCocina, ticketAccesoQR, transliterar };
+module.exports = { ticketCocina, ticketNomina, ticketAccesoQR, transliterar };

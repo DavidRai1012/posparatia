@@ -17,7 +17,31 @@ CREATE TABLE IF NOT EXISTS usuarios (
   nombre TEXT NOT NULL,
   pin TEXT NOT NULL UNIQUE,
   rol TEXT NOT NULL CHECK(rol IN ('admin','cajero','mesero')),
+  valor_turno INTEGER NOT NULL DEFAULT 0,
   activo INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS gastos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  jornada TEXT NOT NULL,
+  concepto TEXT NOT NULL,
+  valor INTEGER NOT NULL,
+  usuario_id INTEGER NOT NULL REFERENCES usuarios(id),
+  creado_en TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nomina (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  empleado_id INTEGER NOT NULL REFERENCES usuarios(id),
+  jornada TEXT NOT NULL,
+  valor_turno INTEGER NOT NULL,
+  descuento INTEGER NOT NULL DEFAULT 0,
+  bono INTEGER NOT NULL DEFAULT 0,
+  total INTEGER NOT NULL,
+  estado TEXT NOT NULL DEFAULT 'pendiente' CHECK(estado IN ('pendiente','confirmado','anulado')),
+  registrado_por INTEGER NOT NULL REFERENCES usuarios(id),
+  confirmado_en TEXT,
+  creado_en TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS platos (
@@ -66,6 +90,7 @@ CREATE TABLE IF NOT EXISTS pagos (
   monto INTEGER NOT NULL,
   recibido INTEGER,
   vueltas INTEGER,
+  recargo_tarjeta INTEGER NOT NULL DEFAULT 0,
   cajero_id INTEGER NOT NULL REFERENCES usuarios(id),
   jornada TEXT NOT NULL,
   creado_en TEXT NOT NULL
@@ -181,6 +206,16 @@ if (!db.prepare('PRAGMA table_info(pedido_items)').all().some(c => c.name === 'b
   console.log('[db] Migración aplicada: bloque de almuerzo en items');
 }
 
+// Migración: valor del turno por empleado y recargo de tarjeta en pagos
+if (!db.prepare('PRAGMA table_info(usuarios)').all().some(c => c.name === 'valor_turno')) {
+  db.exec('ALTER TABLE usuarios ADD COLUMN valor_turno INTEGER NOT NULL DEFAULT 0');
+  console.log('[db] Migración aplicada: valor de turno por empleado');
+}
+if (!db.prepare('PRAGMA table_info(pagos)').all().some(c => c.name === 'recargo_tarjeta')) {
+  db.exec('ALTER TABLE pagos ADD COLUMN recargo_tarjeta INTEGER NOT NULL DEFAULT 0');
+  console.log('[db] Migración aplicada: recargo de tarjeta en pagos');
+}
+
 // Migración: tipo "bebida" (jugo/limonada incluidos en el almuerzo)
 const esquemaPlatos = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'platos'").get();
 if (esquemaPlatos && !esquemaPlatos.sql.includes('bebida')) {
@@ -229,7 +264,13 @@ const CONFIG_DEFAULTS = {
   puerto_com: 'COM4',         // puerto serie del emparejamiento Bluetooth en el PC
   ancho_ticket: '32',         // caracteres por línea (32 = papel 58mm, 48 = 80mm)
   tamano_platos: '3',         // multiplicador de letra de los platos en el ticket (1 a 3)
-  tamano_obs: '2'             // multiplicador de letra de las observaciones (1 a 3)
+  tamano_obs: '2',            // multiplicador de letra de las observaciones (1 a 3)
+  // Recargo por pago con tarjeta: bajo el umbral se cobra el valor fijo; desde el umbral, el porcentaje
+  recargo_tarjeta_fijo: '1000',
+  recargo_tarjeta_umbral: '20000',
+  recargo_tarjeta_pct: '5',
+  // Cambios rápidos (chips de notas): editables por meseros y cajeros desde la pestaña Menú
+  chips_notas: '["Sin arroz","Sin sopa","Sin ensalada"]'
 };
 
 function getConfig(clave) {
