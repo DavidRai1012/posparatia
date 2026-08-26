@@ -114,7 +114,7 @@ const TIPOS_PLATO = ['entrada', 'proteina_dia', 'proteina_especial', 'bebida', '
 function precalentarMenu() {
   setTimeout(() => {
     try {
-      const nombres = platosActivos().map(p => p.nombre.toUpperCase());
+      const nombres = platosActivos().map(p => (p.acronimo || p.nombre).toUpperCase());
       const alto = Math.round(24 * Number(getConfig('tamano_platos') || 3));
       if (alto > 24) require('./texto-bitmap').precalentar(nombres, alto, { centrar: false });
     } catch (e) { console.error('[raster] precalentamiento falló:', e.message); }
@@ -129,8 +129,9 @@ app.post('/api/platos', requiere(1), (req, res) => {
   if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
   const precioSolo = req.body.precio_solo !== undefined && String(req.body.precio_solo).trim() !== ''
     ? Math.round(Number(req.body.precio_solo)) || null : null;
-  const r = db.prepare('INSERT INTO platos (nombre, precio, categoria, tipo, precio_solo) VALUES (?, ?, ?, ?, ?)')
-    .run(String(nombre).trim(), Math.round(Number(precio)), categoria || 'General', tipo, precioSolo);
+  const acronimo = String(req.body.acronimo || '').trim().slice(0, 14).toUpperCase() || null;
+  const r = db.prepare('INSERT INTO platos (nombre, precio, categoria, tipo, precio_solo, acronimo) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(String(nombre).trim(), Math.round(Number(precio)), categoria || 'General', tipo, precioSolo, acronimo);
   emitirMenu();
   precalentarMenu();
   res.json({ id: r.lastInsertRowid });
@@ -150,8 +151,12 @@ app.put('/api/platos/:id', requiere(1), (req, res) => {
   if (req.body.precio_solo !== undefined) {
     precioSolo = String(req.body.precio_solo).trim() === '' ? null : (Math.round(Number(req.body.precio_solo)) || null);
   }
-  db.prepare('UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ?, precio_solo = ? WHERE id = ?')
-    .run(nombre, precio, categoria, tipo, disponible, precioSolo, plato.id);
+  let acronimo = plato.acronimo;
+  if (req.body.acronimo !== undefined) {
+    acronimo = String(req.body.acronimo).trim().slice(0, 14).toUpperCase() || null;
+  }
+  db.prepare('UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ?, precio_solo = ?, acronimo = ? WHERE id = ?')
+    .run(nombre, precio, categoria, tipo, disponible, precioSolo, acronimo, plato.id);
   emitirMenu();
   precalentarMenu();
   res.json({ ok: true });
@@ -204,7 +209,9 @@ function imprimirPedido(pedidoId, tipo) {
   const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(pedidoId);
   // El tipo del plato viaja al ticket para ordenar: entradas, proteínas, bebidas, extras
   const items = db.prepare(
-    `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
+    `SELECT pi.*,
+            (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo,
+            (SELECT pl.acronimo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS acronimo
      FROM pedido_items pi WHERE pi.pedido_id = ?`).all(pedidoId);
   const ticket = ticketCocina(pedido, items, tipo, opcionesTicket());
   impresion.encolar(pedidoId, tipo, ticket);
@@ -602,7 +609,7 @@ app.post('/api/pedidos/:id/factura', requiere(1), (req, res) => {
     metodo: pago ? (ETIQUETAS_METODO[pago.metodo] || pago.metodo) : null
   }, { ancho: getConfig('ancho_ticket') });
   impresion.encolar(pedido.id, 'factura', ticket);
-  registrarHistorial(pedido.id, req.usuario.usuarioId, 'factura', `Cuenta de venta No. ${consecutivo}`);
+  registrarHistorial(pedido.id, req.usuario.usuarioId, 'factura', `Factura No. ${consecutivo}`);
   res.json({ ok: true, consecutivo });
 });
 

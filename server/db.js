@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS platos (
   tipo TEXT NOT NULL DEFAULT 'proteina_dia'
     CHECK(tipo IN ('entrada','proteina_dia','proteina_especial','bebida','extra')),
   precio_solo INTEGER,
+  acronimo TEXT,
   disponible INTEGER NOT NULL DEFAULT 1,
   activo INTEGER NOT NULL DEFAULT 1
 );
@@ -230,6 +231,13 @@ if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'precio_
   console.log('[db] Migración aplicada: precio de platos del día vendidos solos');
 }
 
+// Migración: acrónimo del plato para la comanda ("CREMA" en vez de
+// "Crema de champiñones con pollo"; los reportes usan el nombre completo)
+if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'acronimo')) {
+  db.exec('ALTER TABLE platos ADD COLUMN acronimo TEXT');
+  console.log('[db] Migración aplicada: acrónimos de platos');
+}
+
 // Migración: rol "cocinera" (sin acceso a la app, solo para nómina).
 // usuarios es referenciada por casi todas las tablas: hay que reconstruirla
 // con las llaves foráneas APAGADAS (las referencias son por nombre y se
@@ -313,7 +321,7 @@ const CONFIG_DEFAULTS = {
   chips_notas: '["Sin arroz","Sin sopa","Sin ensalada"]',
   // Cuenta de venta para el cliente (documento informativo; para factura
   // electrónica DIAN se requiere un proveedor autorizado)
-  factura_titulo: 'CUENTA DE VENTA',
+  factura_titulo: 'FACTURA DE VENTA',
   factura_razon_social: '',
   factura_nit: '',
   factura_direccion: '',

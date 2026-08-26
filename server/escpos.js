@@ -124,7 +124,11 @@ function agruparIguales(items) {
   const grupos = new Map();
   for (const it of items) {
     const clave = `${it.plato_nombre}|${it.nota || ''}`;
-    if (!grupos.has(clave)) grupos.set(clave, { nombre: it.plato_nombre, nota: it.nota, tipo: it.tipo, n: 0 });
+    if (!grupos.has(clave)) {
+      // En la comanda se usa el acrónimo si el plato lo tiene ("CREMA" en vez
+      // de "Crema de champiñones con pollo"); los reportes usan el nombre completo
+      grupos.set(clave, { nombre: it.acronimo || it.plato_nombre, nota: it.nota, tipo: it.tipo, n: 0 });
+    }
     grupos.get(clave).n += it.cantidad || 1;
   }
   return [...grupos.values()].sort((a, b) => (ORDEN_TIPO[a.tipo] ?? 1.5) - (ORDEN_TIPO[b.tipo] ?? 1.5));
@@ -202,7 +206,7 @@ function ticketFactura(datos, opciones = {}) {
     if (linea) t.linea(linea);
   };
 
-  t.linea(datos.titulo || 'CUENTA DE VENTA', { altoX2: true, bold: true, centrar: true });
+  t.linea(datos.titulo || 'FACTURA DE VENTA', { altoX2: true, bold: true, centrar: true });
   if (datos.razon) t.linea(datos.razon, { centrar: true, bold: true });
   if (datos.nit) t.linea(`NIT/CC: ${datos.nit}`, { centrar: true });
   if (datos.direccion) t.linea(datos.direccion, { centrar: true });

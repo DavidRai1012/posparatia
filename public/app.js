@@ -313,6 +313,7 @@ function renderTabs() {
 
 function cambiarVista(vista) {
   state.vista = vista;
+  state.enRectificar = false;
   renderTabs();
   renderBanner();
   renderVista();
@@ -882,7 +883,7 @@ function renderHistorial() {
       ${!p.pagado ? `<button class="btn-mini primario" data-editar="${p.id}">✏️ Editar</button>` : ''}
       <button class="btn-mini peligro" data-cancelar="${p.id}">✕ Anular</button>
       <button class="btn-mini" data-reimprimir="${p.id}">🖨️ Reimprimir</button>
-      <button class="btn-mini" data-factura="${p.id}">🧾 Cuenta</button>
+      <button class="btn-mini" data-factura="${p.id}">🧾 Factura</button>
     `)).join('')}
     ${anuladas.length ? `<h3>Anuladas (${anuladas.length})</h3>${anuladas.map(p => tarjetaPedido(p, '')).join('')}` : ''}`;
 
@@ -915,7 +916,7 @@ function conectarBotonesPedidos() {
   v.querySelectorAll('[data-factura]').forEach(b => b.onclick = async () => {
     try {
       const r = await api(`/pedidos/${b.dataset.factura}/factura`, { method: 'POST' });
-      toast(`🧾 Cuenta de venta No. ${String(r.consecutivo).padStart(6, '0')} impresa`);
+      toast(`🧾 Factura No. ${String(r.consecutivo).padStart(6, '0')} impresa`);
     } catch (e) { toast(e.message, true); }
   });
   v.querySelectorAll('[data-editar]').forEach(b => b.onclick = () => cargarParaEditar(Number(b.dataset.editar)));
@@ -956,6 +957,70 @@ function cargarParaEditar(pedidoId) {
   cambiarVista('tomar');
 }
 
+// Pantalla propia para rectificar métodos de pago (con 100 ventas, dentro de
+// la Caja quedaba demasiado abajo)
+function renderRectificar() {
+  $('#vista').innerHTML = `
+    <div class="ticket-cab">
+      <button class="btn-mini" id="btn-rect-volver">← Volver a Caja</button>
+      <h2 style="margin:0">🔁 Rectificar pagos</h2>
+    </div>
+    <div class="tarjeta">
+      <div class="fila">
+        <input id="rect-fecha" type="date" value="${state.jornada}" style="flex:1">
+        <select id="rect-metodo" style="flex:1">
+          <option value="">Todos los métodos</option>
+          ${METODOS_COBRO.map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}
+        </select>
+      </div>
+      <div class="suave" style="margin-top:6px">Elija el método para ver sus pagos del día y corrija el que esté mal con el selector de cada fila.</div>
+    </div>
+    <div id="lista-rect"><span class="suave">Cargando...</span></div>`;
+
+  $('#btn-rect-volver').onclick = () => { state.enRectificar = false; renderCaja(); };
+  const cargarRect = async () => {
+    const cont = $('#lista-rect');
+    if (!cont) return;
+    try {
+      const fecha = $('#rect-fecha').value || state.jornada;
+      const metodo = $('#rect-metodo').value;
+      const r = await api(`/pagos?jornada=${fecha}${metodo ? '&metodo=' + metodo : ''}`);
+      if (!r.pagos.length) { cont.innerHTML = '<div class="tarjeta suave">No hay pagos con ese filtro.</div>'; return; }
+      const totalFiltro = r.pagos.reduce((s, pg) => s + pg.monto, 0);
+      cont.innerHTML = (r.cerrada ? '<div class="tarjeta suave" style="color:var(--alerta)">⚠️ Día con cierre: solo consulta (el admin puede reabrir el día desde la Caja)</div>' : '') +
+        `<div class="tarjeta"><div class="fila"><b class="crece">${r.pagos.length} pago(s)</b><b>${fmt(totalFiltro)}</b></div></div>` +
+        r.pagos.map(pg => `
+        <div class="tarjeta">
+          <div class="fila">
+            <span class="num-comanda" style="font-size:15px">#-${String(pg.numero_comanda).padStart(3, '0')}</span>
+            <span class="suave">${esc((pg.creado_en || '').slice(11, 16))}</span>
+            <span class="crece" style="text-align:right;font-weight:800">${fmt(pg.monto)}</span>
+            <select data-rect-pedido="${pg.pedido_id}" ${r.cerrada ? 'disabled' : ''} style="width:140px">
+              ${METODOS_COBRO.map(([k, v]) => `<option value="${k}" ${pg.metodo === k ? 'selected' : ''}>${v}</option>`).join('')}
+            </select>
+          </div>
+        </div>`).join('');
+      cont.querySelectorAll('[data-rect-pedido]').forEach(sel => {
+        const original = sel.value;
+        sel.onchange = async () => {
+          const nuevo = sel.value;
+          if (!confirm(`¿Cambiar el pago de la comanda a ${METODOS[nuevo] || nuevo}?\n(Si pasa a tarjeta se suma el recargo; si deja de ser tarjeta, se quita.)`)) {
+            sel.value = original; return;
+          }
+          try {
+            const resp = await api(`/pagos/${sel.dataset.rectPedido}/metodo`, { method: 'PUT', body: { metodo: nuevo } });
+            toast(`Pago rectificado: ${METODOS[nuevo] || nuevo} por ${fmt(resp.monto)}`);
+            cargarRect();
+          } catch (e) { toast(e.message, true); sel.value = original; }
+        };
+      });
+    } catch (e) { cont.innerHTML = `<div class="tarjeta suave">${esc(e.message)}</div>`; }
+  };
+  $('#rect-fecha').onchange = cargarRect;
+  $('#rect-metodo').onchange = cargarRect;
+  cargarRect();
+}
+
 async function descargarArchivo(ruta, nombre) {
   const r = await fetch(ruta, { headers: { 'Authorization': 'Bearer ' + state.token } });
   if (!r.ok) {
@@ -972,6 +1037,7 @@ async function descargarArchivo(ruta, nombre) {
 
 // ---------------- Vista: caja ----------------
 function renderCaja() {
+  if (state.enRectificar) return renderRectificar();
   const sinPagar = state.pedidos.filter(p => p.estado !== 'cancelado' && !p.pagado);
   const cobrando = state.cobrandoId ? state.pedidos.find(p => p.id === state.cobrandoId) : null;
 
@@ -1009,17 +1075,7 @@ function renderCaja() {
       <button class="btn-mini primario" id="btn-excel" style="flex:1">📥 Descargar Excel</button>
     </div>
 
-    <h3>🔁 Rectificar métodos de pago</h3>
-    <div class="tarjeta">
-      <div class="fila">
-        <input id="rect-fecha" type="date" value="${state.jornada}" style="flex:1">
-        <select id="rect-metodo" style="flex:1">
-          <option value="">Todos los métodos</option>
-          ${METODOS_COBRO.map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}
-        </select>
-      </div>
-      <div id="lista-rect" style="margin-top:8px"><span class="suave">Cargando...</span></div>
-    </div>
+    <button class="btn gris" id="btn-ir-rect" style="margin:8px 0">🔁 Rectificar métodos de pago →</button>
 
     <h3>Cuentas por cobrar (${sinPagar.length})</h3>
     ${sinPagar.length === 0 ? '<div class="tarjeta suave">Todo está cobrado. 🎉</div>' : ''}
@@ -1095,6 +1151,7 @@ function renderCaja() {
     state.cobroMetodo = 'efectivo'; state.cobroRecibido = '';
     renderCaja();
   });
+  if ($('#btn-ir-rect')) $('#btn-ir-rect').onclick = () => { state.enRectificar = true; renderRectificar(); };
   if ($('#btn-reabrir')) $('#btn-reabrir').onclick = async () => {
     if (!confirm('¿Reabrir la jornada de hoy?\nEl cierre se borra y podrán registrarse ventas de nuevo.\n(Ojo: los nombres de clientes borrados por el cierre no se recuperan.)')) return;
     try {
@@ -1104,41 +1161,6 @@ function renderCaja() {
       renderBanner(); renderCaja();
     } catch (e) { toast(e.message, true); }
   };
-  const cargarRect = async () => {
-    const cont = $('#lista-rect');
-    if (!cont) return;
-    try {
-      const fecha = $('#rect-fecha').value || state.jornada;
-      const metodo = $('#rect-metodo').value;
-      const r = await api(`/pagos?jornada=${fecha}${metodo ? '&metodo=' + metodo : ''}`);
-      if (!r.pagos.length) { cont.innerHTML = '<span class="suave">No hay pagos con ese filtro.</span>'; return; }
-      cont.innerHTML = (r.cerrada ? '<div class="suave" style="color:var(--alerta)">⚠️ Día con cierre: solo consulta (reabra el día para rectificar)</div>' : '') +
-        r.pagos.map(pg => `
-        <div class="fila suave" style="padding:4px 0">
-          <span class="num-comanda" style="font-size:15px">#-${String(pg.numero_comanda).padStart(3, '0')}</span>
-          <span>${esc((pg.creado_en || '').slice(11, 16))}</span>
-          <span class="crece" style="text-align:right;font-weight:700">${fmt(pg.monto)}</span>
-          <select data-rect-pedido="${pg.pedido_id}" ${r.cerrada ? 'disabled' : ''} style="width:130px">
-            ${METODOS_COBRO.map(([k, v]) => `<option value="${k}" ${pg.metodo === k ? 'selected' : ''}>${v}</option>`).join('')}
-          </select>
-        </div>`).join('');
-      cont.querySelectorAll('[data-rect-pedido]').forEach(sel => {
-        const original = sel.value;
-        sel.onchange = async () => {
-          const nuevo = sel.value;
-          if (!confirm(`¿Cambiar el pago de la comanda a ${METODOS[nuevo] || nuevo}?\n(El recargo de tarjeta se recalcula automáticamente.)`)) {
-            sel.value = original; return;
-          }
-          try {
-            const resp = await api(`/pagos/${sel.dataset.rectPedido}/metodo`, { method: 'PUT', body: { metodo: nuevo } });
-            toast(`Pago rectificado: ahora ${METODOS[nuevo] || nuevo} por ${fmt(resp.monto)}`);
-            cargarRect(); cargarResumenDia();
-          } catch (e) { toast(e.message, true); sel.value = original; }
-        };
-      });
-    } catch (e) { cont.innerHTML = `<span class="suave">${esc(e.message)}</span>`; }
-  };
-  if ($('#rect-fecha')) { $('#rect-fecha').onchange = cargarRect; $('#rect-metodo').onchange = cargarRect; cargarRect(); }
   if ($('#btn-cierre')) $('#btn-cierre').onclick = async () => {
     const val = $('#in-efectivo-contado').value;
     if (!confirm('¿Ejecutar el cierre de caja? La jornada quedará bloqueada.')) return;
@@ -1345,6 +1367,7 @@ function renderMenu() {
     <div class="tarjeta">
       <h3 style="margin-top:0">Agregar plato</h3>
       <input id="np-nombre" placeholder="Nombre del plato" autocomplete="off">
+      <input id="np-acronimo" placeholder="Acrónimo para la comanda (opcional, ej: CREMA)" autocomplete="off" style="margin-top:8px">
       <div class="fila" style="margin-top:8px">
         <input id="np-precio" type="number" inputmode="numeric" placeholder="Precio" style="flex:1">
         <select id="np-tipo" style="flex:1.4">
@@ -1371,7 +1394,7 @@ function renderMenu() {
           <div class="crece">
             <div class="plato-nombre">${esc(p.nombre)}
               ${p.disponible ? '' : '<span class="chip">OCULTO</span>'}</div>
-            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}${p.precio_solo ? ` · solo ${fmt(p.precio_solo)}` : ''}</div>
+            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}${p.precio_solo ? ` · solo ${fmt(p.precio_solo)}` : ''}${p.acronimo ? ` · 🖨 ${esc(p.acronimo)}` : ''}</div>
           </div>
           <button class="btn-mini ${p.disponible ? '' : 'ok'}" data-visible="${p.id}">
             ${p.disponible ? '🚫 Ocultar' : '👁 Mostrar'}</button>
@@ -1393,6 +1416,8 @@ function renderMenu() {
           <label>Precio vendido SOLO (vacío = no se vende suelto)</label>
           <input id="ep-solo" type="number" inputmode="numeric" value="${p.precio_solo || ''}"
             placeholder="Ej: sopa sola 7500, bandeja sola 17000">
+          <label>Acrónimo para la comanda (vacío = nombre completo)</label>
+          <input id="ep-acronimo" value="${esc(p.acronimo || '')}" placeholder="Ej: CREMA" autocomplete="off">
           <div class="fila" style="margin-top:10px">
             <button class="btn-mini" id="ep-cancelar">Cancelar</button>
             <button class="btn-mini ok" id="ep-guardar">💾 Guardar cambios</button>
@@ -1404,7 +1429,8 @@ function renderMenu() {
   $('#btn-nuevo-plato').onclick = async () => {
     try {
       await api('/platos', { method: 'POST', body: {
-        nombre: $('#np-nombre').value, precio: $('#np-precio').value || 0, tipo: $('#np-tipo').value
+        nombre: $('#np-nombre').value, precio: $('#np-precio').value || 0, tipo: $('#np-tipo').value,
+        acronimo: $('#np-acronimo').value
       }});
       toast('Plato agregado; visible en todos los teléfonos');
     } catch (e) { toast(e.message, true); }
@@ -1437,7 +1463,7 @@ function renderMenu() {
     try {
       await api(`/platos/${state.editandoPlatoId}`, { method: 'PUT', body: {
         nombre: $('#ep-nombre').value, precio: $('#ep-precio').value || 0, tipo: $('#ep-tipo').value,
-        precio_solo: $('#ep-solo').value
+        precio_solo: $('#ep-solo').value, acronimo: $('#ep-acronimo').value
       }});
       state.editandoPlatoId = null;
       toast('Plato actualizado en todos los teléfonos');
@@ -1660,7 +1686,7 @@ async function renderAdmin() {
     </div>
 
     <div class="tarjeta">
-      <h3 style="margin-top:0">🧾 Cuenta de venta (datos del negocio)</h3>
+      <h3 style="margin-top:0">🧾 Factura (datos del negocio)</h3>
       <label>Título del documento</label>
       <input id="cf-fac-titulo" value="${esc(cfg.factura_titulo)}">
       <label>Razón social / nombre</label>
