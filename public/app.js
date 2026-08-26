@@ -1512,6 +1512,9 @@ function renderImpresora() {
     </div>` : ''}
 
     <h3>Cola de impresión</h3>
+    ${(imp.trabajos || []).some(t => t.estado !== 'impreso') ? `
+      <button class="btn-mini peligro" id="btn-descartar-todo" style="margin-bottom:8px">
+        🧹 Descartar todo lo no impreso (${(imp.trabajos || []).filter(t => t.estado !== 'impreso').length})</button>` : ''}
     ${(imp.trabajos || []).slice(0, 15).map(t => `
       <div class="tarjeta">
         <div class="fila">
@@ -1519,7 +1522,10 @@ function renderImpresora() {
           <span class="der chip ${t.estado === 'impreso' ? 'pagado' : t.estado === 'error' ? 'porcobrar' : ''}">${t.estado.toUpperCase()}</span>
         </div>
         ${t.error ? `<div class="suave" style="color:var(--peligro)">${esc(t.error)}</div>` : ''}
-        ${t.estado === 'error' ? `<div class="acciones"><button class="btn-mini primario" data-reintentar="${t.id}">🔁 Reintentar</button></div>` : ''}
+        ${t.estado !== 'impreso' ? `<div class="acciones">
+          ${t.estado === 'error' ? `<button class="btn-mini primario" data-reintentar="${t.id}">🔁 Reintentar</button>` : ''}
+          <button class="btn-mini peligro" data-descartar="${t.id}">✕ Descartar</button>
+        </div>` : ''}
       </div>`).join('') || '<div class="tarjeta suave">Sin trabajos de impresión todavía.</div>'}
     ${est.log.length ? `<h3>Registro de esta estación</h3><div class="tarjeta suave">${est.log.slice(-8).map(esc).join('<br>')}</div>` : ''}`;
 
@@ -1577,6 +1583,18 @@ function renderImpresora() {
     try { await api(`/impresion/${b.dataset.reintentar}/reintentar`, { method: 'POST' }); toast('Reintentando impresión'); }
     catch (e) { toast(e.message, true); }
   });
+  $('#vista').querySelectorAll('[data-descartar]').forEach(b => b.onclick = async () => {
+    if (!confirm('¿Descartar este trabajo de impresión?\n(La comanda no se borra: puede reimprimirla desde el Historial.)')) return;
+    try { await api(`/impresion/${b.dataset.descartar}/descartar`, { method: 'POST' }); toast('Trabajo descartado'); }
+    catch (e) { toast(e.message, true); }
+  });
+  if ($('#btn-descartar-todo')) $('#btn-descartar-todo').onclick = async () => {
+    if (!confirm('¿Descartar TODOS los trabajos pendientes y con error?\n(Las comandas no se borran: se pueden reimprimir desde el Historial.)')) return;
+    try {
+      const r = await api('/impresion/descartar-fallidos', { method: 'POST' });
+      toast(`🧹 ${r.descartados} trabajo(s) descartado(s); la alerta desaparece`);
+    } catch (e) { toast(e.message, true); }
+  };
 }
 
 function nombreModo(m) {

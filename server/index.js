@@ -906,6 +906,16 @@ app.post('/api/impresion/:id/reintentar', requiere(1), (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/impresion/:id/descartar', requiere(1), (req, res) => {
+  impresion.descartarTrabajo(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/impresion/descartar-fallidos', requiere(1), (req, res) => {
+  const n = impresion.descartarNoImpresos();
+  res.json({ ok: true, descartados: n });
+});
+
 app.post('/api/impresion/prueba', requiere(3), (req, res) => {
   const ticket = ticketCocina(
     { numero_comanda: 0, comensal: 'PRUEBA', tipo_entrega: 'mesa' },

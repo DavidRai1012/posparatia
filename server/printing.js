@@ -171,6 +171,20 @@ function reintentarTrabajo(id) {
   procesarCola();
 }
 
+// Descartar trabajos que ya no interesan (p. ej. comandas atascadas por una
+// impresora mal configurada). El pedido no se toca: se puede Reimprimir después.
+function descartarTrabajo(id) {
+  db.prepare("DELETE FROM cola_impresion WHERE id = ? AND estado != 'impreso'").run(id);
+  notificarEstado();
+}
+
+function descartarNoImpresos() {
+  const n = db.prepare("SELECT COUNT(*) AS n FROM cola_impresion WHERE estado != 'impreso'").get().n;
+  db.prepare("DELETE FROM cola_impresion WHERE estado != 'impreso'").run();
+  notificarEstado();
+  return n;
+}
+
 function esperar(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-module.exports = { setIO, encolar, procesarCola, estadoCola, notificarEstado, registrarPuente, reintentarTrabajo };
+module.exports = { setIO, encolar, procesarCola, estadoCola, notificarEstado, registrarPuente, reintentarTrabajo, descartarTrabajo, descartarNoImpresos };
