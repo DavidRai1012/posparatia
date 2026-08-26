@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const { Server } = require('socket.io');
 
 const { db, ahora, jornadaHoy, horaLocal, getConfig, setConfig, getConfigAll, registrarHistorial, jornadaCerrada } = require('./db');
-const { ticketCocina, ticketNomina, ticketAccesoQR } = require('./escpos');
+const { ticketCocina, ticketNomina, ticketFactura, ticketAccesoQR } = require('./escpos');
 const impresion = require('./printing');
 const reportes = require('./reports');
 
@@ -24,7 +24,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 // ---------- Sesiones y autenticación por PIN ----------
 const sesiones = new Map(); // token -> { usuarioId, nombre, rol }
 const intentosFallidos = new Map(); // ip -> { n, bloqueadoHasta }
-const NIVEL = { mesero: 1, cajero: 2, admin: 3 };
+const NIVEL = { cocinera: 0, mesero: 1, cajero: 2, admin: 3 };
 
 function usuarioDeToken(token) { return token ? sesiones.get(token) : null; }
 
@@ -48,7 +48,8 @@ app.post('/api/login', (req, res) => {
   }
   const pin = String(req.body.pin || '');
   const u = db.prepare('SELECT * FROM usuarios WHERE pin = ? AND activo = 1').get(pin);
-  if (!u) {
+  // La cocinera existe solo para nómina: no tiene acceso a la app
+  if (!u || u.rol === 'cocinera') {
     const reg = intentosFallidos.get(ip) || { n: 0, bloqueadoHasta: 0 };
     reg.n++;
     if (reg.n >= 5) { reg.bloqueadoHasta = Date.now() + 30000; reg.n = 0; }
@@ -126,8 +127,10 @@ app.post('/api/platos', requiere(1), (req, res) => {
   const precioMin = (tipo === 'entrada' || tipo === 'bebida') ? 0 : 1;
   if (!nombre || !(Number(precio) >= precioMin)) return res.status(400).json({ error: 'Nombre y precio válido son obligatorios' });
   if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
-  const r = db.prepare('INSERT INTO platos (nombre, precio, categoria, tipo) VALUES (?, ?, ?, ?)')
-    .run(String(nombre).trim(), Math.round(Number(precio)), categoria || 'General', tipo);
+  const precioSolo = req.body.precio_solo !== undefined && String(req.body.precio_solo).trim() !== ''
+    ? Math.round(Number(req.body.precio_solo)) || null : null;
+  const r = db.prepare('INSERT INTO platos (nombre, precio, categoria, tipo, precio_solo) VALUES (?, ?, ?, ?, ?)')
+    .run(String(nombre).trim(), Math.round(Number(precio)), categoria || 'General', tipo, precioSolo);
   emitirMenu();
   precalentarMenu();
   res.json({ id: r.lastInsertRowid });
@@ -143,8 +146,12 @@ app.put('/api/platos/:id', requiere(1), (req, res) => {
   const disponible = req.body.disponible !== undefined ? (req.body.disponible ? 1 : 0) : plato.disponible;
   if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
   if (!nombre || !(precio >= ((tipo === 'entrada' || tipo === 'bebida') ? 0 : 1))) return res.status(400).json({ error: 'Datos de plato no válidos' });
-  db.prepare('UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ? WHERE id = ?')
-    .run(nombre, precio, categoria, tipo, disponible, plato.id);
+  let precioSolo = plato.precio_solo;
+  if (req.body.precio_solo !== undefined) {
+    precioSolo = String(req.body.precio_solo).trim() === '' ? null : (Math.round(Number(req.body.precio_solo)) || null);
+  }
+  db.prepare('UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ?, precio_solo = ? WHERE id = ?')
+    .run(nombre, precio, categoria, tipo, disponible, precioSolo, plato.id);
   emitirMenu();
   precalentarMenu();
   res.json({ ok: true });
@@ -177,7 +184,10 @@ function armarItems(itemsBody) {
     // así que solo se descarta si no tiene ningún contenido real.
     const nota = (it.nota || '').trim() ? it.nota.replace(/\s+$/, '') : null;
     const bloque = Number.isInteger(it.bloque) ? it.bloque : null;
-    items.push({ plato_nombre: plato.nombre, precio: plato.precio, cantidad, nota, bloque });
+    // "solo": plato del día vendido por fuera del almuerzo completo, a su precio propio
+    const solo = it.solo ? 1 : 0;
+    if (solo && !(plato.precio_solo > 0)) throw new Error(`"${plato.nombre}" no tiene precio para venderse solo`);
+    items.push({ plato_nombre: plato.nombre, precio: solo ? plato.precio_solo : plato.precio, cantidad, nota, bloque, solo });
   }
   if (!items.length) throw new Error('El pedido no tiene platos');
   return items;
@@ -264,8 +274,8 @@ app.post('/api/pedidos', requiere(1), (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(uuidFinal, num, jornada, String(comensal).trim(), tipo_entrega === 'llevar' ? 'llevar' : 'mesa',
            req.usuario.usuarioId, recargo, total, ahora());
-    const insItem = db.prepare('INSERT INTO pedido_items (pedido_id, plato_nombre, precio, cantidad, nota, bloque) VALUES (?, ?, ?, ?, ?, ?)');
-    for (const it of items) insItem.run(r.lastInsertRowid, it.plato_nombre, it.precio, it.cantidad, it.nota, it.bloque);
+    const insItem = db.prepare('INSERT INTO pedido_items (pedido_id, plato_nombre, precio, cantidad, nota, bloque, solo) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    for (const it of items) insItem.run(r.lastInsertRowid, it.plato_nombre, it.precio, it.cantidad, it.nota, it.bloque, it.solo);
     return { id: r.lastInsertRowid, numero_comanda: num };
   });
   const creado = crear();
@@ -322,8 +332,8 @@ app.put('/api/pedidos/:id', requiere(1), (req, res) => {
     db.prepare('UPDATE pedidos SET comensal = ?, tipo_entrega = ?, recargo = ?, total = ?, actualizado_en = ? WHERE id = ?')
       .run(String(comensal || pedido.comensal).trim(), tipo, recargo, total, ahora(), pedido.id);
     db.prepare('DELETE FROM pedido_items WHERE pedido_id = ?').run(pedido.id);
-    const insItem = db.prepare('INSERT INTO pedido_items (pedido_id, plato_nombre, precio, cantidad, nota, bloque) VALUES (?, ?, ?, ?, ?, ?)');
-    for (const it of items) insItem.run(pedido.id, it.plato_nombre, it.precio, it.cantidad, it.nota, it.bloque);
+    const insItem = db.prepare('INSERT INTO pedido_items (pedido_id, plato_nombre, precio, cantidad, nota, bloque, solo) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    for (const it of items) insItem.run(pedido.id, it.plato_nombre, it.precio, it.cantidad, it.nota, it.bloque, it.solo);
   });
   actualizar();
   registrarHistorial(pedido.id, req.usuario.usuarioId, 'editar', `Comanda ${pedido.numero_comanda} modificada por ${req.usuario.nombre}`);
@@ -431,9 +441,39 @@ function hojaConFiltro(XLSX, filas, anchos) {
   return ws;
 }
 
-app.get('/api/reportes/excel', requiere(2), (req, res) => {
+app.get('/api/reportes/excel', requiere(1), (req, res) => {
   const XLSX = require('xlsx');
   const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jornada || '')) ? req.query.jornada : jornadaHoy();
+  const resumen = reportes.resumenJornada(jornada);
+  const fmtCop = (n) => Number(n || 0);
+
+  // --- Hoja 1: Resumen del día (ingresos y egresos, para todos los empleados) ---
+  const filasResumen = [
+    ['RESUMEN DEL DIA', jornada],
+    [],
+    ['INGRESOS', ''],
+    ['Almuerzos completos (cantidad)', resumen.numAlmuerzos],
+    ['Almuerzos completos ($)', fmtCop(resumen.totalAlmuerzos)],
+    ['Sueltos y extras ($)', fmtCop(resumen.totalExtras)],
+    ['Domicilios cobrados', fmtCop(resumen.totalRecargos)],
+    ['TOTAL GENERAL VENDIDO', fmtCop(resumen.totalVentas)],
+    ['Recargos por tarjeta', fmtCop(resumen.totalRecargoTarjeta)],
+    ['Total cobrado', fmtCop(resumen.totalCobrado)],
+    [],
+    ['POR METODO DE PAGO', '']
+  ];
+  for (const [m, v] of Object.entries(resumen.porMetodo)) {
+    filasResumen.push([ETIQUETAS_METODO[m] || m, fmtCop(v)]);
+  }
+  filasResumen.push([]);
+  filasResumen.push(['EGRESOS', '']);
+  filasResumen.push(['Gastos del local', fmtCop(resumen.totalGastos)]);
+  filasResumen.push(['Nomina pagada', fmtCop(resumen.totalNomina)]);
+  filasResumen.push([]);
+  filasResumen.push(['EFECTIVO ESPERADO EN CAJA', fmtCop(resumen.efectivoEsperado)]);
+  filasResumen.push(['(ventas en efectivo menos gastos y nomina)', '']);
+
+  // --- Hoja 2: Ventas en detalle ---
   const pedidos = db.prepare(
     `SELECT p.*, u.nombre AS vendedor, pg.metodo, pg.monto AS cobrado, pg.recargo_tarjeta, pg.creado_en AS pagado_en
      FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
@@ -442,36 +482,35 @@ app.get('/api/reportes/excel', requiere(2), (req, res) => {
   const itemsDe = db.prepare(
     `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
      FROM pedido_items pi WHERE pi.pedido_id = ?`);
-
-  const filas = [['Comanda', 'Hora', 'Vendedor', 'Entrega', 'Entrada', 'Proteína', 'Bebida', 'Extras',
+  const filasVentas = [['Comanda', 'Hora', 'Vendedor', 'Entrega', 'Entrada', 'Proteína', 'Bebida', 'Extras',
     'Método de pago', 'Domicilio', 'Recargo tarjeta', 'Estado', 'Total']];
   for (const p of pedidos) {
-    // Los items del pedido separados por tipo, para que el filtro de Excel sirva
     const porTipo = { entrada: [], proteina: [], bebida: [], extra: [] };
     for (const it of itemsDe.all(p.id)) {
       const clave = it.tipo === 'entrada' ? 'entrada'
         : (it.tipo === 'proteina_dia' || it.tipo === 'proteina_especial') ? 'proteina'
         : it.tipo === 'bebida' ? 'bebida' : 'extra';
-      porTipo[clave].push(`${it.cantidad > 1 ? it.cantidad + 'x ' : ''}${it.plato_nombre}`);
+      porTipo[clave].push(`${it.cantidad > 1 ? it.cantidad + 'x ' : ''}${it.plato_nombre}${it.solo ? ' (solo)' : ''}`);
     }
     const estado = p.estado === 'cancelado' ? 'ANULADA' : (p.metodo ? 'PAGADA' : 'POR COBRAR');
     const hora = ((p.pagado_en || p.creado_en) || '').slice(11, 16);
-    filas.push([p.numero_comanda, hora, p.vendedor, p.tipo_entrega === 'llevar' ? 'Domicilio' : 'Mesa',
+    filasVentas.push([p.numero_comanda, hora, p.vendedor, p.tipo_entrega === 'llevar' ? 'Domicilio' : 'Mesa',
       porTipo.entrada.join(' | '), porTipo.proteina.join(' | '), porTipo.bebida.join(' | '), porTipo.extra.join(' | '),
       p.metodo ? (ETIQUETAS_METODO[p.metodo] || p.metodo) : '', p.recargo, p.recargo_tarjeta || 0,
       estado, p.estado === 'cancelado' ? 0 : (p.cobrado ?? p.total)]);
   }
 
-  const porMetodo = db.prepare(
-    'SELECT metodo, COUNT(*) AS n, SUM(monto) AS total FROM pagos WHERE jornada = ? GROUP BY metodo').all(jornada);
-  const filasTotales = [['Método', 'Pagos', 'Total']];
-  for (const m of porMetodo) filasTotales.push([ETIQUETAS_METODO[m.metodo] || m.metodo, m.n, m.total]);
-  filasTotales.push(['TOTAL COBRADO', porMetodo.reduce((s, m) => s + m.n, 0), porMetodo.reduce((s, m) => s + m.total, 0)]);
+  // --- Hoja 3: Gastos del día ---
+  const filasGastos = [['Concepto', 'Valor', 'Registró']];
+  for (const g of resumen.gastos) filasGastos.push([g.concepto, g.valor, g.usuario]);
+  filasGastos.push([]);
+  filasGastos.push(['TOTAL GASTOS', resumen.totalGastos, '']);
 
   const libro = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filas, [9, 6, 12, 10, 18, 20, 14, 18, 14, 9, 9, 11, 10]), 'Ventas');
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasTotales, [16, 8, 12]), 'Totales por método');
-  enviarXlsx(res, libro, `ventas-${jornada}.xlsx`);
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasResumen, [34, 14]), 'Resumen del día');
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasVentas, [9, 6, 12, 10, 18, 20, 14, 18, 14, 9, 9, 11, 10]), 'Ventas');
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasGastos, [46, 12, 14]), 'Gastos del día');
+  enviarXlsx(res, libro, `resumen-${jornada}.xlsx`);
 });
 
 // Excel de nómina del año: una hoja por empleado (como la tarjeta Kardex que
@@ -523,6 +562,100 @@ app.get('/api/nomina/excel', requiere(2), (req, res) => {
     XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filas, [11, 11, 5, 10, 10, 10, 26, 10, 16]), nombre);
   }
   enviarXlsx(res, libro, `nomina-${anio}.xlsx`);
+});
+
+// Cuenta de venta para el cliente (documento informativo con los datos del negocio)
+app.post('/api/pedidos/:id/factura', requiere(1), (req, res) => {
+  const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(req.params.id);
+  if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado' });
+  if (pedido.estado === 'cancelado') return res.status(409).json({ error: 'La comanda está anulada' });
+  const items = db.prepare('SELECT * FROM pedido_items WHERE pedido_id = ?').all(pedido.id);
+  const pago = db.prepare('SELECT * FROM pagos WHERE pedido_id = ?').get(pedido.id);
+
+  // Agrupar items iguales (mismo plato, precio y condición solo/almuerzo)
+  const grupos = new Map();
+  for (const it of items) {
+    const clave = `${it.plato_nombre}|${it.precio}|${it.solo}`;
+    if (!grupos.has(clave)) grupos.set(clave, { nombre: it.plato_nombre, precio: it.precio, solo: it.solo, cantidad: 0 });
+    grupos.get(clave).cantidad += it.cantidad;
+  }
+
+  const consecutivo = Number(getConfig('factura_consecutivo') || 0) + 1;
+  setConfig('factura_consecutivo', String(consecutivo));
+
+  const recargoTarjeta = pago ? (pago.recargo_tarjeta || 0) : 0;
+  const ticket = ticketFactura({
+    titulo: getConfig('factura_titulo'),
+    razon: getConfig('factura_razon_social'),
+    nit: getConfig('factura_nit'),
+    direccion: getConfig('factura_direccion'),
+    telefono: getConfig('factura_telefono'),
+    leyenda: getConfig('factura_leyenda'),
+    consecutivo,
+    numero_comanda: pedido.numero_comanda,
+    fecha: pedido.jornada,
+    hora: horaLocal(),
+    items: [...grupos.values()].map(g => ({ cantidad: g.cantidad, nombre: g.nombre, solo: g.solo, subtotal: g.precio * g.cantidad })),
+    recargoDomicilio: pedido.recargo,
+    recargoTarjeta,
+    total: pedido.total + recargoTarjeta,
+    metodo: pago ? (ETIQUETAS_METODO[pago.metodo] || pago.metodo) : null
+  }, { ancho: getConfig('ancho_ticket') });
+  impresion.encolar(pedido.id, 'factura', ticket);
+  registrarHistorial(pedido.id, req.usuario.usuarioId, 'factura', `Cuenta de venta No. ${consecutivo}`);
+  res.json({ ok: true, consecutivo });
+});
+
+// Rectificación de métodos de pago: lista por día/método y corrección
+app.get('/api/pagos', requiere(2), (req, res) => {
+  const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jornada || '')) ? req.query.jornada : jornadaHoy();
+  let filtro = '';
+  const params = [jornada];
+  if (req.query.metodo) { filtro = ' AND pg.metodo = ?'; params.push(req.query.metodo); }
+  const pagos = db.prepare(
+    `SELECT pg.*, p.numero_comanda, p.total AS total_pedido, p.estado
+     FROM pagos pg JOIN pedidos p ON p.id = pg.pedido_id
+     WHERE pg.jornada = ?${filtro} ORDER BY pg.creado_en`).all(...params);
+  res.json({ jornada, cerrada: jornadaCerrada(jornada), pagos });
+});
+
+app.put('/api/pagos/:pedidoId/metodo', requiere(2), (req, res) => {
+  const pago = db.prepare('SELECT * FROM pagos WHERE pedido_id = ?').get(req.params.pedidoId);
+  if (!pago) return res.status(404).json({ error: 'Ese pedido no tiene pago registrado' });
+  // Rectificar un día con cierre dañaría el arqueo ya registrado
+  if (jornadaCerrada(pago.jornada)) {
+    return res.status(409).json({ error: 'Ese día ya tiene cierre de caja: no se puede rectificar' });
+  }
+  const metodo = req.body.metodo;
+  if (!['efectivo', 'tarjeta', 'nequi', 'daviplata', 'qr_bancolombia'].includes(metodo)) {
+    return res.status(400).json({ error: 'Método de pago no válido' });
+  }
+  if (metodo === pago.metodo) return res.json({ ok: true, sinCambio: true });
+  const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(pago.pedido_id);
+  // El recargo de tarjeta se recalcula según el método nuevo
+  const rec = recargoTarjetaDe(metodo, pedido.total);
+  const monto = pedido.total + rec;
+  const recibido = metodo === 'efectivo' ? monto : null;
+  db.prepare('UPDATE pagos SET metodo = ?, monto = ?, recargo_tarjeta = ?, recibido = ?, vueltas = ? WHERE pedido_id = ?')
+    .run(metodo, monto, rec, recibido, metodo === 'efectivo' ? 0 : null, pago.pedido_id);
+  registrarHistorial(pago.pedido_id, req.usuario.usuarioId, 'rectificar_pago', `${pago.metodo} -> ${metodo} (${monto})`);
+  emitirPedidos();
+  io.emit('caja:actualizada');
+  res.json({ ok: true, monto, recargo_tarjeta: rec });
+});
+
+// Reabrir el día: deshace un cierre de caja hecho por error (solo admin, solo hoy)
+app.post('/api/cierre/reabrir', requiere(3), (req, res) => {
+  const hoy = jornadaHoy();
+  if (!db.prepare('SELECT id FROM cierres WHERE jornada = ?').get(hoy)) {
+    return res.status(409).json({ error: 'La jornada de hoy no tiene cierre' });
+  }
+  db.prepare('DELETE FROM cierres WHERE jornada = ?').run(hoy);
+  // El reporte por correo que quedó en cola sin enviar se descarta (el cierre nuevo genera otro)
+  db.prepare("DELETE FROM cola_correos WHERE jornada = ? AND estado = 'pendiente'").run(hoy);
+  registrarHistorial(null, req.usuario.usuarioId, 'reabrir_dia', hoy);
+  io.emit('jornada:reabierta', { jornada: hoy });
+  res.json({ ok: true });
 });
 
 app.post('/api/cierre', requiere(2), async (req, res) => {
@@ -580,13 +713,19 @@ app.get('/api/usuarios', requiere(3), (_req, res) => {
 });
 
 app.post('/api/usuarios', requiere(3), (req, res) => {
-  const { nombre, pin, rol } = req.body;
-  if (!nombre || !/^\d{4}$/.test(String(pin))) return res.status(400).json({ error: 'Nombre y PIN de 4 dígitos son obligatorios' });
-  if (!['admin', 'cajero', 'mesero'].includes(rol)) return res.status(400).json({ error: 'Rol no válido' });
-  if (db.prepare('SELECT id FROM usuarios WHERE pin = ?').get(String(pin))) {
+  const { nombre, rol } = req.body;
+  let pin = String(req.body.pin || '');
+  if (!['admin', 'cajero', 'mesero', 'cocinera'].includes(rol)) return res.status(400).json({ error: 'Rol no válido' });
+  if (rol === 'cocinera' && !pin) {
+    // La cocinera no usa la app: se le asigna un PIN interno libre automáticamente
+    do { pin = String(Math.floor(1000 + Math.random() * 9000)); }
+    while (db.prepare('SELECT id FROM usuarios WHERE pin = ?').get(pin));
+  }
+  if (!nombre || !/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'Nombre y PIN de 4 dígitos son obligatorios' });
+  if (db.prepare('SELECT id FROM usuarios WHERE pin = ?').get(pin)) {
     return res.status(409).json({ error: 'Ese PIN ya está asignado a otro usuario' });
   }
-  const r = db.prepare('INSERT INTO usuarios (nombre, pin, rol) VALUES (?, ?, ?)').run(String(nombre).trim(), String(pin), rol);
+  const r = db.prepare('INSERT INTO usuarios (nombre, pin, rol) VALUES (?, ?, ?)').run(String(nombre).trim(), pin, rol);
   res.json({ id: r.lastInsertRowid });
 });
 
@@ -620,7 +759,8 @@ app.get('/api/config', requiere(3), (_req, res) => {
 app.put('/api/config', requiere(3), (req, res) => {
   const permitidas = ['nombre_restaurante', 'recargo_empaque', 'hora_reporte', 'correo_dueno', 'gmail_usuario',
     'gmail_app_password', 'sheets_webhook_url', 'modo_impresion', 'impresora_share', 'puerto_com', 'ancho_ticket', 'tamano_platos', 'tamano_obs',
-    'recargo_tarjeta_fijo', 'recargo_tarjeta_umbral', 'recargo_tarjeta_pct'];
+    'recargo_tarjeta_fijo', 'recargo_tarjeta_umbral', 'recargo_tarjeta_pct',
+    'factura_titulo', 'factura_razon_social', 'factura_nit', 'factura_direccion', 'factura_telefono', 'factura_leyenda'];
   for (const [clave, valor] of Object.entries(req.body || {})) {
     if (!permitidas.includes(clave)) continue;
     if (clave === 'gmail_app_password' && valor === '(guardada)') continue;
@@ -661,7 +801,7 @@ app.post('/api/gastos', requiere(2), (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/gastos/:id', requiere(3), (req, res) => {
+app.delete('/api/gastos/:id', requiere(2), (req, res) => {
   db.prepare('DELETE FROM gastos WHERE id = ? AND jornada = ?').run(req.params.id, jornadaHoy());
   io.emit('caja:actualizada');
   res.json({ ok: true });
@@ -687,7 +827,7 @@ app.post('/api/nomina', requiere(2), (req, res) => {
   const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.jornada || '')) ? req.body.jornada : jornadaHoy();
   // El valor del turno es FIJO para el cajero (el que configuró el admin);
   // solo el admin puede pagar un turno con un valor distinto
-  const turno = req.usuario.rol === 'admin'
+  const turno = (req.usuario.rol === 'admin' && String(req.body.valor_turno ?? '').trim() !== '')
     ? Math.max(0, Math.round(Number(req.body.valor_turno) || 0))
     : empleado.valor_turno;
   const descuento = Math.max(0, Math.round(Number(req.body.descuento) || 0));
@@ -709,15 +849,17 @@ app.post('/api/nomina', requiere(2), (req, res) => {
 
 // Confirma el propio empleado (desde su sesión) o el admin (para quien no usa la app)
 app.post('/api/nomina/:id/confirmar', requiere(1), (req, res) => {
-  const n = db.prepare('SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id WHERE n.id = ?').get(req.params.id);
+  const n = db.prepare('SELECT n.*, u.nombre AS empleado, u.rol AS empleado_rol FROM nomina n JOIN usuarios u ON u.id = n.empleado_id WHERE n.id = ?').get(req.params.id);
   if (!n) return res.status(404).json({ error: 'Pago no encontrado' });
   if (n.estado !== 'pendiente') return res.status(409).json({ error: 'El pago ya no está pendiente' });
-  if (req.usuario.usuarioId !== n.empleado_id && req.usuario.rol !== 'admin') {
+  const esElMismo = req.usuario.usuarioId === n.empleado_id;
+  const esAdmin = req.usuario.rol === 'admin';
+  // La cocinera no usa la app: el cajero está autorizado a confirmar sus pagos
+  const cajeroPorCocinera = NIVEL[req.usuario.rol] >= 2 && n.empleado_rol === 'cocinera';
+  if (!esElMismo && !esAdmin && !cajeroPorCocinera) {
     return res.status(403).json({ error: 'Solo el empleado (o el administrador) puede confirmar este pago' });
   }
   db.prepare("UPDATE nomina SET estado = 'confirmado', confirmado_en = ? WHERE id = ?").run(ahora(), n.id);
-  // Ticket físico de confirmación del pago
-  impresion.encolar(null, 'nomina', ticketNomina(n, { ancho: getConfig('ancho_ticket'), hora: horaLocal() }));
   io.emit('nomina:actualizada');
   io.emit('caja:actualizada');
   res.json({ ok: true });
@@ -744,7 +886,7 @@ app.get('/api/nomina/resumen', requiere(2), (_req, res) => {
       mes: sumaDesde.get(u.id, inicioMes(), hoy).t
     }));
   const pendientes = db.prepare(
-    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
+    `SELECT n.*, u.nombre AS empleado, u.rol AS empleado_rol FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
      WHERE n.estado = 'pendiente' ORDER BY n.id DESC`).all();
   res.json({ empleados, pendientes });
 });

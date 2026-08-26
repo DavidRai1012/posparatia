@@ -34,7 +34,9 @@ $bmp.Save('${bmpPath.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageForm
 $g.Dispose(); $bmp.Dispose(); $gm.Dispose(); $medidor.Dispose()
 `;
   const ps1 = bmpPath.replace(/\.bmp$/, '.ps1');
-  fs.writeFileSync(ps1, script, 'utf8');
+  // BOM obligatorio: sin él, PowerShell 5.1 lee el .ps1 como ANSI y una Ñ/tilde
+  // se convierte en bytes que rompen el script (comanda lenta y errores al arrancar)
+  fs.writeFileSync(ps1, '\uFEFF' + script, 'utf8');
   try {
     execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1], { windowsHide: true });
   } finally {

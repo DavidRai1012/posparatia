@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   nombre TEXT NOT NULL,
   pin TEXT NOT NULL UNIQUE,
-  rol TEXT NOT NULL CHECK(rol IN ('admin','cajero','mesero')),
+  rol TEXT NOT NULL CHECK(rol IN ('admin','cajero','mesero','cocinera')),
   valor_turno INTEGER NOT NULL DEFAULT 0,
   activo INTEGER NOT NULL DEFAULT 1
 );
@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS platos (
   categoria TEXT NOT NULL DEFAULT 'General',
   tipo TEXT NOT NULL DEFAULT 'proteina_dia'
     CHECK(tipo IN ('entrada','proteina_dia','proteina_especial','bebida','extra')),
+  precio_solo INTEGER,
   disponible INTEGER NOT NULL DEFAULT 1,
   activo INTEGER NOT NULL DEFAULT 1
 );
@@ -81,7 +82,8 @@ CREATE TABLE IF NOT EXISTS pedido_items (
   precio INTEGER NOT NULL,
   cantidad INTEGER NOT NULL DEFAULT 1,
   nota TEXT,
-  bloque INTEGER
+  bloque INTEGER,
+  solo INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS pagos (
@@ -221,6 +223,39 @@ if (!db.prepare('PRAGMA table_info(nomina)').all().some(c => c.name === 'concept
   console.log('[db] Migración aplicada: concepto en nómina');
 }
 
+// Migración: precio "solo" (plato del día vendido por fuera del almuerzo completo)
+if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'precio_solo')) {
+  db.exec('ALTER TABLE platos ADD COLUMN precio_solo INTEGER');
+  db.exec('ALTER TABLE pedido_items ADD COLUMN solo INTEGER NOT NULL DEFAULT 0');
+  console.log('[db] Migración aplicada: precio de platos del día vendidos solos');
+}
+
+// Migración: rol "cocinera" (sin acceso a la app, solo para nómina).
+// usuarios es referenciada por casi todas las tablas: hay que reconstruirla
+// con las llaves foráneas APAGADAS (las referencias son por nombre y se
+// conservan al renombrar).
+const esquemaUsuarios = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usuarios'").get();
+if (esquemaUsuarios && !esquemaUsuarios.sql.includes('cocinera')) {
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    DROP TABLE IF EXISTS usuarios_v2;
+    CREATE TABLE usuarios_v2 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nombre TEXT NOT NULL,
+      pin TEXT NOT NULL UNIQUE,
+      rol TEXT NOT NULL CHECK(rol IN ('admin','cajero','mesero','cocinera')),
+      valor_turno INTEGER NOT NULL DEFAULT 0,
+      activo INTEGER NOT NULL DEFAULT 1
+    );
+    INSERT INTO usuarios_v2 (id, nombre, pin, rol, valor_turno, activo)
+      SELECT id, nombre, pin, rol, valor_turno, activo FROM usuarios;
+    DROP TABLE usuarios;
+    ALTER TABLE usuarios_v2 RENAME TO usuarios;
+  `);
+  db.pragma('foreign_keys = ON');
+  console.log('[db] Migración aplicada: rol cocinera');
+}
+
 // Migración: tipo "bebida" (jugo/limonada incluidos en el almuerzo)
 const esquemaPlatos = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'platos'").get();
 if (esquemaPlatos && !esquemaPlatos.sql.includes('bebida')) {
@@ -275,7 +310,16 @@ const CONFIG_DEFAULTS = {
   recargo_tarjeta_umbral: '20000',
   recargo_tarjeta_pct: '5',
   // Cambios rápidos (chips de notas): editables por meseros y cajeros desde la pestaña Menú
-  chips_notas: '["Sin arroz","Sin sopa","Sin ensalada"]'
+  chips_notas: '["Sin arroz","Sin sopa","Sin ensalada"]',
+  // Cuenta de venta para el cliente (documento informativo; para factura
+  // electrónica DIAN se requiere un proveedor autorizado)
+  factura_titulo: 'CUENTA DE VENTA',
+  factura_razon_social: '',
+  factura_nit: '',
+  factura_direccion: '',
+  factura_telefono: '',
+  factura_leyenda: 'No responsable de IVA. Documento informativo: no equivale a factura electronica.',
+  factura_consecutivo: '0'
 };
 
 function getConfig(clave) {

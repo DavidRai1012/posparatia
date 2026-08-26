@@ -34,7 +34,7 @@ const state = {
   jornada: null, jornadaCerrada: false,
   vista: 'tomar',
   // toma de pedido: 3 pantallas (entrada→proteína→extras); cada toque agrega 1 unidad
-  sel: { entrada: [], proteina: [], bebida: [], extra: [] }, uidSeq: 1,
+  sel: { entrada: [], proteina: [], bebida: [], extra: [], solo: [] }, uidSeq: 1,
   notas: {},                                // uid de proteína -> {chips, custom} (nota del almuerzo)
   notaExtras: { chips: [], custom: '' },    // nota del bloque de extras sueltos
   pantalla: 'entrada', itemAbierto: null, ticketAbierto: false,
@@ -263,6 +263,7 @@ function conectarSocket() {
   socket.on('pedidos:actualizado', (pedidos) => { state.pedidos = pedidos; refrescarVistaEnVivo(); });
   socket.on('impresion:estado', (imp) => { state.impresion = imp; renderBanner(); refrescarVistaEnVivo(['impresora', 'admin']); });
   socket.on('jornada:cerrada', () => { state.jornadaCerrada = true; renderBanner(); refrescarVistaEnVivo(); });
+  socket.on('jornada:reabierta', () => { state.jornadaCerrada = false; renderBanner(); refrescarVistaEnVivo(); });
   socket.on('pedido:guardado', (d) => {
     // El PC recibió y guardó un pedido: avisar en todos los teléfonos
     // (excepto en el que lo creó, que ya ve su propia confirmación)
@@ -355,8 +356,11 @@ function platoDe(id) { return state.platos.find(p => p.id === id); }
 
 function totalCarrito() {
   let total = 0;
-  for (const lista of Object.values(state.sel)) {
-    for (const it of lista) { const p = platoDe(it.platoId); if (p) total += p.precio; }
+  for (const [listaKey, lista] of Object.entries(state.sel)) {
+    for (const it of lista) {
+      const p = platoDe(it.platoId);
+      if (p) total += listaKey === 'solo' ? (p.precio_solo || 0) : p.precio;
+    }
   }
   if (state.tipoEntrega === 'llevar') total += recargoDomicilioActual();
   return total;
@@ -372,10 +376,10 @@ function recargoDomicilioActual() {
 // completos (misma cantidad de entradas y proteinas).
 function estadoTicket() {
   const nE = state.sel.entrada.length, nP = state.sel.proteina.length,
-        nB = state.sel.bebida.length, nX = state.sel.extra.length;
-  if (!nE && !nP && !nB && !nX) return { ok: false, motivo: 'Toque los platos para armar el pedido' };
+        nB = state.sel.bebida.length, nX = state.sel.extra.length, nS = state.sel.solo.length;
+  if (!nE && !nP && !nB && !nX && !nS) return { ok: false, motivo: 'Toque los platos para armar el pedido' };
   if (!nE && !nP) {
-    if (nB) return { ok: false, motivo: 'Las bebidas incluidas van con un almuerzo (para vender bebida sola, créela como Extra)' };
+    if (nB) return { ok: false, motivo: 'Las bebidas incluidas van con un almuerzo (los platos sueltos están en "Del día - solos")' };
     return { ok: true, modo: 'extras' };
   }
   if (nE !== nP) return { ok: false, motivo: `Almuerzos incompletos: ${nE} entrada(s) y ${nP} proteína(s)` };
@@ -392,7 +396,11 @@ function derivarBloques() {
     if (state.sel.extra[i]) items.push(state.sel.extra[i]);
     bloques.push({ items, proteinaUid: state.sel.proteina[i].uid });
   }
-  return { bloques, sobrantes: state.sel.extra.slice(n) };
+  const sobrantes = [
+    ...state.sel.extra.slice(n).map(it => ({ ...it, esSolo: false })),
+    ...state.sel.solo.map(it => ({ ...it, esSolo: true }))
+  ];
+  return { bloques, sobrantes };
 }
 
 function componerNota(n) {
@@ -429,28 +437,43 @@ function beep(frec, dur) {
 }
 
 const PANTALLAS = {
-  entrada: { paso: '1', titulo: 'Entradas', secciones: [['entrada', null]] },
-  proteina: { paso: '2', titulo: 'Proteínas', secciones: [['proteina_dia', 'Del día'], ['proteina_especial', 'Especiales']] },
-  extras: { paso: '3', titulo: 'Bebida y extras', secciones: [['bebida', 'Bebida incluida (del almuerzo)'], ['extra', 'Extras (se cobran aparte)']] }
+  entrada: { paso: '1', titulo: 'Entradas', secciones: [['entrada', null, 'entrada']] },
+  proteina: { paso: '2', titulo: 'Proteínas', secciones: [['proteina_dia', 'Del día', 'proteina'], ['proteina_especial', 'Especiales', 'proteina']] },
+  extras: {
+    paso: '3', titulo: 'Bebida y extras', secciones: [
+      ['bebida', 'Bebida incluida (del almuerzo)', 'bebida'],
+      ['solo', '🍛 Del día, vendidos SOLOS', 'solo'],
+      ['extra', 'Extras (se cobran aparte)', 'extra']
+    ]
+  }
 };
+
+// Platos de cada sección: 'solo' es virtual (los del día con precio_solo configurado)
+function platosDeSeccion(tipo) {
+  if (tipo === 'solo') {
+    return state.platos.filter(p => p.disponible && p.precio_solo > 0 && p.tipo !== 'extra');
+  }
+  return state.platos.filter(p => p.tipo === tipo && p.disponible);
+}
 
 function renderTomar() {
   if (state.ticketAbierto) return renderTicket();
   const def = PANTALLAS[state.pantalla];
   const est = estadoTicket();
   const nE = state.sel.entrada.length, nP = state.sel.proteina.length,
-        nB = state.sel.bebida.length, nX = state.sel.extra.length;
+        nB = state.sel.bebida.length, nXS = state.sel.extra.length + state.sel.solo.length;
 
-  const filaPlato = (p) => {
-    const enSel = state.sel[claveListaDeTipo(p.tipo)].filter(it => it.platoId === p.id).length;
+  const filaPlato = (p, listaKey) => {
+    const enSel = state.sel[listaKey].filter(it => it.platoId === p.id).length;
+    const precio = listaKey === 'solo' ? p.precio_solo : p.precio;
     return `
     <div class="pr-wrap">
-      <button class="plato-row ${enSel ? 'en-orden' : ''}" data-plato="${p.id}">
+      <button class="plato-row ${enSel ? 'en-orden' : ''}" data-plato="${p.id}" data-lista="${listaKey}">
         <span class="pr-nombre">${esc(p.nombre)}</span>
-        <span class="pr-precio">${p.precio ? fmt(p.precio) : ''}</span>
+        <span class="pr-precio">${precio ? fmt(precio) : ''}</span>
         ${enSel ? `<span class="pb-badge">${enSel}</span>` : ''}
       </button>
-      ${enSel ? `<button class="pr-menos" data-menos-plato="${p.id}">−</button>` : ''}
+      ${enSel ? `<button class="pr-menos" data-menos-plato="${p.id}" data-lista="${listaKey}">−</button>` : ''}
     </div>`;
   };
 
@@ -460,13 +483,13 @@ function renderTomar() {
       <button class="btn-mini" id="btn-cancelar-edicion">Descartar</button></div>` : ''}
     <div class="paso-titulo">
       <span class="paso-num">${def.paso}</span> ${def.titulo}
-      <span class="der resumen-sel">🥣${nE} · 🍗${nP} · 🥤${nB} · 🧃${nX}</span>
+      <span class="der resumen-sel">🥣${nE} · 🍗${nP} · 🥤${nB} · 🧃${nXS}</span>
     </div>
-    ${def.secciones.map(([tipo, subtitulo]) => {
-      const platos = state.platos.filter(p => p.tipo === tipo && p.disponible);
+    ${def.secciones.map(([tipo, subtitulo, listaKey]) => {
+      const platos = platosDeSeccion(tipo);
       if (!platos.length) return '';
       return `${subtitulo ? `<div class="cat-titulo">${esc(subtitulo)}</div>` : ''}
-        <div class="lista-platos">${platos.map(filaPlato).join('')}</div>`;
+        <div class="lista-platos">${platos.map(p => filaPlato(p, listaKey)).join('')}</div>`;
     }).join('')}
     <div style="height:8px"></div>
   </div>
@@ -486,18 +509,14 @@ function renderTomar() {
   </div>`;
 
   $('#vista').querySelectorAll('[data-plato]').forEach(b => b.onclick = () => {
-    const plato = platoDe(Number(b.dataset.plato));
-    if (!plato) return;
-    state.sel[claveListaDeTipo(plato.tipo)].push({ uid: state.uidSeq++, platoId: plato.id });
+    state.sel[b.dataset.lista].push({ uid: state.uidSeq++, platoId: Number(b.dataset.plato) });
     vibrar(25); renderTomar();
   });
   $('#vista').querySelectorAll('[data-menos-plato]').forEach(b => b.onclick = () => {
-    const plato = platoDe(Number(b.dataset.menosPlato));
-    if (!plato) return;
-    const lista = state.sel[claveListaDeTipo(plato.tipo)];
-    // quitar la ULTIMA unidad de ese plato
+    const lista = state.sel[b.dataset.lista];
+    const id = Number(b.dataset.menosPlato);
     for (let i = lista.length - 1; i >= 0; i--) {
-      if (lista[i].platoId === plato.id) {
+      if (lista[i].platoId === id) {
         delete state.notas[lista[i].uid];
         lista.splice(i, 1);
         break;
@@ -539,15 +558,16 @@ function renderTicket() {
     const nota = notaDe(it.uid);
     const abierto = state.itemAbierto === it.uid;
     const notaTxt = [(nota.chips || []).join(', '), (nota.custom || '').trim()].filter(Boolean).join(' · ');
+    const precioItem = it.esSolo ? (p ? p.precio_solo : 0) : (p ? p.precio : 0);
     return `
     <div class="lt-item ${abierto ? 'abierta' : ''}">
       <div class="lt-item-fila">
         <button class="lt-item-btn" data-item="${it.uid}">
-          <span class="lt-item-nombre">${esc(p ? p.nombre.toUpperCase() : '?')}</span>
+          <span class="lt-item-nombre">${esc(p ? p.nombre.toUpperCase() : '?')}${it.esSolo ? ' <span class="chip">SOLO</span>' : ''}</span>
           ${notaTxt ? `<span class="lt-nota">${esc(notaTxt)}</span>` : ''}
           <span class="lt-flecha">${abierto ? '▲' : '▼'}</span>
         </button>
-        <span class="lt-precio">${p && p.precio ? fmt(p.precio) : ''}</span>
+        <span class="lt-precio">${precioItem ? fmt(precioItem) : ''}</span>
         <button class="btn-mini peligro lt-x" data-quitar-uid="${it.uid}">✕</button>
       </div>
       ${abierto ? `
@@ -711,7 +731,7 @@ function actualizarVueltasTicket() {
 }
 
 function limpiarFormulario() {
-  state.sel = { entrada: [], proteina: [], bebida: [], extra: [] };
+  state.sel = { entrada: [], proteina: [], bebida: [], extra: [], solo: [] };
   state.notas = {}; state.notaExtras = { chips: [], custom: '' };
   state.pantalla = 'entrada'; state.itemAbierto = null; state.ticketAbierto = false;
   state.comensal = ''; state.tipoEntrega = 'mesa';
@@ -726,7 +746,8 @@ function tomarBorrador() {
       entrada: state.sel.entrada.map(x => ({ ...x })),
       proteina: state.sel.proteina.map(x => ({ ...x })),
       bebida: state.sel.bebida.map(x => ({ ...x })),
-      extra: state.sel.extra.map(x => ({ ...x }))
+      extra: state.sel.extra.map(x => ({ ...x })),
+      solo: state.sel.solo.map(x => ({ ...x }))
     },
     notas: JSON.parse(JSON.stringify(state.notas)),
     notaExtras: JSON.parse(JSON.stringify(state.notaExtras)),
@@ -751,7 +772,8 @@ async function enviarPedido(conPago) {
     }
   });
   sobrantes.forEach((it) => {
-    items.push({ plato_id: it.platoId, cantidad: 1, bloque: bloques.length, nota: componerNota(state.notas[it.uid]) });
+    items.push({ plato_id: it.platoId, cantidad: 1, bloque: bloques.length,
+      nota: componerNota(state.notas[it.uid]), solo: it.esSolo || undefined });
   });
 
   const cuerpo = { comensal: state.comensal.trim(), tipo_entrega: state.tipoEntrega, items };
@@ -850,16 +872,26 @@ function renderHistorial() {
   const puedeCobrar = state.usuario.rol !== 'mesero';
 
   $('#vista').innerHTML = `
-    <h2>Historial de hoy (${comandas.length})</h2>
+    <div class="fila" style="margin-bottom:6px">
+      <h2 style="margin:0" class="crece">Historial de hoy (${comandas.length})</h2>
+      <button class="btn-mini primario" id="btn-excel-hist">📥 Excel del día</button>
+    </div>
     ${comandas.length === 0 ? '<div class="tarjeta suave">Aún no hay comandas en esta jornada.</div>' : ''}
     ${comandas.map(p => tarjetaPedido(p, bloqueada ? '' : `
       ${!p.pagado && puedeCobrar ? `<button class="btn-mini ok" data-cobrar="${p.id}">💰 Cobrar</button>` : ''}
       ${!p.pagado ? `<button class="btn-mini primario" data-editar="${p.id}">✏️ Editar</button>` : ''}
       <button class="btn-mini peligro" data-cancelar="${p.id}">✕ Anular</button>
       <button class="btn-mini" data-reimprimir="${p.id}">🖨️ Reimprimir</button>
+      <button class="btn-mini" data-factura="${p.id}">🧾 Cuenta</button>
     `)).join('')}
     ${anuladas.length ? `<h3>Anuladas (${anuladas.length})</h3>${anuladas.map(p => tarjetaPedido(p, '')).join('')}` : ''}`;
 
+  if ($('#btn-excel-hist')) $('#btn-excel-hist').onclick = async () => {
+    try {
+      await descargarArchivo(`/api/reportes/excel?jornada=${state.jornada}`, `resumen-${state.jornada}.xlsx`);
+      toast('📥 Excel del día descargado');
+    } catch (e) { toast(e.message, true); }
+  };
   conectarBotonesPedidos();
 }
 
@@ -880,6 +912,12 @@ function conectarBotonesPedidos() {
     try { await api(`/pedidos/${b.dataset.reimprimir}/reimprimir`, { method: 'POST' }); toast('Reimpresión enviada'); }
     catch (e) { toast(e.message, true); }
   });
+  v.querySelectorAll('[data-factura]').forEach(b => b.onclick = async () => {
+    try {
+      const r = await api(`/pedidos/${b.dataset.factura}/factura`, { method: 'POST' });
+      toast(`🧾 Cuenta de venta No. ${String(r.consecutivo).padStart(6, '0')} impresa`);
+    } catch (e) { toast(e.message, true); }
+  });
   v.querySelectorAll('[data-editar]').forEach(b => b.onclick = () => cargarParaEditar(Number(b.dataset.editar)));
   v.querySelectorAll('[data-cobrar]').forEach(b => b.onclick = () => {
     state.cobrandoId = Number(b.dataset.cobrar);
@@ -896,7 +934,7 @@ function cargarParaEditar(pedidoId) {
   state.comensal = p.comensal;
   state.tipoEntrega = p.tipo_entrega;
   state.valorDomicilio = p.tipo_entrega === 'llevar' ? String(p.recargo) : '';
-  state.sel = { entrada: [], proteina: [], bebida: [], extra: [] };
+  state.sel = { entrada: [], proteina: [], bebida: [], extra: [], solo: [] };
   state.notas = {}; state.notaExtras = { chips: [], custom: '' };
   state.itemAbierto = null;
   const sinMatch = [];
@@ -905,7 +943,7 @@ function cargarParaEditar(pedidoId) {
   for (const it of items) {
     const plato = state.platos.find(pl => pl.nombre === it.plato_nombre);
     if (!plato) { sinMatch.push(it.plato_nombre); continue; }
-    const listaKey = claveListaDeTipo(plato.tipo);
+    const listaKey = it.solo ? 'solo' : claveListaDeTipo(plato.tipo);
     for (let i = 0; i < it.cantidad; i++) {
       const uid = state.uidSeq++;
       state.sel[listaKey].push({ uid, platoId: plato.id });
@@ -916,6 +954,20 @@ function cargarParaEditar(pedidoId) {
   state.pantalla = 'extras';
   state.ticketAbierto = true;
   cambiarVista('tomar');
+}
+
+async function descargarArchivo(ruta, nombre) {
+  const r = await fetch(ruta, { headers: { 'Authorization': 'Bearer ' + state.token } });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(d.error || 'No se pudo generar el archivo');
+  }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = nombre;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // ---------------- Vista: caja ----------------
@@ -957,6 +1009,18 @@ function renderCaja() {
       <button class="btn-mini primario" id="btn-excel" style="flex:1">📥 Descargar Excel</button>
     </div>
 
+    <h3>🔁 Rectificar métodos de pago</h3>
+    <div class="tarjeta">
+      <div class="fila">
+        <input id="rect-fecha" type="date" value="${state.jornada}" style="flex:1">
+        <select id="rect-metodo" style="flex:1">
+          <option value="">Todos los métodos</option>
+          ${METODOS_COBRO.map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}
+        </select>
+      </div>
+      <div id="lista-rect" style="margin-top:8px"><span class="suave">Cargando...</span></div>
+    </div>
+
     <h3>Cuentas por cobrar (${sinPagar.length})</h3>
     ${sinPagar.length === 0 ? '<div class="tarjeta suave">Todo está cobrado. 🎉</div>' : ''}
     ${sinPagar.map(p => tarjetaPedido(p, state.jornadaCerrada ? '' :
@@ -964,7 +1028,7 @@ function renderCaja() {
 
     <h3>💸 Gastos del local</h3>
     <div class="tarjeta">
-      <input id="ga-concepto" placeholder="Concepto (ej: guantes para cocina, proveedor verduras)" autocomplete="off">
+      <textarea id="ga-concepto" rows="2" placeholder="Concepto (puede usar Enter para listar los productos de una factura:&#10;guantes 5.000&#10;esponjas 3.000...)"></textarea>
       <div class="fila" style="margin-top:8px">
         <input id="ga-valor" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="Valor" style="flex:1">
         <button class="btn-mini ok" id="btn-gasto" style="flex:1">Registrar gasto</button>
@@ -981,7 +1045,8 @@ function renderCaja() {
 
     <h3>Cierre de caja</h3>
     <div class="tarjeta">
-      ${state.jornadaCerrada ? '<div class="suave">La jornada ya tiene cierre registrado.</div>' : `
+      ${state.jornadaCerrada ? `<div class="suave">La jornada ya tiene cierre registrado.</div>
+      ${state.usuario.rol === 'admin' ? '<button class="btn peligro" id="btn-reabrir" style="margin-top:10px">🔓 Reabrir el día (deshacer el cierre)</button>' : ''}` : `
       <label>Efectivo físico contado en caja (opcional)</label>
       <input id="in-efectivo-contado" type="number" inputmode="numeric" placeholder="Cuente los billetes y monedas">
       <button class="btn peligro" id="btn-cierre" style="margin-top:10px">Ejecutar cierre de caja</button>
@@ -1030,6 +1095,50 @@ function renderCaja() {
     state.cobroMetodo = 'efectivo'; state.cobroRecibido = '';
     renderCaja();
   });
+  if ($('#btn-reabrir')) $('#btn-reabrir').onclick = async () => {
+    if (!confirm('¿Reabrir la jornada de hoy?\nEl cierre se borra y podrán registrarse ventas de nuevo.\n(Ojo: los nombres de clientes borrados por el cierre no se recuperan.)')) return;
+    try {
+      await api('/cierre/reabrir', { method: 'POST' });
+      state.jornadaCerrada = false;
+      toast('🔓 Día reabierto: pueden seguir vendiendo');
+      renderBanner(); renderCaja();
+    } catch (e) { toast(e.message, true); }
+  };
+  const cargarRect = async () => {
+    const cont = $('#lista-rect');
+    if (!cont) return;
+    try {
+      const fecha = $('#rect-fecha').value || state.jornada;
+      const metodo = $('#rect-metodo').value;
+      const r = await api(`/pagos?jornada=${fecha}${metodo ? '&metodo=' + metodo : ''}`);
+      if (!r.pagos.length) { cont.innerHTML = '<span class="suave">No hay pagos con ese filtro.</span>'; return; }
+      cont.innerHTML = (r.cerrada ? '<div class="suave" style="color:var(--alerta)">⚠️ Día con cierre: solo consulta (reabra el día para rectificar)</div>' : '') +
+        r.pagos.map(pg => `
+        <div class="fila suave" style="padding:4px 0">
+          <span class="num-comanda" style="font-size:15px">#-${String(pg.numero_comanda).padStart(3, '0')}</span>
+          <span>${esc((pg.creado_en || '').slice(11, 16))}</span>
+          <span class="crece" style="text-align:right;font-weight:700">${fmt(pg.monto)}</span>
+          <select data-rect-pedido="${pg.pedido_id}" ${r.cerrada ? 'disabled' : ''} style="width:130px">
+            ${METODOS_COBRO.map(([k, v]) => `<option value="${k}" ${pg.metodo === k ? 'selected' : ''}>${v}</option>`).join('')}
+          </select>
+        </div>`).join('');
+      cont.querySelectorAll('[data-rect-pedido]').forEach(sel => {
+        const original = sel.value;
+        sel.onchange = async () => {
+          const nuevo = sel.value;
+          if (!confirm(`¿Cambiar el pago de la comanda a ${METODOS[nuevo] || nuevo}?\n(El recargo de tarjeta se recalcula automáticamente.)`)) {
+            sel.value = original; return;
+          }
+          try {
+            const resp = await api(`/pagos/${sel.dataset.rectPedido}/metodo`, { method: 'PUT', body: { metodo: nuevo } });
+            toast(`Pago rectificado: ahora ${METODOS[nuevo] || nuevo} por ${fmt(resp.monto)}`);
+            cargarRect(); cargarResumenDia();
+          } catch (e) { toast(e.message, true); sel.value = original; }
+        };
+      });
+    } catch (e) { cont.innerHTML = `<span class="suave">${esc(e.message)}</span>`; }
+  };
+  if ($('#rect-fecha')) { $('#rect-fecha').onchange = cargarRect; $('#rect-metodo').onchange = cargarRect; cargarRect(); }
   if ($('#btn-cierre')) $('#btn-cierre').onclick = async () => {
     const val = $('#in-efectivo-contado').value;
     if (!confirm('¿Ejecutar el cierre de caja? La jornada quedará bloqueada.')) return;
@@ -1048,24 +1157,11 @@ function renderCaja() {
     } catch (e) { toast(e.message, true); }
   };
 
-  async function descargarArchivo(ruta, nombre) {
-    const r = await fetch(ruta, { headers: { 'Authorization': 'Bearer ' + state.token } });
-    if (!r.ok) {
-      const d = await r.json().catch(() => ({}));
-      throw new Error(d.error || 'No se pudo generar el archivo');
-    }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = nombre;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-  }
   if ($('#btn-excel')) $('#btn-excel').onclick = async () => {
     const fecha = $('#excel-fecha').value || state.jornada;
     try {
-      await descargarArchivo(`/api/reportes/excel?jornada=${fecha}`, `ventas-${fecha}.xlsx`);
-      toast('📥 Excel de ventas descargado: revise Descargas');
+      await descargarArchivo(`/api/reportes/excel?jornada=${fecha}`, `resumen-${fecha}.xlsx`);
+      toast('📥 Excel del día descargado: revise Descargas');
     } catch (e) { toast(e.message, true); }
   };
   if ($('#btn-excel-nomina')) $('#btn-excel-nomina').onclick = async () => {
@@ -1095,13 +1191,27 @@ async function cargarGastos() {
     const cont = $('#lista-gastos');
     if (!cont) return;
     const total = gastos.reduce((s, g) => s + g.valor, 0);
-    cont.innerHTML = gastos.length ? gastos.map(g => `
-      <div class="fila suave" style="padding:3px 0">
-        <span class="crece">${esc(g.concepto)} <em>(${esc(g.usuario)})</em></span>
-        <span>${fmt(g.valor)}</span>
-        ${state.usuario.rol === 'admin' ? `<button class="btn-mini peligro" data-gasto-borrar="${g.id}">✕</button>` : ''}
-      </div>`).join('') + `<div class="fila" style="margin-top:4px"><b class="crece">Total gastos hoy</b><b>${fmt(total)}</b></div>`
+    cont.innerHTML = gastos.length ? gastos.map(g => {
+      const lineas = String(g.concepto).split('\n');
+      const multi = lineas.length > 1;
+      const abierto = state.gastoAbierto === g.id;
+      return `
+      <div style="padding:3px 0;border-bottom:1px dashed var(--borde)">
+        <div class="fila suave">
+          ${multi ? `<button class="btn-mini" data-gasto-exp="${g.id}">${abierto ? '▾' : '▸'}</button>` : ''}
+          <span class="crece">${esc(lineas[0])}${multi && !abierto ? '…' : ''} <em>(${esc(g.usuario)})</em></span>
+          <span style="font-weight:700">${fmt(g.valor)}</span>
+          ${state.usuario.rol !== 'mesero' ? `<button class="btn-mini peligro" data-gasto-borrar="${g.id}">✕</button>` : ''}
+        </div>
+        ${abierto ? `<div class="suave" style="white-space:pre-wrap;padding:4px 0 4px 34px">${esc(g.concepto)}</div>` : ''}
+      </div>`;
+    }).join('') + `<div class="fila" style="margin-top:6px"><b class="crece">Total gastos hoy</b><b>${fmt(total)}</b></div>`
       : '<span class="suave">Sin gastos registrados hoy</span>';
+    cont.querySelectorAll('[data-gasto-exp]').forEach(b => b.onclick = () => {
+      const id = Number(b.dataset.gastoExp);
+      state.gastoAbierto = state.gastoAbierto === id ? null : id;
+      cargarGastos();
+    });
     cont.querySelectorAll('[data-gasto-borrar]').forEach(b => b.onclick = async () => {
       if (!confirm('¿Eliminar este gasto?')) return;
       try { await api(`/gastos/${b.dataset.gastoBorrar}`, { method: 'DELETE' }); cargarGastos(); cargarResumenDia(); }
@@ -1140,9 +1250,9 @@ async function cargarNomina() {
         <div class="fila suave" style="padding:4px 0">
           <span class="crece">${esc(n.empleado)} · ${esc(n.jornada)}${n.concepto ? ` · <em>${esc(n.concepto)}</em>` : ''}</span>
           <span>${fmt(n.total)}</span>
-          ${state.usuario.rol === 'admin' ? `
-            <button class="btn-mini ok" data-nomina-conf="${n.id}">✓</button>
-            <button class="btn-mini peligro" data-nomina-anular="${n.id}">✕</button>` : ''}
+          ${state.usuario.rol === 'admin' || (state.usuario.rol === 'cajero' && n.empleado_rol === 'cocinera') ?
+            `<button class="btn-mini ok" data-nomina-conf="${n.id}">✓</button>` : ''}
+          ${state.usuario.rol === 'admin' ? `<button class="btn-mini peligro" data-nomina-anular="${n.id}">✕</button>` : ''}
         </div>`).join('')}` : ''}
 
       <hr class="sep">
@@ -1261,7 +1371,7 @@ function renderMenu() {
           <div class="crece">
             <div class="plato-nombre">${esc(p.nombre)}
               ${p.disponible ? '' : '<span class="chip">OCULTO</span>'}</div>
-            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}</div>
+            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}${p.precio_solo ? ` · solo ${fmt(p.precio_solo)}` : ''}</div>
           </div>
           <button class="btn-mini ${p.disponible ? '' : 'ok'}" data-visible="${p.id}">
             ${p.disponible ? '🚫 Ocultar' : '👁 Mostrar'}</button>
@@ -1273,13 +1383,16 @@ function renderMenu() {
           <label>Nombre</label>
           <input id="ep-nombre" value="${esc(p.nombre)}" autocomplete="off">
           <div class="fila" style="margin-top:8px">
-            <div class="crece"><label>Precio</label>
+            <div class="crece"><label>Precio (en almuerzo)</label>
               <input id="ep-precio" type="number" inputmode="numeric" value="${p.precio}"></div>
             <div class="crece"><label>Tipo</label>
               <select id="ep-tipo">
                 ${OPCIONES_TIPO.map(([v, n]) => `<option value="${v}" ${p.tipo === v ? 'selected' : ''}>${n}</option>`).join('')}
               </select></div>
           </div>
+          <label>Precio vendido SOLO (vacío = no se vende suelto)</label>
+          <input id="ep-solo" type="number" inputmode="numeric" value="${p.precio_solo || ''}"
+            placeholder="Ej: sopa sola 7500, bandeja sola 17000">
           <div class="fila" style="margin-top:10px">
             <button class="btn-mini" id="ep-cancelar">Cancelar</button>
             <button class="btn-mini ok" id="ep-guardar">💾 Guardar cambios</button>
@@ -1323,7 +1436,8 @@ function renderMenu() {
   if ($('#ep-guardar')) $('#ep-guardar').onclick = async () => {
     try {
       await api(`/platos/${state.editandoPlatoId}`, { method: 'PUT', body: {
-        nombre: $('#ep-nombre').value, precio: $('#ep-precio').value || 0, tipo: $('#ep-tipo').value
+        nombre: $('#ep-nombre').value, precio: $('#ep-precio').value || 0, tipo: $('#ep-tipo').value,
+        precio_solo: $('#ep-solo').value
       }});
       state.editandoPlatoId = null;
       toast('Plato actualizado en todos los teléfonos');
@@ -1546,6 +1660,22 @@ async function renderAdmin() {
     </div>
 
     <div class="tarjeta">
+      <h3 style="margin-top:0">🧾 Cuenta de venta (datos del negocio)</h3>
+      <label>Título del documento</label>
+      <input id="cf-fac-titulo" value="${esc(cfg.factura_titulo)}">
+      <label>Razón social / nombre</label>
+      <input id="cf-fac-razon" value="${esc(cfg.factura_razon_social)}" placeholder="Restaurante Doña...">
+      <label>NIT o cédula</label>
+      <input id="cf-fac-nit" value="${esc(cfg.factura_nit)}" placeholder="123456789-0">
+      <div class="fila" style="margin-top:8px">
+        <div class="crece"><label>Dirección</label><input id="cf-fac-dir" value="${esc(cfg.factura_direccion)}"></div>
+        <div class="crece"><label>Teléfono</label><input id="cf-fac-tel" value="${esc(cfg.factura_telefono)}"></div>
+      </div>
+      <label>Leyenda al pie (régimen)</label>
+      <textarea id="cf-fac-leyenda" rows="2">${esc(cfg.factura_leyenda)}</textarea>
+    </div>
+
+    <div class="tarjeta">
       <h3 style="margin-top:0">🏪 General</h3>
       <label>Nombre del restaurante</label>
       <input id="cf-nombre" value="${esc(cfg.nombre_restaurante)}">
@@ -1588,6 +1718,7 @@ async function renderAdmin() {
           <option value="mesero">Mesero</option>
           <option value="cajero">Cajero</option>
           <option value="admin">Administrador</option>
+          <option value="cocinera">Cocinera (sin acceso a la app, solo nómina)</option>
         </select>
       </div>
       <button class="btn" id="btn-nuevo-usuario" style="margin-top:10px">Crear usuario</button>
@@ -1614,7 +1745,10 @@ async function renderAdmin() {
         ancho_ticket: $('#cf-ancho').value, nombre_restaurante: $('#cf-nombre').value, recargo_empaque: $('#cf-recargo').value,
         hora_reporte: $('#cf-hora').value, correo_dueno: $('#cf-correo').value,
         gmail_usuario: $('#cf-gmail').value, gmail_app_password: $('#cf-gmailpass').value,
-        sheets_webhook_url: $('#cf-sheets').value
+        sheets_webhook_url: $('#cf-sheets').value,
+        factura_titulo: $('#cf-fac-titulo').value, factura_razon_social: $('#cf-fac-razon').value,
+        factura_nit: $('#cf-fac-nit').value, factura_direccion: $('#cf-fac-dir').value,
+        factura_telefono: $('#cf-fac-tel').value, factura_leyenda: $('#cf-fac-leyenda').value
       }});
       toast('Configuración guardada (aplica de inmediato)');
       state.config.nombre_restaurante = $('#cf-nombre').value;

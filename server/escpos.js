@@ -180,6 +180,54 @@ function ticketCocina(pedido, items, tipo, opciones = {}) {
   return t.resultado();
 }
 
+// Cuenta de venta para el cliente: datos del negocio configurables (NIT, etc.),
+// detalle con precios, total y método de pago. Documento informativo — la
+// factura electrónica DIAN requiere un proveedor autorizado.
+function ticketFactura(datos, opciones = {}) {
+  const ancho = Number(opciones.ancho || 32);
+  const t = new TicketBuilder(ancho);
+  const fmt = (n) => '$' + Number(n || 0).toLocaleString('es-CO');
+  const filaValor = (izq, der) => {
+    const d = String(der);
+    const espacio = Math.max(1, ancho - d.length);
+    t.linea(transliterar(izq).slice(0, espacio - 1).padEnd(espacio) + d);
+  };
+  const parrafo = (texto) => {
+    const palabras = transliterar(texto).split(/\s+/).filter(Boolean);
+    let linea = '';
+    for (const p of palabras) {
+      if (linea && (linea + ' ' + p).length > ancho) { t.linea(linea); linea = p; }
+      else linea = linea ? linea + ' ' + p : p;
+    }
+    if (linea) t.linea(linea);
+  };
+
+  t.linea(datos.titulo || 'CUENTA DE VENTA', { altoX2: true, bold: true, centrar: true });
+  if (datos.razon) t.linea(datos.razon, { centrar: true, bold: true });
+  if (datos.nit) t.linea(`NIT/CC: ${datos.nit}`, { centrar: true });
+  if (datos.direccion) t.linea(datos.direccion, { centrar: true });
+  if (datos.telefono) t.linea(`Tel: ${datos.telefono}`, { centrar: true });
+  t.separador();
+  t.linea(`No. ${String(datos.consecutivo).padStart(6, '0')}  Comanda #-${String(datos.numero_comanda).padStart(3, '0')}`);
+  t.linea(`Fecha: ${datos.fecha}  ${datos.hora}`);
+  t.separador();
+  for (const it of datos.items) {
+    const nombre = `${it.cantidad} ${it.nombre}${it.solo ? ' (solo)' : ''}`;
+    filaValor(nombre, it.subtotal > 0 ? fmt(it.subtotal) : 'Incl.');
+  }
+  if (datos.recargoDomicilio) filaValor('Domicilio', fmt(datos.recargoDomicilio));
+  if (datos.recargoTarjeta) filaValor('Recargo tarjeta', fmt(datos.recargoTarjeta));
+  t.separador();
+  t.linea(`TOTAL ${fmt(datos.total)}`, { anchoX2: true, altoX2: true, bold: true });
+  if (datos.metodo) t.linea(`Pago: ${datos.metodo}`);
+  else t.linea('PENDIENTE DE PAGO', { bold: true });
+  t.saltos(1);
+  if (datos.leyenda) parrafo(datos.leyenda);
+  t.linea('Gracias por su compra', { centrar: true });
+  t.cortar();
+  return t.resultado();
+}
+
 // Ticket de confirmación de pago de nómina
 function ticketNomina(datos, opciones = {}) {
   const fmt = (n) => '$' + Number(n || 0).toLocaleString('es-CO');
@@ -224,4 +272,4 @@ function ticketAccesoQR(url, nombreRestaurante, ancho) {
   return t.resultado();
 }
 
-module.exports = { ticketCocina, ticketNomina, ticketAccesoQR, transliterar };
+module.exports = { ticketCocina, ticketNomina, ticketFactura, ticketAccesoQR, transliterar };
