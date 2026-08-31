@@ -2,6 +2,45 @@
 // sincronización con Google Sheets (vía webhook de Google Apps Script).
 const { db, ahora, jornadaHoy, getConfig } = require('./db');
 
+// ---- Qué se vendió, plato por plato y tipo por tipo ----
+// Responde las dos preguntas del dueño: "¿cuántos pollo a la jardinera salieron?"
+// y "¿cuántos almuerzos de pollo en total?" (para saber qué comprar más).
+// El "tipo" (pollo, carne, cerdo...) se guarda en platos.grupo.
+// Ojo: hay platos homónimos inactivos de días viejos, por eso el ORDER BY.
+function ventasPorPlato(desde, hasta) {
+  const items = db.prepare(
+    `SELECT pi.plato_nombre, pi.precio, pi.cantidad, pi.solo,
+            (SELECT pl.tipo  FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo,
+            (SELECT pl.grupo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS grupo
+     FROM pedido_items pi JOIN pedidos p ON p.id = pi.pedido_id
+     WHERE p.jornada >= ? AND p.jornada <= ? AND p.estado != 'cancelado'`).all(desde, hasta);
+
+  const platos = new Map(), grupos = new Map();
+  for (const it of items) {
+    const valor = it.precio * it.cantidad;
+    const p = platos.get(it.plato_nombre) || { nombre: it.plato_nombre, tipo: it.tipo, grupo: it.grupo || '', cantidad: 0, solos: 0, total: 0 };
+    p.cantidad += it.cantidad;
+    p.total += valor;
+    if (it.solo) p.solos += it.cantidad;
+    platos.set(it.plato_nombre, p);
+    // El resumen por tipo cuenta proteínas: es lo que se compra en la plaza
+    if (it.tipo === 'proteina_dia' || it.tipo === 'proteina_especial') {
+      const clave = it.grupo || 'Sin tipo';
+      const g = grupos.get(clave) || { grupo: clave, cantidad: 0, solos: 0, total: 0 };
+      g.cantidad += it.cantidad;
+      g.total += valor;
+      if (it.solo) g.solos += it.cantidad;
+      grupos.set(clave, g);
+    }
+  }
+  const porCantidad = (a, b) => b.cantidad - a.cantidad || a.nombre?.localeCompare(b.nombre) || 0;
+  return {
+    desde, hasta,
+    platos: [...platos.values()].sort(porCantidad),
+    grupos: [...grupos.values()].sort((a, b) => b.cantidad - a.cantidad)
+  };
+}
+
 // ---- Resumen de una jornada ----
 function resumenJornada(jornada) {
   const pedidos = db.prepare(
@@ -64,6 +103,8 @@ function resumenJornada(jornada) {
     nomina: nominaDia.map(n => ({ empleado: n.empleado, turno: n.valor_turno, descuento: n.descuento, bono: n.bono, concepto: n.concepto, total: n.total })),
     totalNomina,
     numAlmuerzos, totalAlmuerzos, totalExtras,
+    // Detalle de qué se vendió (por plato y por tipo de proteína)
+    ...(() => { const v = ventasPorPlato(jornada, jornada); return { porPlato: v.platos, porGrupo: v.grupos }; })(),
     // Efectivo que debería haber físicamente: ventas en efectivo menos lo que salió de la caja
     efectivoEsperado: ventasEfectivo - totalGastos - totalNomina
   };
@@ -107,6 +148,22 @@ function textoReporte(resumen) {
   lineas.push('', 'Por vendedor:');
   for (const [v, d] of Object.entries(resumen.porVendedor)) {
     lineas.push(`  - ${v}: ${d.pedidos} pedidos, ${fmt(d.total)} (cancelados: ${d.cancelados})`);
+  }
+  // Lo que sirve para decidir las compras del día siguiente
+  if (resumen.porGrupo && resumen.porGrupo.length) {
+    lineas.push('', 'ALMUERZOS POR TIPO (para las compras):');
+    for (const g of resumen.porGrupo) {
+      lineas.push(`  - ${g.grupo}: ${g.cantidad}${g.solos ? ` (${g.solos} sin entrada)` : ''} = ${fmt(g.total)}`);
+    }
+  }
+  if (resumen.porPlato && resumen.porPlato.length) {
+    const proteinas = resumen.porPlato.filter(p => p.tipo === 'proteina_dia' || p.tipo === 'proteina_especial');
+    if (proteinas.length) {
+      lineas.push('', 'PROTEINAS VENDIDAS (de la más vendida a la menos):');
+      for (const p of proteinas) {
+        lineas.push(`  - ${p.cantidad} x ${p.nombre}${p.grupo ? ` [${p.grupo}]` : ''} = ${fmt(p.total)}`);
+      }
+    }
   }
   if (resumen.gastos.length) {
     lineas.push('', `GASTOS DEL LOCAL (${fmt(resumen.totalGastos)}):`);
@@ -251,4 +308,4 @@ function iniciarPlanificador() {
   }, 30000);
 }
 
-module.exports = { resumenJornada, ejecutarCierre, encolarReporteDiario, encolarVentaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync };
+module.exports = { resumenJornada, ventasPorPlato, ejecutarCierre, encolarReporteDiario, encolarVentaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync };

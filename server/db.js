@@ -286,6 +286,22 @@ if (esquemaPlatos && !esquemaPlatos.sql.includes('bebida')) {
   console.log('[db] Migración aplicada: tipo bebida incluida');
 }
 
+// Migración: "tipo" del plato para el reporte de compras (pollo, carne, cerdo...).
+// En la base se llama `grupo` para no confundirlo con platos.tipo, que es la
+// estructura del almuerzo (entrada / proteína / bebida / extra).
+if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'grupo')) {
+  db.exec('ALTER TABLE platos ADD COLUMN grupo TEXT');
+  console.log('[db] Migración aplicada: tipo de proteína (pollo/carne/cerdo) por plato');
+}
+
+// Migración: precio por defecto. El 90% de las ~150 proteínas del día valen lo
+// mismo y ese valor cambia cada año; con usa_default = 1 el plato toma el precio
+// configurado en el Menú, así se cambia una vez y aplica a todos.
+if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'usa_default')) {
+  db.exec('ALTER TABLE platos ADD COLUMN usa_default INTEGER NOT NULL DEFAULT 0');
+  console.log('[db] Migración aplicada: precio por defecto de proteínas y especiales');
+}
+
 // ---- Helpers de fecha/hora local ----
 function ahora() {
   return new Date().toLocaleString('sv-SE'); // "YYYY-MM-DD HH:MM:SS" en hora local
@@ -319,6 +335,15 @@ const CONFIG_DEFAULTS = {
   recargo_tarjeta_pct: '5',
   // Cambios rápidos (chips de notas): editables por meseros y cajeros desde la pestaña Menú
   chips_notas: '["Sin arroz","Sin sopa","Sin ensalada"]',
+  // Tipos de plato para el reporte de compras: "pollo a la jardinera" es del
+  // tipo Pollo, "chuleta" es Cerdo... Los edita cualquier mesero o cajero.
+  grupos_plato: '["Pollo","Carne","Cerdo","Pescado","Pasta","Vegetariano"]',
+  // Precio por defecto del almuerzo (con entrada) y del plato vendido solo.
+  // Casi todas las proteínas del día valen igual y el valor cambia cada año.
+  precio_dia_entrada: '17500',
+  precio_dia_solo: '17000',
+  precio_especial_entrada: '26000',
+  precio_especial_solo: '25000',
   // Cuenta de venta para el cliente (documento informativo; para factura
   // electrónica DIAN se requiere un proveedor autorizado)
   factura_titulo: 'FACTURA DE VENTA',

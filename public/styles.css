@@ -297,6 +297,21 @@ td.num, th.num { text-align: right; }
   width: 52px; border-radius: 12px; font-size: 22px; font-weight: 800; cursor: pointer;
   background: var(--panel2); border: 1px solid var(--peligro); color: var(--peligro);
 }
+/* Al tocar un plato solo se actualiza su fila: el contador y el "−" se
+   muestran/ocultan con [hidden] en vez de volver a dibujar toda la lista */
+.pr-wrap [hidden], .lista-platos [hidden] { display: none !important; }
+
+/* Buscador de platos (con 150 proteínas, bajar la lista es más lento que escribir) */
+.input-buscar {
+  width: 100%; margin: 8px 0 4px; font-size: 16px; padding: 12px;
+  background: var(--panel2); border: 1px solid var(--borde); border-radius: 10px; color: var(--texto);
+}
+.check-linea {
+  display: flex; align-items: center; gap: 8px; margin: 10px 0 0;
+  font-size: 14px; color: var(--texto);
+}
+.check-linea input { width: 20px; height: 20px; margin: 0; flex: none; }
+
 .nav-pantallas { display: flex; gap: 8px; }
 .btn-nav { flex: 1; padding: 15px 8px; font-size: 15px; }
 .btn-nav.nav-bloqueado { opacity: .55; }

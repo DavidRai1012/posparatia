@@ -69,8 +69,32 @@ app.post('/api/logout', requiere(1), (req, res) => {
 });
 
 // ---------- Datos en vivo compartidos ----------
+// Precio por defecto: casi todas las proteínas del día valen lo mismo (y ese
+// valor cambia cada año), así que el plato marcado con usa_default toma el
+// precio configurado en el Menú en vez del suyo propio.
+function preciosPorDefecto() {
+  const n = (c) => Math.max(0, Math.round(Number(getConfig(c)) || 0));
+  return {
+    proteina_dia: { precio: n('precio_dia_entrada'), solo: n('precio_dia_solo') },
+    proteina_especial: { precio: n('precio_especial_entrada'), solo: n('precio_especial_solo') }
+  };
+}
+
+function conPrecioEfectivo(plato, defs) {
+  if (!plato || !plato.usa_default) return plato;
+  const d = (defs || preciosPorDefecto())[plato.tipo];
+  if (!d) return plato;
+  return { ...plato, precio: d.precio, precio_solo: d.solo || null };
+}
+
 function platosActivos() {
-  return db.prepare('SELECT * FROM platos WHERE activo = 1 ORDER BY categoria, nombre').all();
+  const defs = preciosPorDefecto();
+  return db.prepare('SELECT * FROM platos WHERE activo = 1 ORDER BY categoria, nombre').all()
+    .map(p => conPrecioEfectivo(p, defs));
+}
+
+function gruposActuales() {
+  try { return JSON.parse(getConfig('grupos_plato') || '[]'); } catch { return []; }
 }
 function pedidosDeJornada(jornada) {
   const pedidos = db.prepare(
@@ -98,6 +122,8 @@ app.get('/api/estado', requiere(1), (req, res) => {
       nombre_restaurante: getConfig('nombre_restaurante'),
       recargo_empaque: Number(getConfig('recargo_empaque')),
       chips_notas: chipsActuales(),
+      grupos_plato: gruposActuales(),
+      precios_default: preciosPorDefecto(),
       recargo_tarjeta_fijo: Number(getConfig('recargo_tarjeta_fijo')),
       recargo_tarjeta_umbral: Number(getConfig('recargo_tarjeta_umbral')),
       recargo_tarjeta_pct: Number(getConfig('recargo_tarjeta_pct'))
@@ -110,28 +136,44 @@ app.get('/api/platos', requiere(1), (_req, res) => res.json(platosActivos()));
 
 const TIPOS_PLATO = ['entrada', 'proteina_dia', 'proteina_especial', 'bebida', 'extra'];
 
-// Pre-renderiza los nombres del menú como imagen x3 para que la comanda salga sin espera
+// Pre-renderiza los nombres del menú como imagen para que la primera comanda
+// del día no espere. Con el dibujo en JavaScript esto cuesta ~1 ms por plato,
+// pero se agrupa igual para no repetirlo en cada cambio del menú.
+let temporizadorPrecalentar = null;
 function precalentarMenu() {
-  setTimeout(() => {
+  clearTimeout(temporizadorPrecalentar);
+  temporizadorPrecalentar = setTimeout(() => {
     try {
       const nombres = platosActivos().map(p => (p.acronimo || p.nombre).toUpperCase());
       const alto = Math.round(24 * Number(getConfig('tamano_platos') || 3));
       if (alto > 24) require('./texto-bitmap').precalentar(nombres, alto, { centrar: false });
     } catch (e) { console.error('[raster] precalentamiento falló:', e.message); }
-  }, 1500);
+  }, 2000);
+}
+
+// El "tipo" que ve el usuario en el Menú (pollo, carne, cerdo...) se guarda en
+// la columna `grupo`; sirve para el reporte de qué comprar más.
+function grupoValido(valor) {
+  const g = String(valor || '').trim().slice(0, 24);
+  return g || null;
 }
 
 app.post('/api/platos', requiere(1), (req, res) => {
   const { nombre, precio, categoria, tipo } = req.body;
+  if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
+  // Con precio por defecto no hace falta escribir el precio en cada plato
+  const usaDefault = req.body.usa_default && preciosPorDefecto()[tipo] ? 1 : 0;
   // Las entradas van incluidas en el precio del almuerzo: se permiten en $0
   const precioMin = (tipo === 'entrada' || tipo === 'bebida') ? 0 : 1;
-  if (!nombre || !(Number(precio) >= precioMin)) return res.status(400).json({ error: 'Nombre y precio válido son obligatorios' });
-  if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
+  if (!nombre) return res.status(400).json({ error: 'El nombre del plato es obligatorio' });
+  if (!usaDefault && !(Number(precio) >= precioMin)) return res.status(400).json({ error: 'El precio es obligatorio' });
   const precioSolo = req.body.precio_solo !== undefined && String(req.body.precio_solo).trim() !== ''
     ? Math.round(Number(req.body.precio_solo)) || null : null;
   const acronimo = String(req.body.acronimo || '').trim().slice(0, 14).toUpperCase() || null;
-  const r = db.prepare('INSERT INTO platos (nombre, precio, categoria, tipo, precio_solo, acronimo) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(String(nombre).trim(), Math.round(Number(precio)), categoria || 'General', tipo, precioSolo, acronimo);
+  const r = db.prepare(
+    'INSERT INTO platos (nombre, precio, categoria, tipo, precio_solo, acronimo, grupo, usa_default) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(String(nombre).trim(), Math.round(Number(precio) || 0), categoria || 'General', tipo,
+         precioSolo, acronimo, grupoValido(req.body.grupo), usaDefault);
   emitirMenu();
   precalentarMenu();
   res.json({ id: r.lastInsertRowid });
@@ -146,7 +188,13 @@ app.put('/api/platos/:id', requiere(1), (req, res) => {
   const tipo = req.body.tipo !== undefined ? req.body.tipo : plato.tipo;
   const disponible = req.body.disponible !== undefined ? (req.body.disponible ? 1 : 0) : plato.disponible;
   if (!TIPOS_PLATO.includes(tipo)) return res.status(400).json({ error: 'Tipo de plato no válido' });
-  if (!nombre || !(precio >= ((tipo === 'entrada' || tipo === 'bebida') ? 0 : 1))) return res.status(400).json({ error: 'Datos de plato no válidos' });
+  const usaDefault = (req.body.usa_default !== undefined ? (req.body.usa_default ? 1 : 0) : plato.usa_default)
+    && preciosPorDefecto()[tipo] ? 1 : 0;
+  if (!nombre) return res.status(400).json({ error: 'El nombre del plato es obligatorio' });
+  if (!usaDefault && !(precio >= ((tipo === 'entrada' || tipo === 'bebida') ? 0 : 1))) {
+    return res.status(400).json({ error: 'Datos de plato no válidos' });
+  }
+  const grupo = req.body.grupo !== undefined ? grupoValido(req.body.grupo) : plato.grupo;
   let precioSolo = plato.precio_solo;
   if (req.body.precio_solo !== undefined) {
     precioSolo = String(req.body.precio_solo).trim() === '' ? null : (Math.round(Number(req.body.precio_solo)) || null);
@@ -155,11 +203,22 @@ app.put('/api/platos/:id', requiere(1), (req, res) => {
   if (req.body.acronimo !== undefined) {
     acronimo = String(req.body.acronimo).trim().slice(0, 14).toUpperCase() || null;
   }
-  db.prepare('UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ?, precio_solo = ?, acronimo = ? WHERE id = ?')
-    .run(nombre, precio, categoria, tipo, disponible, precioSolo, acronimo, plato.id);
+  db.prepare(`UPDATE platos SET nombre = ?, precio = ?, categoria = ?, tipo = ?, disponible = ?,
+              precio_solo = ?, acronimo = ?, grupo = ?, usa_default = ? WHERE id = ?`)
+    .run(nombre, Math.round(Number(precio) || 0), categoria, tipo, disponible, precioSolo, acronimo, grupo, usaDefault, plato.id);
   emitirMenu();
   precalentarMenu();
   res.json({ ok: true });
+});
+
+// Pone el precio por defecto a TODOS los platos de un tipo de una vez: sin esto,
+// marcar 150 proteínas una por una sería inviable.
+app.post('/api/platos/aplicar-default', requiere(1), (req, res) => {
+  const tipo = req.body.tipo;
+  if (!preciosPorDefecto()[tipo]) return res.status(400).json({ error: 'Ese tipo no tiene precio por defecto' });
+  const r = db.prepare('UPDATE platos SET usa_default = 1 WHERE tipo = ? AND activo = 1 AND usa_default = 0').run(tipo);
+  emitirMenu();
+  res.json({ ok: true, cambiados: r.changes });
 });
 
 app.delete('/api/platos/:id', requiere(1), (req, res) => {
@@ -179,9 +238,10 @@ function validarJornadaAbierta(res) {
 
 function armarItems(itemsBody) {
   const buscarPlato = db.prepare('SELECT * FROM platos WHERE id = ? AND activo = 1');
+  const defs = preciosPorDefecto();
   const items = [];
   for (const it of itemsBody || []) {
-    const plato = buscarPlato.get(it.plato_id);
+    const plato = conPrecioEfectivo(buscarPlato.get(it.plato_id), defs);
     if (!plato) throw new Error('Uno de los platos ya no existe en el menú');
     if (!plato.disponible) throw new Error(`El plato "${plato.nombre}" no está visible en el menú de hoy`);
     const cantidad = Math.max(1, Math.round(Number(it.cantidad) || 1));
@@ -206,6 +266,7 @@ function opcionesTicket() {
 }
 
 function imprimirPedido(pedidoId, tipo) {
+  const inicio = Date.now();
   const pedido = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(pedidoId);
   // El tipo del plato viaja al ticket para ordenar: entradas, proteínas, bebidas, extras
   const items = db.prepare(
@@ -215,6 +276,10 @@ function imprimirPedido(pedidoId, tipo) {
      FROM pedido_items pi WHERE pi.pedido_id = ?`).all(pedidoId);
   const ticket = ticketCocina(pedido, items, tipo, opcionesTicket());
   impresion.encolar(pedidoId, tipo, ticket);
+  // Armar la comanda debe costar milisegundos; si algún día vuelve a demorarse,
+  // que quede en el registro para saberlo sin adivinar
+  const ms = Date.now() - inicio;
+  if (ms > 1500) console.warn(`[impresion] la comanda ${pedido.numero_comanda} tardó ${ms} ms en armarse`);
 }
 
 // Recargo por pago con tarjeta: fijo bajo el umbral, porcentaje desde el umbral
@@ -432,6 +497,24 @@ const ETIQUETAS_METODO = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', nequi: 'Neq
   qr_bancolombia: 'QR Bancolombia', tarjeta_debito: 'Tarjeta débito', tarjeta_credito: 'Tarjeta crédito', billetera: 'Billetera' };
 const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
   'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+const ETIQUETAS_CLASE = { entrada: 'Entrada', proteina_dia: 'Del día', proteina_especial: 'Especial',
+  bebida: 'Bebida', extra: 'Extra' };
+
+// Hojas "qué se vendió": una con el detalle plato por plato y otra con el total
+// por tipo (pollo, carne, cerdo...), que es lo que se mira para hacer las compras.
+function hojasDePlatos(XLSX, libro, ventas) {
+  const filasPlatos = [['Plato', 'Tipo (compras)', 'Clase', 'Cantidad', 'De esos, sin entrada', 'Total $']];
+  for (const p of ventas.platos) {
+    filasPlatos.push([p.nombre, p.grupo || '', ETIQUETAS_CLASE[p.tipo] || p.tipo || '', p.cantidad, p.solos, p.total]);
+  }
+  const filasGrupos = [['Tipo', 'Almuerzos vendidos', 'De esos, sin entrada', 'Total $']];
+  for (const g of ventas.grupos) filasGrupos.push([g.grupo, g.cantidad, g.solos, g.total]);
+  filasGrupos.push([]);
+  filasGrupos.push(['TOTAL', ventas.grupos.reduce((s, g) => s + g.cantidad, 0), '',
+    ventas.grupos.reduce((s, g) => s + g.total, 0)]);
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasPlatos, [30, 16, 12, 10, 20, 12]), 'Platos vendidos');
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasGrupos, [18, 20, 20, 12]), 'Por tipo');
+}
 
 function enviarXlsx(res, libro, nombre) {
   const XLSX = require('xlsx');
@@ -516,8 +599,29 @@ app.get('/api/reportes/excel', requiere(1), (req, res) => {
   const libro = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasResumen, [34, 14]), 'Resumen del día');
   XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasVentas, [9, 6, 12, 10, 18, 20, 14, 18, 14, 9, 9, 11, 10]), 'Ventas');
+  hojasDePlatos(XLSX, libro, { platos: resumen.porPlato, grupos: resumen.porGrupo });
   XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasGastos, [46, 12, 14]), 'Gastos del día');
   enviarXlsx(res, libro, `resumen-${jornada}.xlsx`);
+});
+
+// Excel de "qué se vendió" entre dos fechas: sirve para decidir las compras de
+// la semana (cuántos pollos, cuánta carne) y ver qué plato no se está moviendo.
+app.get('/api/reportes/platos-excel', requiere(1), (req, res) => {
+  const XLSX = require('xlsx');
+  const fecha = (v, alt) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : alt;
+  const desde = fecha(req.query.desde, jornadaHoy());
+  const hasta = fecha(req.query.hasta, desde);
+  if (hasta < desde) return res.status(400).json({ error: 'La fecha final es anterior a la inicial' });
+  const ventas = reportes.ventasPorPlato(desde, hasta);
+  if (!ventas.platos.length) return res.status(404).json({ error: `No hay ventas entre ${desde} y ${hasta}` });
+  const libro = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, [
+    ['PLATOS VENDIDOS'], ['Desde', desde], ['Hasta', hasta], [],
+    ['Almuerzos (proteínas) vendidos', ventas.grupos.reduce((s, g) => s + g.cantidad, 0)],
+    ['Platos distintos vendidos', ventas.platos.length]
+  ], [32, 14]), 'Periodo');
+  hojasDePlatos(XLSX, libro, ventas);
+  enviarXlsx(res, libro, `platos-${desde}_a_${hasta}.xlsx`);
 });
 
 // Excel de nómina del año: una hoja por empleado (como la tarjeta Kardex que
@@ -790,6 +894,36 @@ app.put('/api/chips', requiere(1), (req, res) => {
   res.json({ ok: true, chips: limpios });
 });
 
+// ---------- Tipos de plato (pollo, carne, cerdo...): los editan meseros y cajeros ----------
+app.get('/api/grupos', requiere(1), (_req, res) => res.json(gruposActuales()));
+
+app.put('/api/grupos', requiere(1), (req, res) => {
+  const grupos = Array.isArray(req.body.grupos) ? req.body.grupos : null;
+  if (!grupos) return res.status(400).json({ error: 'Formato no válido' });
+  const limpios = [...new Set(grupos.map(g => String(g).trim()).filter(g => g && g.length <= 24))].slice(0, 30);
+  setConfig('grupos_plato', JSON.stringify(limpios));
+  io.emit('menu:config', { grupos_plato: limpios });
+  res.json({ ok: true, grupos: limpios });
+});
+
+// ---------- Precio por defecto de proteínas del día y especiales ----------
+// Lo cambian meseros y cajeros porque es el precio del almuerzo del año, y ya
+// pueden fijar precios al crear platos; el cambio aplica a todos los platos
+// marcados con "precio por defecto" (las ventas ya registradas no se tocan).
+app.put('/api/precios-default', requiere(1), (req, res) => {
+  const claves = ['precio_dia_entrada', 'precio_dia_solo', 'precio_especial_entrada', 'precio_especial_solo'];
+  for (const clave of claves) {
+    if (req.body[clave] === undefined) continue;
+    const v = Math.max(0, Math.round(Number(req.body[clave])));
+    if (!Number.isFinite(v)) return res.status(400).json({ error: 'Precio no válido' });
+    setConfig(clave, String(v));
+  }
+  const precios = preciosPorDefecto();
+  emitirMenu(); // los teléfonos ven los precios nuevos de inmediato
+  io.emit('menu:config', { precios_default: precios });
+  res.json({ ok: true, precios });
+});
+
 // ---------- Gastos del local (cajero o admin) ----------
 app.get('/api/gastos', requiere(2), (_req, res) => {
   res.json(db.prepare(
@@ -1005,5 +1139,14 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('==============================================');
   reportes.iniciarPlanificador();
   impresion.procesarCola(); // retomar comandas que quedaron pendientes tras un reinicio
-  precalentarMenu(); // pre-render de los nombres del menú en imagen x3
+  // Los platos grandes del ticket se dibujan con la letra de Windows. Si no se
+  // pudiera leer, el ticket sigue saliendo con la letra de la impresora (2x),
+  // pero conviene verlo aquí y no descubrirlo por un ticket más pequeño.
+  try {
+    require('./fuente-ttf').cargarFuente();
+  } catch (e) {
+    console.warn('[raster] No se pudo leer la fuente de Windows:', e.message);
+    console.warn('[raster] Los platos se imprimirán con la letra de la impresora (tamaño 2x).');
+  }
+  precalentarMenu(); // pre-render de los nombres del menú
 });

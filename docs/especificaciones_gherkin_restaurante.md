@@ -520,3 +520,104 @@ Característica: Reporte de ventas por vendedor y reintento de correo
     Y debe reintentarse automáticamente al restablecerse la conexión
     Y el reporte enviado con retraso debe indicar la fecha de la jornada a la que corresponde
 ```
+
+---
+
+```gherkin
+# language: es
+Característica: Velocidad de la comanda con el menú completo
+  Como mesero
+  Quiero que la comanda salga de inmediato aunque el menú tenga 300 platos
+  Para no dejar al cliente esperando en la caja
+
+  Escenario: Comanda con platos que nunca se han impreso
+    Dado que el menú tiene 300 platos y ninguno se ha impreso hoy
+    Cuando el mesero confirma una comanda con 3 almuerzos de platos distintos
+    Entonces la comanda debe armarse en menos de un segundo
+    Y el servidor debe seguir atendiendo a los demás teléfonos mientras tanto
+
+  Escenario: Buscar un plato en un menú largo
+    Dado que la pantalla de proteínas tiene más de 12 platos
+    Cuando el mesero escribe "champinones" en el buscador
+    Entonces deben quedar visibles los platos cuyo nombre contenga "champiñones"
+    Y la búsqueda debe ignorar tildes y mayúsculas
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Bebida incluida en los platos vendidos solos
+  Como mesero
+  Quiero poder agregar el jugo incluido a una proteína vendida sin entrada
+  Para no cobrarle aparte al cliente algo que va incluido
+
+  Escenario: Proteína del día vendida sola con su jugo
+    Dado que el cliente pide una proteína del día sin entrada
+    Cuando el mesero agrega una bebida incluida
+    Entonces el ticket debe quedar válido
+    Y la bebida no debe sumar valor al total
+
+  Escenario: Más bebidas que platos
+    Dado que el cliente pide una proteína del día sola
+    Cuando el mesero agrega dos bebidas incluidas
+    Entonces el sistema debe avisar que hay 2 bebidas para 1 plato
+    Y no debe permitir confirmar el pedido
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Tipo de plato y reporte de compras
+  Como dueño del restaurante
+  Quiero saber cuántos almuerzos se vendieron de cada plato y de cada tipo de carne
+  Para decidir qué comprar más y qué se está quedando quieto
+
+  Escenario: Asignar el tipo a una proteína
+    Dado que existe el tipo "Pollo" configurado en el menú
+    Cuando el cajero asigna el tipo "Pollo" al plato "Pollo a la jardinera"
+    Entonces el plato debe quedar clasificado como "Pollo" en los reportes
+
+  Escenario: Configurar los tipos disponibles
+    Dado que el mesero está en la pestaña Menú
+    Cuando agrega el tipo "Pescado"
+    Entonces el tipo debe quedar disponible en todos los teléfonos
+
+  Escenario: Reporte del día por plato y por tipo
+    Dado que se vendieron 2 "Pollo a la jardinera" y 1 "Chuleta valluna"
+    Cuando se consulta el resumen del día
+    Entonces debe mostrar 2 almuerzos del tipo "Pollo" y 1 del tipo "Cerdo"
+    Y el Excel debe traer una hoja con los platos vendidos y otra con los totales por tipo
+
+  Escenario: Reporte de varios días para las compras
+    Dado que el cajero elige un rango de fechas
+    Cuando descarga el Excel de platos vendidos
+    Entonces debe recibir las cantidades vendidas de cada plato y de cada tipo en ese rango
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Precio por defecto del almuerzo
+  Como cajero
+  Quiero configurar un solo precio para casi todas las proteínas del día
+  Para no escribir el mismo valor 150 veces y poder cambiarlo cuando suba el año siguiente
+
+  Escenario: Crear un plato con el precio por defecto
+    Dado que el precio por defecto del día es "$17.500" con entrada y "$17.000" solo
+    Cuando el cajero crea la proteína "Pollo a la jardinera" con "precio por defecto" marcado
+    Entonces el plato debe venderse a "$17.500" en almuerzo completo y a "$17.000" solo
+
+  Escenario: Cambio del precio del año
+    Dado que hay 150 proteínas marcadas con precio por defecto
+    Cuando el cajero cambia el precio por defecto a "$18.000"
+    Entonces las 150 proteínas deben pasar a "$18.000"
+    Y las ventas ya registradas deben conservar el precio que tenían
+
+  Escenario: Plato con precio propio
+    Dado que la "Bandeja paisa" tiene un precio distinto al del resto
+    Cuando el cajero deja sin marcar "precio por defecto" y escribe "$18.500"
+    Entonces la bandeja debe conservar su precio aunque cambie el precio por defecto
+```

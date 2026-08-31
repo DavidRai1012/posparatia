@@ -37,7 +37,7 @@ const state = {
   sel: { entrada: [], proteina: [], bebida: [], extra: [], solo: [] }, uidSeq: 1,
   notas: {},                                // uid de proteína -> {chips, custom} (nota del almuerzo)
   notaExtras: { chips: [], custom: '' },    // nota del bloque de extras sueltos
-  pantalla: 'entrada', itemAbierto: null, ticketAbierto: false,
+  pantalla: 'entrada', itemAbierto: null, ticketAbierto: false, busqueda: '', busquedaMenu: '',
   comensal: '', tipoEntrega: 'mesa', editandoId: null,
   valorDomicilio: '', imprimirExtras: false,
   enviandoPedido: false, pagoMetodo: null, pagoRecibido: '',
@@ -259,8 +259,14 @@ function mostrarConfirmacionNomina() {
 function conectarSocket() {
   if (socket) socket.disconnect();
   socket = io({ auth: { token: state.token } });
-  socket.on('menu:actualizado', (platos) => { state.platos = platos; refrescarVistaEnVivo(); });
-  socket.on('pedidos:actualizado', (pedidos) => { state.pedidos = pedidos; refrescarVistaEnVivo(); });
+  socket.on('menu:actualizado', (platos) => { state.platos = platos; refrescarVistaEnVivo(['tomar', 'menu']); });
+  // La pantalla de toma de pedido no muestra comandas ajenas: redibujarla en
+  // cada venta de otro mesero solo estorbaba (perdía el buscador y el scroll)
+  socket.on('pedidos:actualizado', (pedidos) => { state.pedidos = pedidos; refrescarVistaEnVivo(['historial', 'caja']); });
+  socket.on('menu:config', (cfg) => {
+    Object.assign(state.config, cfg);
+    refrescarVistaEnVivo(['menu', 'tomar']);
+  });
   socket.on('impresion:estado', (imp) => { state.impresion = imp; renderBanner(); refrescarVistaEnVivo(['impresora', 'admin']); });
   socket.on('jornada:cerrada', () => { state.jornadaCerrada = true; renderBanner(); refrescarVistaEnVivo(); });
   socket.on('jornada:reabierta', () => { state.jornadaCerrada = false; renderBanner(); refrescarVistaEnVivo(); });
@@ -373,18 +379,32 @@ function recargoDomicilioActual() {
   return v === '' ? Number(state.config.recargo_empaque || 0) : Math.max(0, Math.round(Number(v) || 0));
 }
 
-// Regla acordada: el ticket solo se habilita con SOLO extras, o con almuerzos
-// completos (misma cantidad de entradas y proteinas).
+// Una proteína del día o un especial vendidos SOLOS (sin entrada) también
+// llevan la bebida incluida: cuentan para el cupo de jugos del ticket.
+function solosConBebida() {
+  return state.sel.solo.filter(it => {
+    const p = platoDe(it.platoId);
+    return p && (p.tipo === 'proteina_dia' || p.tipo === 'proteina_especial');
+  }).length;
+}
+
+// Regla acordada: el ticket solo se habilita con SOLO extras/sueltos, o con
+// almuerzos completos (misma cantidad de entradas y proteinas).
 function estadoTicket() {
   const nE = state.sel.entrada.length, nP = state.sel.proteina.length,
         nB = state.sel.bebida.length, nX = state.sel.extra.length, nS = state.sel.solo.length;
+  const cupoBebidas = nE + solosConBebida();
   if (!nE && !nP && !nB && !nX && !nS) return { ok: false, motivo: 'Toque los platos para armar el pedido' };
   if (!nE && !nP) {
-    if (nB) return { ok: false, motivo: 'Las bebidas incluidas van con un almuerzo (los platos sueltos están en "Del día - solos")' };
+    if (nB > cupoBebidas) {
+      return { ok: false, motivo: cupoBebidas
+        ? `Hay ${nB} bebida(s) para ${cupoBebidas} plato(s) del día vendido(s) solo(s)`
+        : 'La bebida va incluida con un almuerzo o con un plato del día vendido solo' };
+    }
     return { ok: true, modo: 'extras' };
   }
   if (nE !== nP) return { ok: false, motivo: `Almuerzos incompletos: ${nE} entrada(s) y ${nP} proteína(s)` };
-  if (nB > nE) return { ok: false, motivo: `Hay ${nB} bebida(s) incluida(s) para solo ${nE} almuerzo(s)` };
+  if (nB > cupoBebidas) return { ok: false, motivo: `Hay ${nB} bebida(s) incluida(s) para ${cupoBebidas} almuerzo(s) o plato(s) solo(s)` };
   return { ok: true, modo: 'almuerzos' };
 }
 
@@ -397,9 +417,12 @@ function derivarBloques() {
     if (state.sel.extra[i]) items.push(state.sel.extra[i]);
     bloques.push({ items, proteinaUid: state.sel.proteina[i].uid });
   }
+  // Lo que no cupo en un almuerzo completo: los platos del día vendidos solos,
+  // las bebidas que van con ellos y los extras sueltos.
   const sobrantes = [
-    ...state.sel.extra.slice(n).map(it => ({ ...it, esSolo: false })),
-    ...state.sel.solo.map(it => ({ ...it, esSolo: true }))
+    ...state.sel.solo.map(it => ({ ...it, esSolo: true })),
+    ...state.sel.bebida.slice(n).map(it => ({ ...it, esSolo: false })),
+    ...state.sel.extra.slice(n).map(it => ({ ...it, esSolo: false }))
   ];
   return { bloques, sobrantes };
 }
@@ -457,26 +480,76 @@ function platosDeSeccion(tipo) {
   return state.platos.filter(p => p.tipo === tipo && p.disponible);
 }
 
+// Búsqueda tolerante a tildes y mayúsculas: con 150 proteínas en el menú,
+// desplazarse hasta el plato es más lento que escribir dos letras.
+function normalizar(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
+
+function filaPlato(p, listaKey) {
+  const enSel = state.sel[listaKey].filter(it => it.platoId === p.id).length;
+  const precio = listaKey === 'solo' ? p.precio_solo : p.precio;
+  return `
+    <div class="pr-wrap" data-wrap="${listaKey}-${p.id}">
+      <button class="plato-row ${enSel ? 'en-orden' : ''}" data-plato="${p.id}" data-lista="${listaKey}">
+        <span class="pr-nombre">${esc(p.nombre)}</span>
+        <span class="pr-precio">${precio ? fmt(precio) : ''}</span>
+        <span class="pb-badge" ${enSel ? '' : 'hidden'}>${enSel}</span>
+      </button>
+      <button class="pr-menos" ${enSel ? '' : 'hidden'} data-menos-plato="${p.id}" data-lista="${listaKey}">−</button>
+    </div>`;
+}
+
+// Solo se redibuja la lista de platos (no la pantalla entera): así el buscador
+// no pierde el cursor y con 300 platos se siente instantáneo.
+function pintarListas() {
+  const cont = $('#listas-platos');
+  if (!cont) return;
+  const q = normalizar(state.busqueda);
+  let html = '';
+  for (const [tipo, subtitulo, listaKey] of PANTALLAS[state.pantalla].secciones) {
+    let platos = platosDeSeccion(tipo);
+    if (q) platos = platos.filter(p => normalizar(p.nombre).includes(q) || normalizar(p.acronimo).includes(q));
+    if (!platos.length) continue;
+    html += `${subtitulo ? `<div class="cat-titulo">${esc(subtitulo)}</div>` : ''}
+      <div class="lista-platos">${platos.map(p => filaPlato(p, listaKey)).join('')}</div>`;
+  }
+  cont.innerHTML = html || `<div class="tarjeta suave">Ningún plato coincide con "${esc(state.busqueda)}"</div>`;
+}
+
+// Actualiza SOLO la fila tocada y los contadores, sin volver a dibujar la lista
+function actualizarFilaPlato(platoId, listaKey) {
+  const wrap = document.querySelector(`[data-wrap="${listaKey}-${platoId}"]`);
+  if (!wrap) return;
+  const n = state.sel[listaKey].filter(it => it.platoId === platoId).length;
+  const badge = wrap.querySelector('.pb-badge');
+  const menos = wrap.querySelector('.pr-menos');
+  const fila = wrap.querySelector('.plato-row');
+  if (badge) { badge.textContent = n; badge.hidden = !n; }
+  if (menos) menos.hidden = !n;
+  if (fila) fila.classList.toggle('en-orden', !!n);
+}
+
+function actualizarBarraPedido() {
+  const resumen = $('#resumen-sel');
+  if (resumen) {
+    resumen.textContent = `🥣${state.sel.entrada.length} · 🍗${state.sel.proteina.length} · ` +
+      `🥤${state.sel.bebida.length} · 🧃${state.sel.extra.length + state.sel.solo.length}`;
+  }
+  const btn = $('#btn-ver-ticket');
+  if (btn) {
+    btn.classList.toggle('nav-bloqueado', !estadoTicket().ok);
+    btn.textContent = `🧾 TICKET · ${fmt(totalCarrito())}`;
+  }
+}
+
 function renderTomar() {
   if (state.ticketAbierto) return renderTicket();
   const def = PANTALLAS[state.pantalla];
   const est = estadoTicket();
   const nE = state.sel.entrada.length, nP = state.sel.proteina.length,
         nB = state.sel.bebida.length, nXS = state.sel.extra.length + state.sel.solo.length;
-
-  const filaPlato = (p, listaKey) => {
-    const enSel = state.sel[listaKey].filter(it => it.platoId === p.id).length;
-    const precio = listaKey === 'solo' ? p.precio_solo : p.precio;
-    return `
-    <div class="pr-wrap">
-      <button class="plato-row ${enSel ? 'en-orden' : ''}" data-plato="${p.id}" data-lista="${listaKey}">
-        <span class="pr-nombre">${esc(p.nombre)}</span>
-        <span class="pr-precio">${precio ? fmt(precio) : ''}</span>
-        ${enSel ? `<span class="pb-badge">${enSel}</span>` : ''}
-      </button>
-      ${enSel ? `<button class="pr-menos" data-menos-plato="${p.id}" data-lista="${listaKey}">−</button>` : ''}
-    </div>`;
-  };
+  const totalPantalla = def.secciones.reduce((n, [tipo]) => n + platosDeSeccion(tipo).length, 0);
 
   $('#vista').innerHTML = `
   <div class="pantalla-pedido">
@@ -484,14 +557,12 @@ function renderTomar() {
       <button class="btn-mini" id="btn-cancelar-edicion">Descartar</button></div>` : ''}
     <div class="paso-titulo">
       <span class="paso-num">${def.paso}</span> ${def.titulo}
-      <span class="der resumen-sel">🥣${nE} · 🍗${nP} · 🥤${nB} · 🧃${nXS}</span>
+      <span class="der resumen-sel" id="resumen-sel">🥣${nE} · 🍗${nP} · 🥤${nB} · 🧃${nXS}</span>
     </div>
-    ${def.secciones.map(([tipo, subtitulo, listaKey]) => {
-      const platos = platosDeSeccion(tipo);
-      if (!platos.length) return '';
-      return `${subtitulo ? `<div class="cat-titulo">${esc(subtitulo)}</div>` : ''}
-        <div class="lista-platos">${platos.map(p => filaPlato(p, listaKey)).join('')}</div>`;
-    }).join('')}
+    ${totalPantalla > 12 ? `<input id="buscar-plato" class="input-buscar" type="search"
+      placeholder="🔎 Buscar entre ${totalPantalla} platos..." value="${esc(state.busqueda)}"
+      autocomplete="off" autocorrect="off" enterkeyhint="search">` : ''}
+    <div id="listas-platos"></div>
     <div style="height:8px"></div>
   </div>
   <div class="barra-envio">
@@ -509,24 +580,36 @@ function renderTomar() {
     </div>
   </div>`;
 
-  $('#vista').querySelectorAll('[data-plato]').forEach(b => b.onclick = () => {
-    state.sel[b.dataset.lista].push({ uid: state.uidSeq++, platoId: Number(b.dataset.plato) });
-    vibrar(25); renderTomar();
-  });
-  $('#vista').querySelectorAll('[data-menos-plato]').forEach(b => b.onclick = () => {
-    const lista = state.sel[b.dataset.lista];
-    const id = Number(b.dataset.menosPlato);
-    for (let i = lista.length - 1; i >= 0; i--) {
-      if (lista[i].platoId === id) {
-        delete state.notas[lista[i].uid];
-        lista.splice(i, 1);
-        break;
+  pintarListas();
+
+  // Un solo manejador para toda la lista (con 300 platos, poner 300 escuchas
+  // en cada toque es justo lo que hacía sentir lenta la pantalla)
+  $('#listas-platos').onclick = (e) => {
+    const menos = e.target.closest('[data-menos-plato]');
+    if (menos) {
+      const lista = state.sel[menos.dataset.lista];
+      const id = Number(menos.dataset.menosPlato);
+      for (let i = lista.length - 1; i >= 0; i--) {
+        if (lista[i].platoId === id) { delete state.notas[lista[i].uid]; lista.splice(i, 1); break; }
       }
+      vibrar(25);
+      actualizarFilaPlato(id, menos.dataset.lista);
+      actualizarBarraPedido();
+      return;
     }
-    vibrar(25); renderTomar();
-  });
+    const b = e.target.closest('[data-plato]');
+    if (!b) return;
+    const id = Number(b.dataset.plato);
+    state.sel[b.dataset.lista].push({ uid: state.uidSeq++, platoId: id });
+    vibrar(25);
+    actualizarFilaPlato(id, b.dataset.lista);
+    actualizarBarraPedido();
+  };
+  if ($('#buscar-plato')) $('#buscar-plato').oninput = (e) => { state.busqueda = e.target.value; pintarListas(); };
   if ($('#btn-cancelar-edicion')) $('#btn-cancelar-edicion').onclick = () => { limpiarFormulario(); renderTomar(); };
-  const ir = (id, pantalla) => { if ($(id)) $(id).onclick = () => { state.pantalla = pantalla; renderTomar(); }; };
+  const ir = (id, pantalla) => {
+    if ($(id)) $(id).onclick = () => { state.pantalla = pantalla; state.busqueda = ''; renderTomar(); };
+  };
   ir('#btn-solo-extras', 'extras');
   ir('#btn-ir-proteina', 'proteina');
   ir('#btn-ir-entrada', 'entrada');
@@ -598,7 +681,7 @@ function renderTicket() {
 
     <div class="lineas-ticket">
       ${bloques.map((b, i) => cardBloque(`Almuerzo ${i + 1}`, b.items)).join('')}
-      ${sobrantes.length ? cardBloque('Extras', sobrantes) : ''}
+      ${sobrantes.length ? cardBloque('Sueltos y extras', sobrantes) : ''}
     </div>
 
     <div class="top-pedido" style="margin-top:10px">
@@ -692,7 +775,8 @@ function renderTicket() {
     delete state.notas[uid];
     state.itemAbierto = null;
     vibrar(25);
-    const quedan = state.sel.entrada.length + state.sel.proteina.length + state.sel.bebida.length + state.sel.extra.length;
+    const quedan = state.sel.entrada.length + state.sel.proteina.length + state.sel.bebida.length +
+                   state.sel.extra.length + state.sel.solo.length;
     if (!quedan) { state.ticketAbierto = false; state.pantalla = 'entrada'; renderTomar(); }
     else if (!estadoTicket().ok) {
       state.ticketAbierto = false; state.pantalla = 'extras';
@@ -734,7 +818,7 @@ function actualizarVueltasTicket() {
 function limpiarFormulario() {
   state.sel = { entrada: [], proteina: [], bebida: [], extra: [], solo: [] };
   state.notas = {}; state.notaExtras = { chips: [], custom: '' };
-  state.pantalla = 'entrada'; state.itemAbierto = null; state.ticketAbierto = false;
+  state.pantalla = 'entrada'; state.itemAbierto = null; state.ticketAbierto = false; state.busqueda = '';
   state.comensal = ''; state.tipoEntrega = 'mesa';
   state.editandoId = null; state.editandoNumero = null;
   state.pagoMetodo = null; state.pagoRecibido = '';
@@ -1074,6 +1158,15 @@ function renderCaja() {
       <input id="excel-fecha" type="date" value="${state.jornada}" style="flex:1">
       <button class="btn-mini primario" id="btn-excel" style="flex:1">📥 Descargar Excel</button>
     </div>
+    <div class="tarjeta">
+      <div class="suave">📊 Qué se vendió entre dos fechas (para decidir las compras)</div>
+      <div class="fila" style="margin-top:6px">
+        <input id="pl-desde" type="date" value="${state.jornada.slice(0, 8)}01" style="flex:1">
+        <input id="pl-hasta" type="date" value="${state.jornada}" style="flex:1">
+      </div>
+      <button class="btn-mini primario" id="btn-excel-platos" style="margin-top:8px;width:100%">
+        📊 Excel de platos y tipos vendidos</button>
+    </div>
 
     <button class="btn gris" id="btn-ir-rect" style="margin:8px 0">🔁 Rectificar métodos de pago →</button>
 
@@ -1184,6 +1277,14 @@ function renderCaja() {
     try {
       await descargarArchivo(`/api/reportes/excel?jornada=${fecha}`, `resumen-${fecha}.xlsx`);
       toast('📥 Excel del día descargado: revise Descargas');
+    } catch (e) { toast(e.message, true); }
+  };
+  if ($('#btn-excel-platos')) $('#btn-excel-platos').onclick = async () => {
+    const desde = $('#pl-desde').value || state.jornada;
+    const hasta = $('#pl-hasta').value || state.jornada;
+    try {
+      await descargarArchivo(`/api/reportes/platos-excel?desde=${desde}&hasta=${hasta}`, `platos-${desde}_a_${hasta}.xlsx`);
+      toast('📊 Excel de platos vendidos descargado');
     } catch (e) { toast(e.message, true); }
   };
   if ($('#btn-excel-nomina')) $('#btn-excel-nomina').onclick = async () => {
@@ -1330,6 +1431,15 @@ async function cargarResumenDia() {
       <div class="fila"><span>🍛 Almuerzos completos (${r.numAlmuerzos})</span><span class="der grande" style="font-size:16px">${fmt(r.totalAlmuerzos)}</span></div>
       <div class="fila suave"><span>🧃 Extras vendidos</span><span class="der">${fmt(r.totalExtras)}</span></div>
       <div class="fila"><span><b>Total general</b> (${r.numPedidos} pedidos)</span><span class="der grande" style="font-size:16px">${fmt(r.totalVentas)}</span></div>
+      ${(r.porGrupo || []).length ? `<hr class="sep">
+        <div class="suave" style="margin-bottom:4px">🍗 Almuerzos por tipo (para las compras)</div>
+        ${r.porGrupo.map(g => `<div class="fila suave"><span>${esc(g.grupo)}</span>
+          <span class="der"><b>${g.cantidad}</b>${g.solos ? ` (${g.solos} sin entrada)` : ''}</span></div>`).join('')}` : ''}
+      ${(r.porPlato || []).some(p => p.tipo === 'proteina_dia' || p.tipo === 'proteina_especial') ? `<hr class="sep">
+        <div class="suave" style="margin-bottom:4px">🍽️ Platos vendidos hoy</div>
+        ${r.porPlato.filter(p => p.tipo === 'proteina_dia' || p.tipo === 'proteina_especial')
+          .map(p => `<div class="fila suave"><span>${esc(p.nombre)}${p.grupo ? ` <span class="chip">${esc(p.grupo)}</span>` : ''}</span>
+            <span class="der"><b>${p.cantidad}</b></span></div>`).join('')}` : ''}
       <hr class="sep">
       <div class="fila suave"><span>Cobrado</span><span class="der">${fmt(r.totalCobrado)}</span></div>
       <div class="fila suave"><span>Domicilios cobrados</span><span class="der">${fmt(r.totalRecargos)}</span></div>
@@ -1361,7 +1471,36 @@ const OPCIONES_TIPO = [
   ['proteina_especial', 'Especial'], ['bebida', 'Bebida incluida'], ['extra', 'Extra']
 ];
 
+// Tipos de plato para el reporte de compras (pollo, carne, cerdo...).
+// En la base se llaman "grupo" para no chocar con el tipo de estructura.
+function gruposPlato() { return (state.config && state.config.grupos_plato) || []; }
+function preciosDefault() {
+  return (state.config && state.config.precios_default) ||
+    { proteina_dia: { precio: 0, solo: 0 }, proteina_especial: { precio: 0, solo: 0 } };
+}
+const LLEVA_GRUPO = (tipo) => tipo === 'proteina_dia' || tipo === 'proteina_especial';
+const MAX_LISTA_MENU = 40; // con ~150 proteínas, pintarlas todas hace lenta la pestaña
+
+function selectGrupos(id, sel) {
+  return `<select id="${id}">
+    <option value="">— sin tipo —</option>
+    ${gruposPlato().map(g => `<option value="${esc(g)}" ${g === sel ? 'selected' : ''}>${esc(g)}</option>`).join('')}
+  </select>`;
+}
+
 function renderMenu() {
+  const pd = preciosDefault();
+  const q = normalizar(state.busquedaMenu);
+  // La clase/tipo del formulario vive en el estado: así cargar 150 platos
+  // seguidos no obliga a re-elegirlos, ni siquiera cuando otro teléfono
+  // cambia el menú y esta pestaña se vuelve a dibujar sola.
+  const nuevo = state.nuevoPlato || (state.nuevoPlato = { tipo: 'proteina_dia', grupo: '', usaDefault: true });
+  // Guardar la posición: al asignar tipos en fila, el menú se redibuja solo y
+  // saltar al principio de la lista cada vez sería insufrible
+  const zona = document.querySelector('main');
+  const scrollPrevio = zona ? zona.scrollTop : 0;
+  const nSinDefault = (tipo) => state.platos.filter(p => p.tipo === tipo && !p.usa_default).length;
+
   $('#vista').innerHTML = `
     <h2>Menú del día</h2>
     <div class="tarjeta">
@@ -1369,13 +1508,58 @@ function renderMenu() {
       <input id="np-nombre" placeholder="Nombre del plato" autocomplete="off">
       <input id="np-acronimo" placeholder="Acrónimo para la comanda (opcional, ej: CREMA)" autocomplete="off" style="margin-top:8px">
       <div class="fila" style="margin-top:8px">
-        <input id="np-precio" type="number" inputmode="numeric" placeholder="Precio" style="flex:1">
-        <select id="np-tipo" style="flex:1.4">
-          ${OPCIONES_TIPO.map(([v, n]) => `<option value="${v}" ${v === 'proteina_dia' ? 'selected' : ''}>${n}</option>`).join('')}
-        </select>
+        <div class="crece"><label>Clase</label>
+          <select id="np-tipo">
+            ${OPCIONES_TIPO.map(([v, n]) => `<option value="${v}" ${v === nuevo.tipo ? 'selected' : ''}>${n}</option>`).join('')}
+          </select></div>
+        <div class="crece" id="np-grupo-caja"><label>Tipo (para compras)</label>${selectGrupos('np-grupo', nuevo.grupo)}</div>
+      </div>
+      <label class="check-linea" id="np-default-caja">
+        <input type="checkbox" id="np-default" ${nuevo.usaDefault ? 'checked' : ''}>
+        <span>Usar el precio por defecto (<b id="np-default-txt"></b>)</span>
+      </label>
+      <div class="fila" id="np-precios" style="margin-top:8px">
+        <div class="crece"><label>Precio con entrada</label>
+          <input id="np-precio" type="number" inputmode="numeric" placeholder="Ej: 17500"></div>
+        <div class="crece"><label>Precio vendido solo</label>
+          <input id="np-solo" type="number" inputmode="numeric" placeholder="Ej: 17000"></div>
       </div>
       <button class="btn" id="btn-nuevo-plato" style="margin-top:10px">Agregar al menú</button>
     </div>
+
+    <div class="tarjeta">
+      <h3 style="margin-top:0">💲 Precio del almuerzo (por defecto)</h3>
+      <div class="suave">Casi todas las proteínas valen lo mismo y cambia cada año: cámbielo aquí una vez y todos los platos marcados con "precio por defecto" quedan actualizados. Las ventas ya registradas no se tocan.</div>
+      <div class="fila" style="margin-top:8px">
+        <div class="crece"><label>🍗 Del día, con entrada</label>
+          <input id="pd-dia-entrada" type="number" inputmode="numeric" value="${pd.proteina_dia.precio || ''}"></div>
+        <div class="crece"><label>🍗 Del día, solo</label>
+          <input id="pd-dia-solo" type="number" inputmode="numeric" value="${pd.proteina_dia.solo || ''}"></div>
+      </div>
+      <div class="fila" style="margin-top:8px">
+        <div class="crece"><label>⭐ Especial, con entrada</label>
+          <input id="pd-esp-entrada" type="number" inputmode="numeric" value="${pd.proteina_especial.precio || ''}"></div>
+        <div class="crece"><label>⭐ Especial, solo</label>
+          <input id="pd-esp-solo" type="number" inputmode="numeric" value="${pd.proteina_especial.solo || ''}"></div>
+      </div>
+      <button class="btn-mini ok" id="btn-precios-default" style="margin-top:10px">💾 Guardar precios</button>
+      ${nSinDefault('proteina_dia') ? `<button class="btn-mini" data-aplicar="proteina_dia" style="margin-top:8px;width:100%">
+        Poner el precio por defecto a las ${nSinDefault('proteina_dia')} proteínas del día que tienen precio propio</button>` : ''}
+      ${nSinDefault('proteina_especial') ? `<button class="btn-mini" data-aplicar="proteina_especial" style="margin-top:6px;width:100%">
+        Poner el precio por defecto a los ${nSinDefault('proteina_especial')} especiales con precio propio</button>` : ''}
+    </div>
+
+    <div class="tarjeta">
+      <h3 style="margin-top:0">🏷️ Tipos de plato (para saber qué comprar)</h3>
+      <div class="suave">Ej: "pollo a la jardinera" es del tipo <b>Pollo</b>, "chuleta" es <b>Cerdo</b>. El reporte dice cuántos almuerzos se vendieron de cada tipo.</div>
+      <div class="chips" style="margin-top:8px">${gruposPlato().map(g =>
+        `<button class="chip-nota" data-grupo-borrar="${esc(g)}">${esc(g)} ✕</button>`).join('') || '<span class="suave">No hay tipos aún</span>'}</div>
+      <div class="fila" style="margin-top:8px">
+        <input id="grupo-nuevo" placeholder="Nuevo tipo (ej: Pescado)" style="flex:2" autocomplete="off">
+        <button class="btn-mini ok" id="btn-grupo-agregar" style="flex:1">Agregar</button>
+      </div>
+    </div>
+
     <div class="tarjeta">
       <h3 style="margin-top:0">⚡ Cambios rápidos (notas de 1 toque en el ticket)</h3>
       <div class="chips">${chipsNotas().map(c =>
@@ -1385,37 +1569,58 @@ function renderMenu() {
         <button class="btn-mini ok" id="btn-chip-agregar" style="flex:1">Agregar</button>
       </div>
     </div>
+
+    <input id="buscar-menu" class="input-buscar" type="search" placeholder="🔎 Buscar plato en el menú (${state.platos.length})"
+      value="${esc(state.busquedaMenu)}" autocomplete="off" autocorrect="off">
+
     ${TIPOS_UI.map(([tipo, titulo]) => {
-      const platos = state.platos.filter(p => p.tipo === tipo);
-      if (!platos.length) return '';
-      return `<h3>${titulo}</h3>` + platos.map(p => `
+      const todos = state.platos.filter(p => p.tipo === tipo);
+      const filtrados = q ? todos.filter(p => normalizar(p.nombre).includes(q) || normalizar(p.acronimo).includes(q)) : todos;
+      if (!filtrados.length) return '';
+      const visibles = filtrados.slice(0, MAX_LISTA_MENU);
+      return `<h3>${titulo} (${filtrados.length})</h3>` + visibles.map(p => `
       <div class="tarjeta ${p.disponible ? '' : 'plato-oculto'}">
         <div class="fila">
           <div class="crece">
             <div class="plato-nombre">${esc(p.nombre)}
-              ${p.disponible ? '' : '<span class="chip">OCULTO</span>'}</div>
-            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}${p.precio_solo ? ` · solo ${fmt(p.precio_solo)}` : ''}${p.acronimo ? ` · 🖨 ${esc(p.acronimo)}` : ''}</div>
+              ${p.disponible ? '' : '<span class="chip">OCULTO</span>'}
+              ${p.grupo ? `<span class="chip">${esc(p.grupo)}</span>` : ''}</div>
+            <div class="plato-precio">${p.precio ? fmt(p.precio) : 'Incluido'}${p.precio_solo ? ` · solo ${fmt(p.precio_solo)}` : ''}${p.usa_default ? ' · por defecto' : ''}${p.acronimo ? ` · 🖨 ${esc(p.acronimo)}` : ''}</div>
           </div>
           <button class="btn-mini ${p.disponible ? '' : 'ok'}" data-visible="${p.id}">
             ${p.disponible ? '🚫 Ocultar' : '👁 Mostrar'}</button>
           <button class="btn-mini primario" data-editar-plato="${p.id}">✏️</button>
           <button class="btn-mini peligro" data-borrar="${p.id}">🗑</button>
         </div>
+        ${LLEVA_GRUPO(p.tipo) && gruposPlato().length ? `
+        <div class="fila" style="margin-top:6px">
+          <span class="suave">Tipo:</span>
+          <select data-grupo-de="${p.id}" style="flex:1">
+            <option value="">— sin tipo —</option>
+            ${gruposPlato().map(g => `<option value="${esc(g)}" ${g === p.grupo ? 'selected' : ''}>${esc(g)}</option>`).join('')}
+          </select>
+        </div>` : ''}
         ${state.editandoPlatoId === p.id ? `
         <div class="lt-detalle" style="border-top:1px dashed var(--borde);margin-top:8px">
           <label>Nombre</label>
           <input id="ep-nombre" value="${esc(p.nombre)}" autocomplete="off">
           <div class="fila" style="margin-top:8px">
-            <div class="crece"><label>Precio (en almuerzo)</label>
-              <input id="ep-precio" type="number" inputmode="numeric" value="${p.precio}"></div>
-            <div class="crece"><label>Tipo</label>
+            <div class="crece"><label>Clase</label>
               <select id="ep-tipo">
                 ${OPCIONES_TIPO.map(([v, n]) => `<option value="${v}" ${p.tipo === v ? 'selected' : ''}>${n}</option>`).join('')}
               </select></div>
+            <div class="crece"><label>Tipo (para compras)</label>${selectGrupos('ep-grupo', p.grupo || '')}</div>
           </div>
-          <label>Precio vendido SOLO (vacío = no se vende suelto)</label>
-          <input id="ep-solo" type="number" inputmode="numeric" value="${p.precio_solo || ''}"
-            placeholder="Ej: sopa sola 7500, bandeja sola 17000">
+          <label class="check-linea">
+            <input type="checkbox" id="ep-default" ${p.usa_default ? 'checked' : ''}>
+            <span>Usar el precio por defecto</span>
+          </label>
+          <div class="fila" style="margin-top:8px">
+            <div class="crece"><label>Precio (en almuerzo)</label>
+              <input id="ep-precio" type="number" inputmode="numeric" value="${p.precio}"></div>
+            <div class="crece"><label>Precio vendido SOLO</label>
+              <input id="ep-solo" type="number" inputmode="numeric" value="${p.precio_solo || ''}" placeholder="vacío = no se vende suelto"></div>
+          </div>
           <label>Acrónimo para la comanda (vacío = nombre completo)</label>
           <input id="ep-acronimo" value="${esc(p.acronimo || '')}" placeholder="Ej: CREMA" autocomplete="off">
           <div class="fila" style="margin-top:10px">
@@ -1423,18 +1628,113 @@ function renderMenu() {
             <button class="btn-mini ok" id="ep-guardar">💾 Guardar cambios</button>
           </div>
         </div>` : ''}
-      </div>`).join('');
+      </div>`).join('') +
+      (filtrados.length > visibles.length
+        ? `<div class="tarjeta suave">…y ${filtrados.length - visibles.length} más. Use el buscador para encontrarlos.</div>` : '');
     }).join('')}`;
+
+  // El tipo de compras y el precio por defecto solo aplican a proteínas
+  const sincronizarFormNuevo = () => {
+    nuevo.tipo = $('#np-tipo').value;
+    nuevo.grupo = $('#np-grupo') ? $('#np-grupo').value : '';
+    const lleva = LLEVA_GRUPO(nuevo.tipo);
+    const def = preciosDefault()[nuevo.tipo];
+    if (!lleva) $('#np-default').checked = false;
+    nuevo.usaDefault = $('#np-default').checked;
+    $('#np-grupo-caja').style.display = lleva ? '' : 'none';
+    $('#np-default-caja').style.display = lleva ? '' : 'none';
+    if (def) $('#np-default-txt').textContent = `${fmt(def.precio)} con entrada · ${fmt(def.solo)} solo`;
+    $('#np-precios').style.display = nuevo.usaDefault ? 'none' : '';
+  };
+  $('#np-tipo').onchange = sincronizarFormNuevo;
+  $('#np-default').onchange = sincronizarFormNuevo;
+  if ($('#np-grupo')) $('#np-grupo').onchange = sincronizarFormNuevo;
+  sincronizarFormNuevo();
+  if (zona) zona.scrollTop = scrollPrevio;
+  // Tras agregar un plato el menú se redibuja solo: hay que devolver el cursor
+  if (state.enfocarNuevoPlato) { state.enfocarNuevoPlato = false; $('#np-nombre').focus(); }
+
+  $('#buscar-menu').oninput = (e) => {
+    state.busquedaMenu = e.target.value;
+    clearTimeout(renderMenu._t);
+    renderMenu._t = setTimeout(() => {
+      const foco = document.activeElement === $('#buscar-menu');
+      renderMenu();
+      if (foco && $('#buscar-menu')) {
+        const inp = $('#buscar-menu');
+        inp.focus();
+        inp.setSelectionRange(inp.value.length, inp.value.length);
+      }
+    }, 180);
+  };
 
   $('#btn-nuevo-plato').onclick = async () => {
     try {
       await api('/platos', { method: 'POST', body: {
         nombre: $('#np-nombre').value, precio: $('#np-precio').value || 0, tipo: $('#np-tipo').value,
-        acronimo: $('#np-acronimo').value
+        precio_solo: $('#np-solo').value, acronimo: $('#np-acronimo').value,
+        grupo: $('#np-grupo') ? $('#np-grupo').value : '', usa_default: $('#np-default').checked
       }});
       toast('Plato agregado; visible en todos los teléfonos');
+      // El formulario queda listo para el siguiente (se cargan de a 150)
+      $('#np-nombre').value = ''; $('#np-acronimo').value = '';
+      state.enfocarNuevoPlato = true;
+      $('#np-nombre').focus();
     } catch (e) { toast(e.message, true); }
   };
+  // Enter agrega el plato: cargar el menú de la semana es escribir y dar Enter
+  for (const sel of ['#np-nombre', '#np-acronimo']) {
+    $(sel).onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#btn-nuevo-plato').click(); } };
+  }
+  $('#btn-precios-default').onclick = async () => {
+    try {
+      const r = await api('/precios-default', { method: 'PUT', body: {
+        precio_dia_entrada: $('#pd-dia-entrada').value || 0, precio_dia_solo: $('#pd-dia-solo').value || 0,
+        precio_especial_entrada: $('#pd-esp-entrada').value || 0, precio_especial_solo: $('#pd-esp-solo').value || 0
+      }});
+      state.config.precios_default = r.precios;
+      toast('Precios guardados: aplican a todos los platos con precio por defecto');
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#vista').querySelectorAll('[data-aplicar]').forEach(b => b.onclick = async () => {
+    const tipo = b.dataset.aplicar;
+    const def = preciosDefault()[tipo];
+    const afectados = state.platos.filter(p => p.tipo === tipo && !p.usa_default);
+    // Aviso explícito de los que HOY valen otra cosa (ej: la bandeja paisa):
+    // esos son los que cambiarían de precio sin querer
+    const distintos = afectados.filter(p => p.precio !== def.precio);
+    const aviso = distintos.length
+      ? `\n\n⚠️ OJO: ${distintos.length} tienen hoy otro precio y pasarían a ${fmt(def.precio)}:\n` +
+        distintos.slice(0, 8).map(p => `  · ${p.nombre} (${fmt(p.precio)})`).join('\n') +
+        (distintos.length > 8 ? `\n  · ...y ${distintos.length - 8} más` : '') +
+        '\n\nSi alguno debe conservar su precio, cancele y desmárquelo después con ✏️.'
+      : '';
+    if (!confirm(`¿Poner el precio por defecto (${fmt(def.precio)} con entrada / ${fmt(def.solo)} solo) a ${afectados.length} plato(s)?${aviso}`)) return;
+    try {
+      const r = await api('/platos/aplicar-default', { method: 'POST', body: { tipo } });
+      toast(`${r.cambiados} plato(s) quedaron con el precio por defecto`);
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#btn-grupo-agregar').onclick = async () => {
+    const v = $('#grupo-nuevo').value.trim();
+    if (!v) return;
+    try {
+      const r = await api('/grupos', { method: 'PUT', body: { grupos: [...gruposPlato(), v] } });
+      state.config.grupos_plato = r.grupos;
+      toast('Tipo agregado en todos los teléfonos');
+      renderMenu();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#vista').querySelectorAll('[data-grupo-borrar]').forEach(b => b.onclick = async () => {
+    const g = b.dataset.grupoBorrar;
+    const usados = state.platos.filter(p => p.grupo === g).length;
+    if (!confirm(`¿Quitar el tipo "${g}"?${usados ? `\n${usados} plato(s) lo tienen asignado y quedarán sin tipo en los reportes nuevos.` : ''}`)) return;
+    try {
+      const r = await api('/grupos', { method: 'PUT', body: { grupos: gruposPlato().filter(x => x !== g) } });
+      state.config.grupos_plato = r.grupos;
+      renderMenu();
+    } catch (e) { toast(e.message, true); }
+  });
   $('#btn-chip-agregar').onclick = async () => {
     const v = $('#chip-nuevo').value.trim();
     if (!v) return;
@@ -1459,11 +1759,17 @@ function renderMenu() {
     state.editandoPlatoId = state.editandoPlatoId === id ? null : id;
     renderMenu();
   });
+  // Asignar el tipo desde la misma lista: son ~150 proteínas por clasificar
+  $('#vista').querySelectorAll('[data-grupo-de]').forEach(sel => sel.onchange = async () => {
+    try { await api(`/platos/${sel.dataset.grupoDe}`, { method: 'PUT', body: { grupo: sel.value } }); }
+    catch (e) { toast(e.message, true); }
+  });
   if ($('#ep-guardar')) $('#ep-guardar').onclick = async () => {
     try {
       await api(`/platos/${state.editandoPlatoId}`, { method: 'PUT', body: {
         nombre: $('#ep-nombre').value, precio: $('#ep-precio').value || 0, tipo: $('#ep-tipo').value,
-        precio_solo: $('#ep-solo').value, acronimo: $('#ep-acronimo').value
+        precio_solo: $('#ep-solo').value, acronimo: $('#ep-acronimo').value,
+        grupo: $('#ep-grupo') ? $('#ep-grupo').value : '', usa_default: $('#ep-default').checked
       }});
       state.editandoPlatoId = null;
       toast('Plato actualizado en todos los teléfonos');
