@@ -99,3 +99,19 @@ CIERRE DE CAJA (efectivo contado y descuadre)
 | No llega el correo | Revise Spam; verifique las 16 letras y que la verificación en 2 pasos esté activa |
 | El reporte llegó "con retraso" | Es normal: no había internet a esa hora; el sistema lo envió al reconectarse |
 | Cambié de hoja de Sheets | Repita la Parte 1 con la hoja nueva y pegue la URL nueva en Admin |
+
+---
+
+## Si la prueba de Google Sheets falla
+
+El botón "📊 Probar Google Sheets" ahora dice exactamente qué pasó:
+
+| Mensaje | Qué hacer |
+|---|---|
+| "Google pidió iniciar sesión..." | El Apps Script quedó implementado con el acceso equivocado. Vuelva al editor → **Implementar → Administrar implementaciones → ✏️ → Quién tiene acceso: Cualquier persona** → Implementar, y pegue la **URL nueva** en el POS. |
+| "Internet no respondió en 15 segundos" | El PC no tiene salida a internet en este momento (¿el teléfono que comparte los datos tiene señal/datos?). Las ventas quedan en cola y suben solas después. |
+| "La URL no respondió como el Apps Script de la guía" | Se pegó un enlace equivocado (por ejemplo el de la hoja). El correcto es el que sale al Implementar y **termina en `/exec`**. |
+
+> El internet NO afecta la app local: los teléfonos siguen tomando pedidos y
+> la impresora sigue imprimiendo aunque no haya datos. Todo lo de internet
+> (Sheets y correo) espera en cola y sale solo cuando vuelva la señal.

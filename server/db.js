@@ -302,6 +302,22 @@ if (!db.prepare('PRAGMA table_info(platos)').all().some(c => c.name === 'usa_def
   console.log('[db] Migración aplicada: precio por defecto de proteínas y especiales');
 }
 
+// Migración: valor del turno POR DÍA DE LA SEMANA (de lunes a jueves vale una
+// cosa, el sábado otra y el domingo otra). JSON de 7 valores con el índice de
+// getDay() (0=domingo ... 6=sábado); un día en 0/vacío usa valor_turno de base.
+if (!db.prepare('PRAGMA table_info(usuarios)').all().some(c => c.name === 'turnos')) {
+  db.exec('ALTER TABLE usuarios ADD COLUMN turnos TEXT');
+  console.log('[db] Migración aplicada: valor del turno por día de la semana');
+}
+
+// Migración: usuarios eliminados. No se pueden borrar de verdad si tienen
+// ventas o nómina registradas (los reportes viejos los referencian), así que
+// se marcan eliminados: desaparecen de todas las listas y su PIN queda libre.
+if (!db.prepare('PRAGMA table_info(usuarios)').all().some(c => c.name === 'eliminado')) {
+  db.exec('ALTER TABLE usuarios ADD COLUMN eliminado INTEGER NOT NULL DEFAULT 0');
+  console.log('[db] Migración aplicada: eliminación de usuarios');
+}
+
 // ---- Helpers de fecha/hora local ----
 function ahora() {
   return new Date().toLocaleString('sv-SE'); // "YYYY-MM-DD HH:MM:SS" en hora local

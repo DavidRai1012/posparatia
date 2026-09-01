@@ -621,3 +621,94 @@ Característica: Precio por defecto del almuerzo
     Cuando el cajero deja sin marcar "precio por defecto" y escribe "$18.500"
     Entonces la bandeja debe conservar su precio aunque cambie el precio por defecto
 ```
+
+---
+
+```gherkin
+# language: es
+Característica: Sincronización con Google Sheets a prueba de hotspot
+  Como administrador
+  Quiero que los envíos a internet nunca dejen la app esperando ni pierdan ventas
+  Para confiar en la hoja aunque el internet del local sea el hotspot de un teléfono
+
+  Escenario: Internet mudo (datos agotados del teléfono)
+    Dado que el hotspot acepta conexiones pero no responde
+    Cuando el sistema intenta enviar ventas a Google Sheets
+    Entonces el intento debe cortarse a los 15 segundos con un mensaje claro
+    Y las ventas deben quedar en cola y reintentarse solas
+    Y la app local debe seguir atendiendo a los teléfonos con normalidad
+
+  Escenario: Apps Script mal implementado (falso éxito)
+    Dado que la URL del webhook responde la página de login de Google con estado 200
+    Cuando el sistema envía ventas
+    Entonces NO deben marcarse como enviadas
+    Y el error debe explicar que la implementación necesita acceso "Cualquier persona"
+
+  Escenario: Cierre de caja sin internet
+    Dado que el correo del reporte no puede salir
+    Cuando la cajera ejecuta el cierre de caja
+    Entonces el cierre debe completarse en segundos con el reporte "en cola"
+    Y el correo debe salir solo cuando vuelva el internet
+
+  Escenario: El QR de conexión se actualiza solo
+    Dado que el hotspot se reinició y le entregó otra dirección al PC
+    Cuando la pantalla de login del PC lleva abierta más de 20 segundos
+    Entonces el QR y la dirección mostrados deben ser los nuevos
+    Y el botón 📶 debe indicar si el PC tiene salida a internet
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Valor del turno por día de la semana
+  Como administradora
+  Quiero que el turno de cada empleado valga distinto según el día
+  Porque de lunes a jueves vale una cosa, el sábado otra y el domingo otra
+
+  Escenario: Configurar los turnos de un empleado
+    Dado que el admin abre 💰 en la tarjeta del empleado
+    Cuando escribe un valor para cada día de la semana y guarda
+    Entonces la nómina debe usar el valor del día que corresponda a la fecha del turno
+
+  Escenario: El cajero no puede alterar el valor
+    Dado que el empleado tiene sábado en "$45.000"
+    Cuando el cajero registra un pago de nómina con fecha de un sábado enviando otro valor
+    Entonces el sistema debe registrar "$45.000" ignorando el valor enviado
+
+  Escenario: Día sin valor propio
+    Dado que el empleado tiene valores solo para sábado y domingo
+    Cuando se registra un turno de un martes
+    Entonces debe usarse el valor base del empleado
+
+  Escenario: El formulario muestra el valor del día elegido
+    Dado que el cajero está registrando nómina
+    Cuando cambia la fecha del turno a un domingo
+    Entonces el campo del valor debe actualizarse al valor del domingo e indicar el día
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Eliminación de usuarios
+  Como administrador
+  Quiero poder eliminar usuarios además de desactivarlos
+  Para que los que ya no trabajan no aparezcan más y sus PIN queden libres
+
+  Escenario: Eliminar un usuario sin historia
+    Dado que el usuario nunca registró ventas, nómina ni gastos
+    Cuando el admin lo elimina
+    Entonces debe borrarse por completo del sistema
+
+  Escenario: Eliminar un usuario con ventas registradas
+    Dado que el usuario tiene ventas o nómina en la historia
+    Cuando el admin lo elimina
+    Entonces debe desaparecer de todas las listas y su PIN quedar libre
+    Y los reportes y Excel de días pasados deben conservar su nombre
+
+  Escenario: Protección del último administrador
+    Dado que solo existe un administrador activo
+    Cuando intenta eliminarse o desactivarse a sí mismo
+    Entonces el sistema debe impedirlo y pedir crear otro admin primero
+```

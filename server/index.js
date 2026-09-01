@@ -19,6 +19,27 @@ const io = new Server(server, { cors: { origin: '*' } });
 impresion.setIO(io);
 
 app.use(express.json());
+
+// El PC puede tener varias redes al tiempo (cable, hotspot del teléfono,
+// adaptadores virtuales) y adivinar cuál alcanza a los meseros falla: se
+// anunciaba la del cable y ningún teléfono del hotspot podía entrar.
+// Aquí se aprende de la realidad: cada vez que un dispositivo de la red habla
+// con el servidor, queda anotada la dirección del PC por la que lo alcanzó.
+let ipQueFunciona = getConfig('ip_lan_ok') || null;
+function esClienteDeLaRed(req) {
+  const remoto = (req.socket.remoteAddress || '').replace('::ffff:', '');
+  return !!remoto && !remoto.startsWith('127.') && remoto !== '::1';
+}
+app.use((req, _res, next) => {
+  const local = (req.socket.localAddress || '').replace('::ffff:', '');
+  if (local && local !== ipQueFunciona && esClienteDeLaRed(req)) {
+    ipQueFunciona = local;
+    setConfig('ip_lan_ok', local); // sobrevive reinicios del PC
+    console.log(`[red] Los teléfonos entran por ${local}: esa es la dirección que se anuncia`);
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // ---------- Sesiones y autenticación por PIN ----------
@@ -27,6 +48,15 @@ const intentosFallidos = new Map(); // ip -> { n, bloqueadoHasta }
 const NIVEL = { cocinera: 0, mesero: 1, cajero: 2, admin: 3 };
 
 function usuarioDeToken(token) { return token ? sesiones.get(token) : null; }
+
+// Cerrar por la fuerza las sesiones abiertas de un usuario. Sin esto, el
+// teléfono de un empleado eliminado o desactivado seguía tomando pedidos y
+// viendo las ventas del día: el token queda guardado en el teléfono y la sesión
+// vive en memoria hasta reiniciar el PC.
+function cerrarSesionesDe(usuarioId) {
+  for (const [token, s] of sesiones) if (s.usuarioId === usuarioId) sesiones.delete(token);
+  try { io.in(`usuario:${usuarioId}`).disconnectSockets(true); } catch { /* sin sockets abiertos */ }
+}
 
 function requiere(nivelMinimo) {
   return (req, res, next) => {
@@ -804,12 +834,26 @@ app.post('/api/sheets/prueba', requiere(3), async (req, res) => {
 app.get('/api/sync/estado', requiere(3), (_req, res) => res.json(reportes.estadoSync()));
 
 // Dirección actual del servidor en la red (público: quien pregunta ya está en la LAN).
-// Útil cuando la IP cambia, p. ej. al usar el hotspot de un teléfono.
-app.get('/api/red', (_req, res) => {
-  res.json({
-    url: urlLan(),
-    candidatas: candidatasLan().filter(c => c.prioridad < 10).map(c => ({ url: `http://${c.ip}:${PORT}`, red: c.nombre }))
-  });
+// Útil cuando la IP cambia, p. ej. al usar el hotspot de un teléfono: el QR de
+// la pantalla de login se refresca solo con esta respuesta.
+app.get('/api/red', async (req, res) => {
+  // Si quien pregunta es un teléfono de la red, la respuesta exacta es la
+  // dirección por la que ÉL llegó: esa con seguridad funciona
+  const local = (req.socket.localAddress || '').replace('::ffff:', '');
+  const datos = {
+    url: esClienteDeLaRed(req) && local ? `http://${local}:${PORT}` : urlLan(),
+    candidatas: candidatasLan().filter(c => c.prioridad < 10).map(c => ({ url: `http://${c.ip}:${PORT}`, red: c.nombre })),
+    aprendida: ipQueFunciona || null
+  };
+  // Diagnóstico opcional: separa "no hay internet" (Sheets y correo esperan,
+  // pero la app local funciona) de "los teléfonos no alcanzan al PC" (WiFi)
+  if (req.query.diagnostico) {
+    datos.internet = await reportes.hayInternet();
+    const sync = reportes.estadoSync();
+    datos.sheets_pendientes = sync.sheets_pendientes;
+    datos.correos_pendientes = sync.correos_pendientes;
+  }
+  res.json(datos);
 });
 
 app.post('/api/reportes/enviar-ahora', requiere(3), (req, res) => {
@@ -819,8 +863,31 @@ app.post('/api/reportes/enviar-ahora', requiere(3), (req, res) => {
 });
 
 // ---------- Usuarios (solo admin) ----------
+// El turno vale distinto según el día (lunes-jueves, sábado, domingo...):
+// `turnos` es un arreglo de 7 valores con el índice de getDay() (0=domingo).
+// Un día en 0 o vacío usa el valor base (valor_turno).
+function turnosDe(u) {
+  try {
+    const arr = JSON.parse(u.turnos || 'null');
+    if (Array.isArray(arr) && arr.length === 7) return arr.map(v => Math.max(0, Math.round(Number(v) || 0)));
+  } catch { }
+  return null;
+}
+
+function valorTurnoPara(u, jornada) {
+  const arr = turnosDe(u);
+  if (arr) {
+    // Mediodía local: 'YYYY-MM-DD' a secas se interpretaría como UTC y en
+    // Colombia (UTC-5) el día se correría al anterior
+    const dia = new Date(jornada + 'T12:00:00').getDay();
+    if (arr[dia] > 0) return arr[dia];
+  }
+  return u.valor_turno;
+}
+
 app.get('/api/usuarios', requiere(3), (_req, res) => {
-  res.json(db.prepare('SELECT id, nombre, rol, valor_turno, activo FROM usuarios ORDER BY nombre').all());
+  res.json(db.prepare('SELECT id, nombre, rol, valor_turno, turnos, activo FROM usuarios WHERE eliminado = 0 ORDER BY nombre').all()
+    .map(u => ({ ...u, turnos: turnosDe(u) })));
 });
 
 app.post('/api/usuarios', requiere(3), (req, res) => {
@@ -840,12 +907,22 @@ app.post('/api/usuarios', requiere(3), (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
+// ¿Este usuario es el único admin activo? Desactivarlo o eliminarlo dejaría
+// el sistema sin nadie que pueda administrar.
+function esUltimoAdmin(u) {
+  return u.rol === 'admin' && u.activo &&
+    !db.prepare("SELECT id FROM usuarios WHERE rol = 'admin' AND activo = 1 AND eliminado = 0 AND id != ?").get(u.id);
+}
+
 app.put('/api/usuarios/:id', requiere(3), (req, res) => {
-  const u = db.prepare('SELECT * FROM usuarios WHERE id = ?').get(req.params.id);
+  const u = db.prepare('SELECT * FROM usuarios WHERE id = ? AND eliminado = 0').get(req.params.id);
   if (!u) return res.status(404).json({ error: 'Usuario no encontrado' });
   const nombre = req.body.nombre !== undefined ? String(req.body.nombre).trim() : u.nombre;
   const rol = req.body.rol !== undefined ? req.body.rol : u.rol;
   const activo = req.body.activo !== undefined ? (req.body.activo ? 1 : 0) : u.activo;
+  if ((!activo || rol !== 'admin') && esUltimoAdmin(u)) {
+    return res.status(409).json({ error: 'Es el único administrador activo: cree o reactive otro admin primero' });
+  }
   let pin = u.pin;
   if (req.body.pin) {
     if (!/^\d{4}$/.test(String(req.body.pin))) return res.status(400).json({ error: 'El PIN debe ser de 4 dígitos' });
@@ -855,9 +932,47 @@ app.put('/api/usuarios/:id', requiere(3), (req, res) => {
   }
   // El valor del turno solo lo cambia el admin (este endpoint ya exige admin)
   const valorTurno = req.body.valor_turno !== undefined ? Math.max(0, Math.round(Number(req.body.valor_turno) || 0)) : u.valor_turno;
+  let turnos = u.turnos;
+  if (req.body.turnos !== undefined) {
+    if (req.body.turnos === null) turnos = null;
+    else {
+      const arr = Array.isArray(req.body.turnos) ? req.body.turnos.map(v => Math.max(0, Math.round(Number(v) || 0))) : null;
+      if (!arr || arr.length !== 7) return res.status(400).json({ error: 'Los turnos por día deben ser 7 valores (domingo a sábado)' });
+      turnos = arr.some(v => v > 0) ? JSON.stringify(arr) : null; // todo en 0 = sin valores por día
+    }
+  }
   // Desactivar no borra: sus ventas históricas quedan intactas
-  db.prepare('UPDATE usuarios SET nombre = ?, rol = ?, activo = ?, pin = ?, valor_turno = ? WHERE id = ?').run(nombre, rol, activo, pin, valorTurno, u.id);
+  db.prepare('UPDATE usuarios SET nombre = ?, rol = ?, activo = ?, pin = ?, valor_turno = ?, turnos = ? WHERE id = ?')
+    .run(nombre, rol, activo, pin, valorTurno, turnos, u.id);
+  // Si se desactivó, le cambiaron el PIN o el rol, la sesión que tenga abierta
+  // en su teléfono deja de valer en el acto
+  if (!activo || pin !== u.pin || rol !== u.rol) cerrarSesionesDe(u.id);
   res.json({ ok: true });
+});
+
+// Eliminar un usuario. Si nunca registró nada, se borra de verdad; si tiene
+// ventas/nómina/gastos en la historia, se archiva (desaparece de todas las
+// listas y su PIN queda libre) para no dañar los reportes viejos.
+app.delete('/api/usuarios/:id', requiere(3), (req, res) => {
+  const u = db.prepare('SELECT * FROM usuarios WHERE id = ? AND eliminado = 0').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Usuario no encontrado' });
+  if (u.id === req.usuario.usuarioId) return res.status(409).json({ error: 'No puede eliminar su propio usuario' });
+  if (esUltimoAdmin(u)) return res.status(409).json({ error: 'Es el único administrador activo: cree otro admin primero' });
+  const referencias =
+    db.prepare('SELECT COUNT(*) AS n FROM pedidos WHERE vendedor_id = ?').get(u.id).n +
+    db.prepare('SELECT COUNT(*) AS n FROM pagos WHERE cajero_id = ?').get(u.id).n +
+    db.prepare('SELECT COUNT(*) AS n FROM gastos WHERE usuario_id = ?').get(u.id).n +
+    db.prepare('SELECT COUNT(*) AS n FROM nomina WHERE empleado_id = ? OR registrado_por = ?').get(u.id, u.id).n +
+    db.prepare('SELECT COUNT(*) AS n FROM historial WHERE usuario_id = ?').get(u.id).n;
+  cerrarSesionesDe(u.id); // su teléfono deja de funcionar de inmediato
+  if (referencias === 0) {
+    db.prepare('DELETE FROM usuarios WHERE id = ?').run(u.id);
+    return res.json({ ok: true, borrado: true });
+  }
+  // El PIN se libera cambiándolo por una marca imposible de teclear (los PIN
+  // reales son 4 dígitos), así otro empleado puede recibir ese número
+  db.prepare("UPDATE usuarios SET eliminado = 1, activo = 0, pin = 'X' || id WHERE id = ?").run(u.id);
+  res.json({ ok: true, borrado: false, archivado: true });
 });
 
 // ---------- Configuración (solo admin) ----------
@@ -875,7 +990,10 @@ app.put('/api/config', requiere(3), (req, res) => {
   for (const [clave, valor] of Object.entries(req.body || {})) {
     if (!permitidas.includes(clave)) continue;
     if (clave === 'gmail_app_password' && valor === '(guardada)') continue;
-    setConfig(clave, valor);
+    // Las URL y credenciales llegan de copiar y pegar: fuera espacios y saltos
+    const limpio = ['sheets_webhook_url', 'gmail_usuario', 'gmail_app_password', 'correo_dueno'].includes(clave)
+      ? String(valor).trim() : valor;
+    setConfig(clave, limpio);
   }
   impresion.procesarCola(); // por si el cambio de modo destraba trabajos pendientes
   impresion.notificarEstado();
@@ -966,11 +1084,12 @@ app.post('/api/nomina', requiere(2), (req, res) => {
   const empleado = db.prepare('SELECT * FROM usuarios WHERE id = ? AND activo = 1').get(req.body.empleado_id);
   if (!empleado) return res.status(404).json({ error: 'Empleado no encontrado' });
   const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.jornada || '')) ? req.body.jornada : jornadaHoy();
-  // El valor del turno es FIJO para el cajero (el que configuró el admin);
-  // solo el admin puede pagar un turno con un valor distinto
+  // El valor del turno es FIJO para el cajero (el que configuró el admin,
+  // según el día de la semana de la fecha del turno); solo el admin puede
+  // pagar un turno con un valor distinto
   const turno = (req.usuario.rol === 'admin' && String(req.body.valor_turno ?? '').trim() !== '')
     ? Math.max(0, Math.round(Number(req.body.valor_turno) || 0))
-    : empleado.valor_turno;
+    : valorTurnoPara(empleado, jornada);
   const descuento = Math.max(0, Math.round(Number(req.body.descuento) || 0));
   const bono = Math.max(0, Math.round(Number(req.body.bono) || 0));
   const concepto = String(req.body.concepto || '').trim().slice(0, 80) || null;
@@ -1018,9 +1137,10 @@ app.get('/api/nomina/resumen', requiere(2), (_req, res) => {
   const hoy = jornadaHoy();
   const sumaDesde = db.prepare(
     "SELECT COALESCE(SUM(total), 0) AS t FROM nomina WHERE empleado_id = ? AND estado = 'confirmado' AND jornada >= ? AND jornada <= ?");
-  const empleados = db.prepare('SELECT id, nombre, rol, valor_turno FROM usuarios WHERE activo = 1 ORDER BY nombre').all()
+  const empleados = db.prepare('SELECT id, nombre, rol, valor_turno, turnos FROM usuarios WHERE activo = 1 AND eliminado = 0 ORDER BY nombre').all()
     .map(u => ({
       ...u,
+      turnos: turnosDe(u), // para que el formulario muestre el valor del día elegido
       dia: sumaDesde.get(u.id, hoy, hoy).t,
       semana: sumaDesde.get(u.id, inicioSemana(), hoy).t,
       quincena: sumaDesde.get(u.id, inicioQuincena(), hoy).t,
@@ -1076,11 +1196,15 @@ app.get('/api/historial/:pedidoId', requiere(1), (req, res) => {
 io.on('connection', (socket) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
   const u = usuarioDeToken(token);
-  if (u) socket.join(`usuario:${u.usuarioId}`);
-  socket.on('impresora:registrar', () => {
-    if (!u) return socket.emit('error:auth', 'Inicie sesión antes de registrar la estación de impresión');
-    impresion.registrarPuente(socket);
-  });
+  // Sin sesión válida no se entra: por este canal viajan en vivo TODAS las
+  // comandas del día (platos, totales y nombre del cliente), así que un
+  // dispositivo cualquiera del WiFi no puede quedarse escuchando.
+  if (!u) {
+    socket.emit('error:auth', 'Inicie sesión de nuevo');
+    return socket.disconnect(true);
+  }
+  socket.join(`usuario:${u.usuarioId}`);
+  socket.on('impresora:registrar', () => impresion.registrarPuente(socket));
 });
 
 // ---------- Arranque ----------
@@ -1103,6 +1227,14 @@ function candidatasLan() {
       if (ip.startsWith('169.254.')) prioridad = 20;
       if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip)) prioridad = 30;
       if (/tailscale|vmware|virtualbox|vethernet|bluetooth|loopback/i.test(nombre)) prioridad += 10;
+      // Rangos típicos del hotspot de un teléfono: si el PC está colgado de uno,
+      // ahí es donde están los meseros
+      if (/^192\.168\.43\.|^172\.20\.10\.|^192\.168\.137\./.test(ip)) prioridad -= 2;
+      // LA REGLA QUE MANDA: si un teléfono YA se conectó por esta dirección,
+      // es la buena. Adivinar por el rango falla cuando el PC tiene varias redes
+      // al tiempo (cable + hotspot): se anunciaba la del cable, donde no hay
+      // ningún mesero, y nadie podía conectarse.
+      if (ip === ipQueFunciona) prioridad = -100;
       candidatas.push({ ip, nombre, prioridad });
     }
   }

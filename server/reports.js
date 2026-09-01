@@ -2,6 +2,21 @@
 // sincronización con Google Sheets (vía webhook de Google Apps Script).
 const { db, ahora, jornadaHoy, getConfig } = require('./db');
 
+// Toda salida a internet lleva tope de tiempo. El restaurante navega por el
+// hotspot de un teléfono: cuando los datos se acaban o la señal se cae, la
+// conexión muchas veces NO falla, se queda muda — y sin tope, un fetch espera
+// hasta 5 minutos (y el cierre de caja, hasta 2 minutos por el correo).
+const TIMEOUT_INTERNET_MS = 15000;
+function fetchConTimeout(url, opciones = {}) {
+  return fetch(url, { ...opciones, signal: AbortSignal.timeout(TIMEOUT_INTERNET_MS) });
+}
+function errorDeRed(err) {
+  if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+    return 'Internet no respondió en 15 segundos (¿el teléfono que comparte los datos tiene señal?)';
+  }
+  return (err && (err.cause && err.cause.message || err.message)) || String(err);
+}
+
 // ---- Qué se vendió, plato por plato y tipo por tipo ----
 // Responde las dos preguntas del dueño: "¿cuántos pollo a la jardinera salieron?"
 // y "¿cuántos almuerzos de pollo en total?" (para saber qué comprar más).
@@ -213,7 +228,12 @@ async function drenarCorreos() {
     return { ok: false, enviados: 0, pendientes: pendientes.length, error: 'Faltan datos de Gmail o el correo del dueño en la configuración' };
   }
   const nodemailer = require('nodemailer');
-  const transporte = nodemailer.createTransport({ service: 'gmail', auth: { user: usuario, pass: password } });
+  // Con topes de tiempo: sin ellos, un cierre de caja sin internet se queda
+  // esperando el correo hasta 2 minutos con la cajera mirando la pantalla
+  const transporte = nodemailer.createTransport({
+    service: 'gmail', auth: { user: usuario, pass: password },
+    connectionTimeout: TIMEOUT_INTERNET_MS, greetingTimeout: TIMEOUT_INTERNET_MS, socketTimeout: 30000
+  });
   let enviados = 0;
   for (const correo of pendientes) {
     try {
@@ -227,7 +247,7 @@ async function drenarCorreos() {
       console.log(`[reportes] Correo enviado: ${correo.asunto}`);
     } catch (err) {
       console.error('[reportes] Fallo al enviar correo (se reintentará):', err.message);
-      return { ok: false, enviados, pendientes: pendientes.length - enviados, error: err.message };
+      return { ok: false, enviados, pendientes: pendientes.length - enviados, error: errorDeRed(err) };
     }
   }
   return { ok: true, enviados, pendientes: 0 };
@@ -253,26 +273,50 @@ function encolarVentaSheets(pedido, items, pago, vendedor) {
 }
 
 async function drenarSheets() {
-  const url = getConfig('sheets_webhook_url');
+  const url = String(getConfig('sheets_webhook_url') || '').trim();
   const pendientes = db.prepare("SELECT * FROM cola_sheets WHERE estado = 'pendiente' ORDER BY id LIMIT 100").all();
   if (!pendientes.length) return { ok: true, enviados: 0, pendientes: 0 };
   if (!url) return { ok: false, enviados: 0, pendientes: pendientes.length, error: 'No hay URL del webhook de Google Sheets configurada' };
   try {
-    const res = await fetch(url, {
+    const res = await fetchConTimeout(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filas: pendientes.map(p => JSON.parse(p.payload)) })
     });
+    const cuerpo = (await res.text()).trim();
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // El Apps Script de la guía responde el texto 'ok'. Un Apps Script mal
+    // implementado (acceso distinto de "Cualquier persona") responde la página
+    // de login de Google CON ESTADO 200: sin esta verificación, las ventas se
+    // marcaban como enviadas sin llegar jamás a la hoja.
+    let esJsonOk = false;
+    try { const j = JSON.parse(cuerpo); esJsonOk = !!(j && (j.ok || j.result === 'ok' || j.status === 'ok')); } catch { }
+    if (cuerpo.toLowerCase() !== 'ok' && !esJsonOk) {
+      if (/<html|<!doctype/i.test(cuerpo)) {
+        throw new Error('Google pidió iniciar sesión: la implementación del Apps Script debe tener acceso "Cualquier persona" (paso 5 de la guía). Vuelva a Implementar y pegue la URL nueva.');
+      }
+      throw new Error(`La URL no respondió como el Apps Script de la guía (¿pegó el enlace que termina en /exec?). Respondió: "${cuerpo.slice(0, 80)}"`);
+    }
     const marcar = db.prepare("UPDATE cola_sheets SET estado = 'enviado', enviado_en = ? WHERE id = ?");
     const tx = db.transaction(() => { for (const p of pendientes) marcar.run(ahora(), p.id); });
     tx();
     console.log(`[sheets] ${pendientes.length} venta(s) sincronizada(s)`);
     return { ok: true, enviados: pendientes.length, pendientes: 0 };
   } catch (err) {
-    console.error('[sheets] Sin conexión o error del webhook (quedan en búfer):', err.message);
-    return { ok: false, enviados: 0, pendientes: pendientes.length, error: err.message };
+    const detalle = errorDeRed(err);
+    console.error('[sheets] Sin conexión o error del webhook (quedan en búfer):', detalle);
+    return { ok: false, enviados: 0, pendientes: pendientes.length, error: detalle };
   }
+}
+
+// ¿El PC tiene salida a internet en este momento? Para el diagnóstico del
+// botón 📶: separa "no hay internet" (Sheets/correo esperan, la app local
+// sigue normal) de "los teléfonos no alcanzan al PC" (problema del WiFi).
+async function hayInternet() {
+  try {
+    const res = await fetch('https://www.gstatic.com/generate_204', { signal: AbortSignal.timeout(4000) });
+    return res.status === 204 || res.ok;
+  } catch { return false; }
 }
 
 // Estado de las colas de sincronización, para mostrarlo en Admin
@@ -287,8 +331,11 @@ function estadoSync() {
 
 // ---- Planificador: reporte automático a la hora configurada + drenaje de colas ----
 let ultimaJornadaReportada = null;
+let drenando = false; // un ciclo a la vez: si internet está lento, no acumular intentos
 function iniciarPlanificador() {
   setInterval(async () => {
+    if (drenando) return;
+    drenando = true;
     try {
       const jornada = jornadaHoy();
       const horaConfig = getConfig('hora_reporte'); // se lee en cada ciclo: cambia sin reiniciar
@@ -304,8 +351,10 @@ function iniciarPlanificador() {
       await drenarSheets();
     } catch (err) {
       console.error('[planificador]', err.message);
+    } finally {
+      drenando = false;
     }
   }, 30000);
 }
 
-module.exports = { resumenJornada, ventasPorPlato, ejecutarCierre, encolarReporteDiario, encolarVentaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync };
+module.exports = { resumenJornada, ventasPorPlato, ejecutarCierre, encolarReporteDiario, encolarVentaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync, hayInternet };

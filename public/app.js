@@ -18,6 +18,22 @@ const METODOS_COBRO = [
 // Cambios rápidos por plato: se cargan del servidor y los editan meseros/cajeros en Menú
 function chipsNotas() { return (state.config && state.config.chips_notas) || []; }
 
+// Turno por día de la semana: índice de getDay() (0=domingo ... 6=sábado)
+const DIAS_TURNO = [[1, 'Lunes'], [2, 'Martes'], [3, 'Miércoles'], [4, 'Jueves'], [5, 'Viernes'], [6, 'Sábado'], [0, 'Domingo']];
+// El mismo cálculo que hace el servidor (el servidor manda de todas formas).
+// Con la fecha vacía el servidor usa la de hoy: aquí igual, para que el total
+// que se muestra en pantalla nunca difiera del que se registra.
+function fechaTurnoValida(fecha) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(fecha || '') ? fecha : new Date().toLocaleDateString('sv-SE');
+}
+function valorTurnoCliente(emp, fecha) {
+  if (emp.turnos) {
+    const dia = new Date(fechaTurnoValida(fecha) + 'T12:00:00').getDay();
+    if (emp.turnos[dia] > 0) return emp.turnos[dia];
+  }
+  return emp.valor_turno || 0;
+}
+
 // Recargo por pago con tarjeta (el servidor recalcula; esto es solo para mostrar)
 function recargoTarjetaCliente(monto) {
   const c = state.config || {};
@@ -117,15 +133,59 @@ async function mostrarRed() {
       <div class="red-url">${esc(red.url)}</div>
       ${red.candidatas.length > 1 ? `<div class="suave" style="margin-top:8px">Si no abre, pruebe:<br>
         ${red.candidatas.slice(1).map(c => `${esc(c.url)} <em>(${esc(c.red)})</em>`).join('<br>')}</div>` : ''}
+      <div class="suave" id="red-diagnostico" style="margin-top:10px;text-align:left">🔎 Revisando internet...</div>
+      <div class="suave" style="margin-top:8px;text-align:left">💡 Si el hotspot se apagó y se prendió, la dirección pudo
+        cambiar: vuelvan a escanear este QR (se actualiza solo). La app local funciona aunque no haya internet.</div>
       <button class="btn gris" id="btn-cerrar-red" style="margin-top:14px">Cerrar</button>
     </div>`;
   document.body.appendChild(div);
   dibujarQR($('#red-qr'), red.url);
   $('#btn-cerrar-red').onclick = () => div.remove();
   div.onclick = (e) => { if (e.target === div) div.remove(); };
+  // Diagnóstico aparte (tarda unos segundos si no hay internet)
+  fetch('/api/red?diagnostico=1').then(r => r.json()).then(d => {
+    const el = $('#red-diagnostico');
+    if (!el) return;
+    const colas = (d.sheets_pendientes || 0) + (d.correos_pendientes || 0);
+    el.innerHTML = d.internet
+      ? '🌐 Internet del PC: <b style="color:var(--ok)">funcionando</b>' +
+        (colas ? ` · ${colas} envío(s) pendiente(s) saliendo` : '')
+      : '🌐 Internet del PC: <b style="color:var(--peligro)">sin salida</b> — Google Sheets y el correo quedan en cola' +
+        (colas ? ` (${colas} pendiente(s))` : '') + ' y se envían solos cuando vuelva. Las ventas NO se pierden.';
+  }).catch(() => {});
 }
 
 const ES_PC_SERVIDOR = ['localhost', '127.0.0.1'].includes(location.hostname);
+
+// El QR de la pantalla de login se refresca solo: cuando el hotspot se apaga y
+// se prende, el teléfono le entrega OTRA dirección al PC y un QR viejo deja a
+// todos los meseros "sin poder conectar" aunque el POS esté funcionando.
+let qrLoginTimer = null;
+function pintarQRLogin() {
+  fetch('/api/red').then(r => r.json()).then(red => {
+    const cont = $('#login-redes');
+    if (!cont) return; // la vista pudo cambiar
+    // El PC puede estar en varias redes (cable + hotspot): se muestran TODAS,
+    // porque si se muestra una sola y es la equivocada, nadie puede conectarse.
+    const otras = (red.candidatas || []).filter(c => c.url !== red.url);
+    const firma = red.url + '|' + otras.map(c => c.url).join(',');
+    if (cont.dataset.firma === firma) return; // sin cambios: no redibujar
+    cont.dataset.firma = firma;
+    cont.innerHTML = `
+      <div class="suave">📶 Conectar teléfonos — escanee:</div>
+      <div class="red-qr" id="login-qr"></div>
+      <div class="red-url">${esc(red.url)}</div>
+      ${otras.length ? `<div class="suave" style="margin-top:10px">Si ese no abre, este PC también está en otra red:</div>
+        <div class="login-otras">${otras.map((c, i) => `
+          <div class="login-otra">
+            <div class="red-qr chico" id="login-qr-${i}"></div>
+            <div class="red-url chico">${esc(c.url)}</div>
+            <div class="suave">${esc(c.red)}</div>
+          </div>`).join('')}</div>` : ''}`;
+    dibujarQR($('#login-qr'), red.url);
+    otras.forEach((c, i) => { const el = $('#login-qr-' + i); if (el) dibujarQR(el, c.url); });
+  }).catch(() => {});
+}
 
 // ---------------- Login ----------------
 function renderLogin(mensajeError) {
@@ -143,20 +203,15 @@ function renderLogin(mensajeError) {
         <button data-accion="limpiar">C</button>
       </div>
       <div class="error-login">${esc(mensajeError || '')}</div>
-      ${ES_PC_SERVIDOR ? `
-      <div class="tarjeta" style="text-align:center">
-        <div class="suave">📶 Conectar teléfonos — escanee:</div>
-        <div class="red-qr" id="login-qr"></div>
-        <div class="red-url" id="login-url"></div>
-      </div>` : ''}
+      ${ES_PC_SERVIDOR ? '<div class="tarjeta" style="text-align:center" id="login-redes"></div>' : ''}
     </div>`;
   if (ES_PC_SERVIDOR) {
-    fetch('/api/red').then(r => r.json()).then(red => {
-      const qrEl = $('#login-qr'), urlEl = $('#login-url');
-      if (!qrEl || !urlEl) return; // la vista pudo cambiar
-      dibujarQR(qrEl, red.url);
-      urlEl.textContent = red.url;
-    }).catch(() => {});
+    pintarQRLogin();
+    clearInterval(qrLoginTimer); // renderLogin corre en cada dígito del PIN: un solo timer
+    qrLoginTimer = setInterval(() => {
+      if (!$('#login-redes')) { clearInterval(qrLoginTimer); return; } // ya no es la vista de login
+      pintarQRLogin();
+    }, 20000);
   }
   $('#pin-teclado').onclick = async (e) => {
     const b = e.target.closest('button');
@@ -288,6 +343,9 @@ function conectarSocket() {
 
 function refrescarVistaEnVivo(soloVistas) {
   if (soloVistas && !soloVistas.includes(state.vista)) return;
+  // Con el editor de turnos abierto, cada comanda que entra disparaba un
+  // redibujado de Admin que borraba lo que el administrador venía escribiendo
+  if (state.vista === 'admin' && state.turnosAbiertoId) return;
   if (['historial', 'caja', 'menu', 'impresora', 'admin', 'tomar'].includes(state.vista)) renderVista();
 }
 
@@ -1352,11 +1410,12 @@ async function cargarNomina() {
     cont.innerHTML = `
       <label>Empleado</label>
       <select id="no-emp">${r.empleados.map(e =>
-        `<option value="${e.id}" data-turno="${e.valor_turno}">${esc(e.nombre)} (turno ${fmt(e.valor_turno)})</option>`).join('')}</select>
+        `<option value="${e.id}">${esc(e.nombre)}${e.turnos ? '' : ` (turno ${fmt(e.valor_turno)})`}</option>`).join('')}</select>
       <div class="fila" style="margin-top:8px">
         <div class="crece"><label>Fecha del turno</label><input id="no-fecha" type="date" value="${hoy}"></div>
-        <div class="crece"><label>Valor del turno${state.usuario.rol === 'admin' ? '' : ' (fijo)'}</label><input id="no-turno" type="text" inputmode="numeric" pattern="[0-9]*"
-          value="${r.empleados.length ? r.empleados[0].valor_turno : 0}" ${state.usuario.rol === 'admin' ? '' : 'readonly style="opacity:.65"'}></div>
+        <div class="crece"><label>Valor del turno <span id="no-turno-dia" class="suave"></span>${state.usuario.rol === 'admin' ? '' : ' (fijo)'}</label>
+          <input id="no-turno" type="text" inputmode="numeric" pattern="[0-9]*"
+          value="${r.empleados.length ? valorTurnoCliente(r.empleados[0], hoy) : 0}" ${state.usuario.rol === 'admin' ? '' : 'readonly style="opacity:.65"'}></div>
       </div>
       <div class="fila" style="margin-top:8px">
         <div class="crece"><label>Descuento</label><input id="no-desc" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
@@ -1391,12 +1450,29 @@ async function cargarNomina() {
       const t = (Number($('#no-turno').value) || 0) - (Number($('#no-desc').value) || 0) + (Number($('#no-bono').value) || 0);
       $('#no-total').textContent = fmt(t);
     };
-    $('#no-emp').onchange = () => {
-      $('#no-turno').value = $('#no-emp').selectedOptions[0].dataset.turno;
+    // El turno depende del empleado Y del día de la semana de la fecha elegida
+    const NOMBRES_DIA = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+    let turnoAutomatico = null; // último valor puesto por el sistema
+    const actualizarTurnoDelDia = (forzar) => {
+      const emp = r.empleados.find(e => e.id === Number($('#no-emp').value));
+      const fecha = $('#no-fecha').value;
+      if (!emp) return;
+      const campo = $('#no-turno');
+      // El admin puede escribir un valor propio: cambiar la fecha no se lo borra
+      const escritoAMano = turnoAutomatico !== null && campo.value !== String(turnoAutomatico);
+      if (forzar || !escritoAMano) {
+        turnoAutomatico = valorTurnoCliente(emp, fecha);
+        campo.value = turnoAutomatico;
+      }
+      const el = $('#no-turno-dia');
+      if (el) el.textContent = emp.turnos ? `(${NOMBRES_DIA[new Date(fechaTurnoValida(fecha) + 'T12:00:00').getDay()]})` : '';
       actualizarTotalNomina();
     };
+    // Cambiar de empleado empieza de cero; cambiar la fecha respeta lo escrito
+    $('#no-emp').onchange = () => actualizarTurnoDelDia(true);
+    $('#no-fecha').onchange = () => actualizarTurnoDelDia(false);
     ['#no-turno', '#no-desc', '#no-bono'].forEach(s => { $(s).oninput = actualizarTotalNomina; });
-    actualizarTotalNomina();
+    actualizarTurnoDelDia(true);
 
     $('#btn-nomina-registrar').onclick = async () => {
       try {
@@ -1978,11 +2054,23 @@ function imprimirPorRawBT(trabajo) {
 }
 
 // ---------------- Vista: admin ----------------
-async function renderAdmin() {
-  $('#vista').innerHTML = '<h2>Administración</h2><div class="tarjeta suave">Cargando...</div>';
+// usarCache: para abrir/cerrar el editor de turnos sin volver a pedir los datos
+// al servidor (así no se pierde lo que esté escrito en el formulario de arriba
+// ni se queda la vista en "Cargando..." si falla una de las tres consultas)
+async function renderAdmin(usarCache) {
   let cfg, usuarios, sync;
-  try { [cfg, usuarios, sync] = await Promise.all([api('/config'), api('/usuarios'), api('/sync/estado')]); }
-  catch (e) { return toast(e.message, true); }
+  const escritos = {};
+  if (usarCache && state.adminCache) {
+    ({ cfg, usuarios, sync } = state.adminCache);
+    // Conservar lo que el admin tenga escrito y sin guardar en la configuración
+    $('#vista').querySelectorAll('input[id^="cf-"], textarea[id^="cf-"], select[id^="cf-"]')
+      .forEach(el => { escritos[el.id] = el.value; });
+  } else {
+    $('#vista').innerHTML = '<h2>Administración</h2><div class="tarjeta suave">Cargando...</div>';
+    try { [cfg, usuarios, sync] = await Promise.all([api('/config'), api('/usuarios'), api('/sync/estado')]); }
+    catch (e) { return toast(e.message, true); }
+    state.adminCache = { cfg, usuarios, sync };
+  }
   if (state.vista !== 'admin') return;
 
   $('#vista').innerHTML = `
@@ -2078,14 +2166,32 @@ async function renderAdmin() {
         <div class="fila">
           <div class="crece">
             <b>${esc(u.nombre)}</b> <span class="chip">${esc(u.rol)}</span>
-            <span class="chip">turno ${fmt(u.valor_turno || 0)}</span>
+            <span class="chip">${u.turnos ? '💰 turno por día' : `turno ${fmt(u.valor_turno || 0)}`}</span>
             ${u.activo ? '' : '<span class="chip porcobrar">INACTIVO</span>'}
           </div>
-          <button class="btn-mini" data-uturno="${u.id}">💰</button>
+          <button class="btn-mini ${state.turnosAbiertoId === u.id ? 'primario' : ''}" data-uturno="${u.id}">💰</button>
           <button class="btn-mini" data-upin="${u.id}">🔑 PIN</button>
           <button class="btn-mini ${u.activo ? 'peligro' : 'ok'}" data-uactivo="${u.id}" data-estado="${u.activo}">
             ${u.activo ? 'Desactivar' : 'Reactivar'}</button>
+          <button class="btn-mini peligro" data-uborrar="${u.id}">🗑</button>
         </div>
+        ${state.turnosAbiertoId === u.id ? `
+        <div class="lt-detalle" style="border-top:1px dashed var(--borde);margin-top:8px">
+          <b>💰 Valor del turno de ${esc(u.nombre)}</b>
+          <div class="suave" style="margin:4px 0">El turno vale distinto según el día. Un día vacío (o en 0) usa el valor base.</div>
+          <label>Valor base (para los días sin valor propio)</label>
+          <input id="tu-base" type="text" inputmode="numeric" pattern="[0-9]*" value="${u.valor_turno || ''}">
+          <div class="turnos-grid">
+            ${DIAS_TURNO.map(([dia, nombre]) => `
+            <div><label>${nombre}</label>
+              <input data-tu-dia="${dia}" type="text" inputmode="numeric" pattern="[0-9]*"
+                value="${u.turnos && u.turnos[dia] ? u.turnos[dia] : ''}" placeholder="${u.valor_turno || 0}"></div>`).join('')}
+          </div>
+          <div class="fila" style="margin-top:10px">
+            <button class="btn-mini" id="tu-cancelar">Cancelar</button>
+            <button class="btn-mini ok" id="tu-guardar" data-tu-usuario="${u.id}">💾 Guardar turnos</button>
+          </div>
+        </div>` : ''}
       </div>`).join('')}`;
 
   $('#btn-guardar-cfg').onclick = async () => {
@@ -2131,12 +2237,40 @@ async function renderAdmin() {
       toast('Usuario creado'); renderAdmin();
     } catch (e) { toast(e.message, true); }
   };
-  $('#vista').querySelectorAll('[data-uturno]').forEach(b => b.onclick = async () => {
-    const u = usuarios.find(x => x.id === Number(b.dataset.uturno));
-    const v = prompt(`Valor del turno de ${u.nombre} (para nómina):`, u.valor_turno || 0);
-    if (v === null) return;
-    try { await api(`/usuarios/${u.id}`, { method: 'PUT', body: { valor_turno: Number(v) } }); toast('Turno actualizado'); renderAdmin(); }
-    catch (e) { toast(e.message, true); }
+  // Devolver lo que estuviera escrito y sin guardar en la configuración
+  for (const [id, valor] of Object.entries(escritos)) {
+    const el = document.getElementById(id);
+    if (el) el.value = valor;
+  }
+
+  // 💰 abre el submenú de turnos por día (lunes a jueves un valor, sábado otro...)
+  $('#vista').querySelectorAll('[data-uturno]').forEach(b => b.onclick = () => {
+    const id = Number(b.dataset.uturno);
+    state.turnosAbiertoId = state.turnosAbiertoId === id ? null : id;
+    renderAdmin(true); // sin refetch: no se pierde nada de lo escrito arriba
+  });
+  if ($('#tu-cancelar')) $('#tu-cancelar').onclick = () => { state.turnosAbiertoId = null; renderAdmin(true); };
+  if ($('#tu-guardar')) $('#tu-guardar').onclick = async () => {
+    const id = Number($('#tu-guardar').dataset.tuUsuario);
+    const turnos = [0, 0, 0, 0, 0, 0, 0];
+    $('#vista').querySelectorAll('[data-tu-dia]').forEach(inp => {
+      turnos[Number(inp.dataset.tuDia)] = Math.max(0, Math.round(Number(inp.value) || 0));
+    });
+    try {
+      await api(`/usuarios/${id}`, { method: 'PUT', body: { valor_turno: Number($('#tu-base').value) || 0, turnos } });
+      state.turnosAbiertoId = null;
+      toast('Turnos guardados: la nómina usará el valor del día que corresponda');
+      renderAdmin();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#vista').querySelectorAll('[data-uborrar]').forEach(b => b.onclick = async () => {
+    const u = usuarios.find(x => x.id === Number(b.dataset.uborrar));
+    if (!confirm(`¿Eliminar a "${u.nombre}" definitivamente?\n\nYa no aparecerá en ninguna lista y su PIN queda libre para otro empleado.\nSi tiene ventas o nómina registradas, esos reportes viejos conservan su nombre.\n\n(Si solo es temporal — vacaciones, retiro con posible regreso — mejor use "Desactivar".)`)) return;
+    try {
+      const r = await api(`/usuarios/${u.id}`, { method: 'DELETE' });
+      toast(r.borrado ? `"${u.nombre}" eliminado` : `"${u.nombre}" eliminado (sus ventas y nómina viejas se conservan en los reportes)`);
+      renderAdmin();
+    } catch (e) { toast(e.message, true); }
   });
   $('#vista').querySelectorAll('[data-upin]').forEach(b => b.onclick = async () => {
     const pin = prompt('Nuevo PIN de 4 dígitos:');

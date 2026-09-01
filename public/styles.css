@@ -312,6 +312,10 @@ td.num, th.num { text-align: right; }
 }
 .check-linea input { width: 20px; height: 20px; margin: 0; flex: none; }
 
+/* Submenú de turnos por día de la semana (Admin → 💰) */
+.turnos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin-top: 8px; }
+.turnos-grid label { margin: 4px 0 2px; }
+
 .nav-pantallas { display: flex; gap: 8px; }
 .btn-nav { flex: 1; padding: 15px 8px; font-size: 15px; }
 .btn-nav.nav-bloqueado { opacity: .55; }
@@ -352,3 +356,11 @@ td.num, th.num { text-align: right; }
 #login .tarjeta { margin-top: 22px; }
 
 @media (min-width: 700px) { main { max-width: 640px; margin: 0 auto; width: 100%; } }
+
+/* La pantalla de login muestra un QR por cada red del PC: si solo se mostrara
+   una y fuera la equivocada (cable en vez del hotspot), nadie podría conectar */
+.login-otras { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 6px; }
+.login-otra { flex: 1; min-width: 130px; }
+.red-qr.chico { margin: 6px 0 4px; }
+#login .red-qr.chico svg, .red-qr.chico svg { max-width: 120px; }
+.red-url.chico { font-size: 13px; font-weight: 700; }
