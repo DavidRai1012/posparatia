@@ -145,6 +145,32 @@ CREATE TABLE IF NOT EXISTS cierres (
   creado_en TEXT NOT NULL
 );
 
+-- Dinero con el que arrancó el día (base de caja). Opcional: si no se registra,
+-- se asume que lo contado en el cierre anterior sigue en la caja.
+CREATE TABLE IF NOT EXISTS base_caja (
+  jornada TEXT PRIMARY KEY,
+  valor INTEGER NOT NULL,
+  usuario_id INTEGER REFERENCES usuarios(id),
+  creado_en TEXT NOT NULL
+);
+
+-- Corrección del TOTAL del día por método de pago (p. ej. Nequi real según el
+-- extracto). No toca los pagos uno a uno: el reporte muestra el valor real y
+-- los almuerzos de ese método pasan a ser un aproximado.
+-- La columna registrado guarda lo que sumaban los pagos EN EL MOMENTO de
+-- corregir. La corrección se aplica como diferencia (total_real - registrado),
+-- no como reemplazo: así, si después entra un pago, se anula uno o se
+-- rectifica su método, el total real se mueve con ellos en vez de congelarse.
+CREATE TABLE IF NOT EXISTS ajustes_metodo (
+  jornada TEXT NOT NULL,
+  metodo TEXT NOT NULL,
+  total_real INTEGER NOT NULL,
+  registrado INTEGER NOT NULL DEFAULT 0,
+  usuario_id INTEGER REFERENCES usuarios(id),
+  creado_en TEXT NOT NULL,
+  PRIMARY KEY (jornada, metodo)
+);
+
 CREATE TABLE IF NOT EXISTS historial (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   pedido_id INTEGER REFERENCES pedidos(id),
@@ -318,6 +344,24 @@ if (!db.prepare('PRAGMA table_info(usuarios)').all().some(c => c.name === 'elimi
   console.log('[db] Migración aplicada: eliminación de usuarios');
 }
 
+// Migración: los correos llevan versión HTML y archivos adjuntos (Excel del
+// resumen del día, de nómina y del mes). Los adjuntos viajan en la cola en
+// base64 para que sobrevivan sin internet, y se borran al enviarse.
+if (!db.prepare('PRAGMA table_info(cola_correos)').all().some(c => c.name === 'adjuntos')) {
+  db.exec('ALTER TABLE cola_correos ADD COLUMN html TEXT');
+  db.exec('ALTER TABLE cola_correos ADD COLUMN adjuntos TEXT');
+  console.log('[db] Migración aplicada: correos con HTML y adjuntos');
+}
+
+// Migración: la corrección de totales por método pasó de reemplazo a diferencia
+if (!db.prepare('PRAGMA table_info(ajustes_metodo)').all().some(c => c.name === 'registrado')) {
+  db.exec('ALTER TABLE ajustes_metodo ADD COLUMN registrado INTEGER NOT NULL DEFAULT 0');
+  // Las correcciones viejas no saben contra qué se hicieron: se descartan para
+  // que nadie herede un total congelado (se vuelven a hacer si hacen falta)
+  db.exec('DELETE FROM ajustes_metodo');
+  console.log('[db] Migración aplicada: correcciones de total por método como diferencia');
+}
+
 // ---- Helpers de fecha/hora local ----
 function ahora() {
   return new Date().toLocaleString('sv-SE'); // "YYYY-MM-DD HH:MM:SS" en hora local
@@ -360,6 +404,8 @@ const CONFIG_DEFAULTS = {
   precio_dia_solo: '17000',
   precio_especial_entrada: '26000',
   precio_especial_solo: '25000',
+  // Meses cuyo reporte mensual ya se encoló (para no repetirlo en cada cierre)
+  meses_reportados: '[]',
   // Cuenta de venta para el cliente (documento informativo; para factura
   // electrónica DIAN se requiere un proveedor autorizado)
   factura_titulo: 'FACTURA DE VENTA',

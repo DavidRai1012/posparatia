@@ -346,6 +346,10 @@ function refrescarVistaEnVivo(soloVistas) {
   // Con el editor de turnos abierto, cada comanda que entra disparaba un
   // redibujado de Admin que borraba lo que el administrador venía escribiendo
   if (state.vista === 'admin' && state.turnosAbiertoId) return;
+  // Lo mismo en Rectificar: la cajera está escribiendo totales contra el
+  // extracto y cada venta de un mesero le cerraba el teclado y le borraba el
+  // filtro de fecha. Esa pantalla se refresca sola con sus propios botones.
+  if (state.vista === 'caja' && state.enRectificar) return;
   if (['historial', 'caja', 'menu', 'impresora', 'admin', 'tomar'].includes(state.vista)) renderVista();
 }
 
@@ -1117,9 +1121,54 @@ function renderRectificar() {
       </div>
       <div class="suave" style="margin-top:6px">Elija el método para ver sus pagos del día y corrija el que esté mal con el selector de cada fila.</div>
     </div>
+    <div class="tarjeta">
+      <b>Corregir el TOTAL del día por método</b>
+      <div class="suave" style="margin:4px 0 6px">Para cuadrar contra el extracto (Nequi, datáfono) sin tocar pago por pago. Ojo: al corregir un total, los almuerzos de ese método pasan a ser un <b>aproximado</b> en los reportes. Vacío = volver a lo registrado.</div>
+      <div id="ajustes-rect"><span class="suave">Cargando...</span></div>
+    </div>
+    <div class="suave" style="margin:2px 0 6px">O corrija pago por pago (esto sí conserva el conteo exacto de almuerzos):</div>
     <div id="lista-rect"><span class="suave">Cargando...</span></div>`;
 
   $('#btn-rect-volver').onclick = () => { state.enRectificar = false; renderCaja(); };
+  const cargarAjustes = async () => {
+    const cont = $('#ajustes-rect');
+    if (!cont) return;
+    try {
+      const fecha = $('#rect-fecha').value || state.jornada;
+      const a = await api(`/pagos/ajustes?jornada=${fecha}`);
+      const ajustables = a.ajustables || [];
+      cont.innerHTML = METODOS_COBRO.map(([k, v]) => {
+        const reg = a.registrado[k] || 0, real = a.real[k] || 0;
+        const alm = a.almuerzos[k] || { cantidad: 0, aproximado: false };
+        const d = (a.detalle || {})[k];
+        // El efectivo no se corrige aquí: se cuadra contando la caja
+        if (!ajustables.includes(k)) {
+          return `<div class="fila" style="padding:4px 0;border-bottom:1px dashed var(--borde)">
+            <span class="crece">${v}<br><span class="suave">registrado ${fmt(reg)} · ${alm.cantidad} almuerzo(s)</span></span>
+            <span class="suave" style="width:120px;text-align:right">se cuadra contando la caja</span>
+          </div>`;
+        }
+        return `<div class="fila" style="padding:4px 0;border-bottom:1px dashed var(--borde)">
+          <span class="crece">${v}<br><span class="suave">registrado ${fmt(reg)} · ${alm.cantidad} almuerzo(s)${alm.aproximado ? ' <b style="color:var(--alerta)">aprox.</b>' : ''}${d && d.cambiaronPagos ? '<br><b style="color:var(--alerta)">hubo pagos nuevos o anulados después de corregir</b>' : ''}</span></span>
+          <input data-ajuste="${k}" type="text" inputmode="numeric" value="${a.ajustados[k] ? real : ''}"
+            placeholder="${fmt(reg)}" ${a.cerrada ? 'disabled' : ''} style="width:120px">
+        </div>`;
+      }).join('');
+      // Solo dígitos: el teclado de Android ofrece el punto y "12.000" se
+      // guardaría como 12
+      cont.querySelectorAll('[data-ajuste]').forEach(inp => inp.oninput = () => {
+        const limpio = inp.value.replace(/[^0-9]/g, '');
+        if (inp.value !== limpio) inp.value = limpio;
+      });
+      cont.querySelectorAll('[data-ajuste]').forEach(inp => inp.onchange = async () => {
+        try {
+          const r = await api('/pagos/ajustes', { method: 'PUT', body: { jornada: fecha, metodo: inp.dataset.ajuste, total_real: inp.value } });
+          toast(r.ajustado ? `${METODOS[inp.dataset.ajuste]}: total corregido a ${fmt(r.real)} (almuerzos aproximados)` : `${METODOS[inp.dataset.ajuste]}: sin corrección, vuelve a lo registrado`);
+          cargarAjustes();
+        } catch (e) { toast(e.message, true); cargarAjustes(); }
+      });
+    } catch (e) { cont.innerHTML = `<div class="suave">${esc(e.message)}</div>`; }
+  };
   const cargarRect = async () => {
     const cont = $('#lista-rect');
     if (!cont) return;
@@ -1158,9 +1207,10 @@ function renderRectificar() {
       });
     } catch (e) { cont.innerHTML = `<div class="tarjeta suave">${esc(e.message)}</div>`; }
   };
-  $('#rect-fecha').onchange = cargarRect;
+  $('#rect-fecha').onchange = () => { cargarRect(); cargarAjustes(); };
   $('#rect-metodo').onchange = cargarRect;
   cargarRect();
+  cargarAjustes();
 }
 
 async function descargarArchivo(ruta, nombre) {
@@ -1210,11 +1260,25 @@ function renderCaja() {
   $('#vista').innerHTML = `
     <h2>Caja</h2>
     ${htmlCobro}
+    <div class="tarjeta" id="base-caja">
+      <div class="fila"><b class="crece">💵 Dinero con el que arrancó el día</b><b id="base-actual">...</b></div>
+      <div class="suave" id="base-origen" style="margin:2px 0 6px"></div>
+      ${state.jornadaCerrada ? '' : `
+      <div class="fila">
+        <input id="in-base" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="Corregir (vacío = usar el de ayer)" style="flex:2">
+        <button class="btn-mini ok" id="btn-base" style="flex:1">Registrar</button>
+      </div>
+      <div class="suave" style="margin-top:4px">Opcional: si lo que hay en la caja no coincide con lo que contó el cajero de ayer, escriba aquí lo que hay de verdad.</div>`}
+    </div>
     <h3>Resumen del día</h3>
     <div class="tarjeta" id="resumen-dia"><span class="suave">Cargando...</span></div>
     <div class="fila" style="margin:8px 0 4px">
       <input id="excel-fecha" type="date" value="${state.jornada}" style="flex:1">
       <button class="btn-mini primario" id="btn-excel" style="flex:1">📥 Descargar Excel</button>
+    </div>
+    <div class="fila" style="margin:4px 0 8px">
+      <input id="excel-mes" type="month" value="${state.jornada.slice(0, 7)}" style="flex:1">
+      <button class="btn-mini primario" id="btn-excel-mes" style="flex:1">📥 Excel del mes</button>
     </div>
     <div class="tarjeta">
       <div class="suave">📊 Qué se vendió entre dos fechas (para decidir las compras)</div>
@@ -1343,6 +1407,26 @@ function renderCaja() {
     try {
       await descargarArchivo(`/api/reportes/platos-excel?desde=${desde}&hasta=${hasta}`, `platos-${desde}_a_${hasta}.xlsx`);
       toast('📊 Excel de platos vendidos descargado');
+    } catch (e) { toast(e.message, true); }
+  };
+  if ($('#btn-excel-mes')) $('#btn-excel-mes').onclick = async () => {
+    const mes = $('#excel-mes').value || state.jornada.slice(0, 7);
+    try {
+      await descargarArchivo(`/api/reportes/excel-mes?mes=${mes}`, `resumen-${mes}.xlsx`);
+      toast('📥 Excel del mes descargado (resumen día por día + todas las ventas)');
+    } catch (e) { toast(e.message, true); }
+  };
+  if ($('#in-base')) $('#in-base').oninput = (e) => {
+    const limpio = e.target.value.replace(/[^0-9]/g, ''); // "120.000" -> 120000
+    if (e.target.value !== limpio) e.target.value = limpio;
+  };
+  if ($('#btn-base')) $('#btn-base').onclick = async () => {
+    const valor = $('#in-base').value.trim();
+    try {
+      const r = await api('/caja/base', { method: 'PUT', body: { valor } });
+      $('#in-base').value = '';
+      toast(valor === '' ? 'Base de caja: vuelve a usarse la del cierre anterior' : `Base de caja registrada: ${fmt(r.base.valor)}`);
+      cargarResumenDia();
     } catch (e) { toast(e.message, true); }
   };
   if ($('#btn-excel-nomina')) $('#btn-excel-nomina').onclick = async () => {
@@ -1521,16 +1605,38 @@ async function cargarResumenDia() {
       <div class="fila suave"><span>Domicilios cobrados</span><span class="der">${fmt(r.totalRecargos)}</span></div>
       <div class="fila suave"><span>Cancelados (${r.numCancelados})</span><span class="der">${fmt(r.totalCancelado)}</span></div>
       <hr class="sep">
-      ${Object.entries(r.porMetodo).map(([m, v]) =>
-        `<div class="fila suave"><span>${METODOS[m] || m}</span><span class="der">${fmt(v)}</span></div>`).join('') || '<div class="suave">Sin pagos aún</div>'}
+      ${Object.entries(r.porMetodo).map(([m, v]) => {
+        const a = (r.almuerzosPorMetodo || {})[m] || { cantidad: 0, aproximado: false };
+        const ajustado = (r.ajustados || {})[m];
+        return `<div class="fila suave"><span>${METODOS[m] || m}${ajustado ? ' <span class="chip llevar">TOTAL CORREGIDO</span>' : ''}</span>
+          <span class="der">${fmt(v)}</span></div>
+          <div class="fila suave" style="font-size:12px;padding-left:12px"><span>${a.cantidad} almuerzo(s)${a.aproximado ? ' · <b style="color:var(--alerta)">APROXIMADO</b>' : ''}${ajustado ? ` · pago a pago sumaba ${fmt((r.porMetodoRegistrado || {})[m] || 0)}` : ''}</span></div>`;
+      }).join('') || '<div class="suave">Sin pagos aún</div>'}
       <hr class="sep">
       ${Object.entries(r.porVendedor).map(([v, d]) =>
         `<div class="fila suave"><span>👤 ${esc(v)} (${d.pedidos} pedidos)</span><span class="der">${fmt(d.total)}</span></div>`).join('')}
       <hr class="sep">
-      <div class="fila suave"><span>💸 Gastos del local</span><span class="der">-${fmt(r.totalGastos)}</span></div>
-      <div class="fila suave"><span>👥 Nómina pagada</span><span class="der">-${fmt(r.totalNomina)}</span></div>
+      <div class="fila suave"><span>💵 Base de caja (inicio del día)</span><span class="der">${fmt(r.baseCaja ? r.baseCaja.valor : 0)}</span></div>
+      <div class="fila suave"><span>+ Ventas en efectivo</span><span class="der">${fmt(r.ventasEfectivo || 0)}</span></div>
+      <div class="fila suave"><span>💸 − Gastos del local</span><span class="der">-${fmt(r.totalGastos)}</span></div>
+      <div class="fila suave"><span>👥 − Nómina pagada</span><span class="der">-${fmt(r.totalNomina)}</span></div>
       ${r.totalRecargoTarjeta ? `<div class="fila suave"><span>Recargos tarjeta cobrados</span><span class="der">${fmt(r.totalRecargoTarjeta)}</span></div>` : ''}
-      <div class="fila" style="font-weight:800"><span>Efectivo esperado en caja</span><span class="der">${fmt(r.efectivoEsperado)}</span></div>`;
+      <div class="fila" style="font-weight:800"><span>= Efectivo esperado en caja</span><span class="der">${fmt(r.efectivoEsperado)}</span></div>`;
+    // La tarjeta de base de caja de arriba se llena con el mismo resumen
+    const b = r.baseCaja || { valor: 0, origen: 'ninguna' };
+    if ($('#base-actual')) $('#base-actual').textContent = fmt(b.valor);
+    if ($('#base-origen')) {
+      const texto = {
+        registrada: `Registrado hoy${b.usuario ? ` por ${b.usuario}` : ''}`,
+        contado_anterior: `Lo que contó el cajero en el cierre del ${b.jornadaOrigen}`,
+        esperado_anterior: `Según el sistema al cierre del ${b.jornadaOrigen} (ese día no se contó el efectivo)`,
+        ninguna: 'No hay cierre anterior: se asume que se arrancó en $0'
+      }[b.origen] || '';
+      const aviso = b.incierta && b.diasSinCierre && b.diasSinCierre.length
+        ? `<br><b style="color:var(--alerta)">⚠️ ${b.diasSinCierre.join(', ')} tuvo(tuvieron) ventas sin cierre: ese efectivo no está contado. Cuente la caja y registre la base.</b>`
+        : '';
+      $('#base-origen').innerHTML = esc(texto) + aviso;
+    }
   } catch { /* la vista pudo cambiar */ }
 }
 
@@ -2143,6 +2249,11 @@ async function renderAdmin(usarCache) {
         <button class="btn-mini primario" id="btn-reporte-ahora">📨 Enviar reporte ahora</button>
         <button class="btn-mini primario" id="btn-sheets-prueba">📊 Probar Google Sheets</button>
       </div>
+      <div class="fila" style="margin-top:8px">
+        <input id="cf-mes-reporte" type="month" value="${state.jornada.slice(0, 7)}" style="flex:1">
+        <button class="btn-mini primario" id="btn-reporte-mes" style="flex:1.4">📅 Enviar reportes del mes</button>
+      </div>
+      <div class="suave" style="margin-top:4px">Los dos correos del mes (nómina y resumen con todas las ventas) salen solos en el cierre del último día; con este botón se reenvían cuando quiera.</div>
     </div>
 
     <button class="btn ok" id="btn-guardar-cfg">💾 Guardar configuración</button>
@@ -2221,7 +2332,17 @@ async function renderAdmin(usarCache) {
     catch (e) { toast(e.message, true); }
   };
   $('#btn-reporte-ahora').onclick = async () => {
-    try { await api('/reportes/enviar-ahora', { method: 'POST' }); toast('Reporte encolado para envío'); }
+    try { await api('/reportes/enviar-ahora', { method: 'POST' }); toast('Reporte encolado para envío (con el Excel del día adjunto)'); }
+    catch (e) { toast(e.message, true); }
+  };
+  $('#btn-reporte-mes').onclick = async () => {
+    const mes = String($('#cf-mes-reporte').value || '').trim();
+    // En navegadores sin selector de mes el campo es texto libre
+    if (!/^\d{4}-\d{2}$/.test(mes)) return toast('Escriba el mes como 2026-09', true);
+    const enCurso = mes === state.jornada.slice(0, 7);
+    if (!confirm(`¿Enviar los dos correos del mes ${mes} (nómina y resumen con todas las ventas)?` +
+      (enCurso ? '\n\nOjo: es el mes en curso, así que el reporte va hasta hoy (parcial).' : ''))) return;
+    try { const r = await api('/reportes/enviar-mes', { method: 'POST', body: { mes } }); toast(`Reportes de ${r.mes} encolados para envío`); }
     catch (e) { toast(e.message, true); }
   };
   $('#btn-sheets-prueba').onclick = async () => {

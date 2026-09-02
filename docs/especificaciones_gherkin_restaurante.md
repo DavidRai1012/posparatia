@@ -712,3 +712,109 @@ Característica: Eliminación de usuarios
     Cuando intenta eliminarse o desactivarse a sí mismo
     Entonces el sistema debe impedirlo y pedir crear otro admin primero
 ```
+
+---
+
+```gherkin
+# language: es
+Característica: Correo del reporte con Excel adjunto
+  Como dueño del restaurante
+  Quiero recibir el resumen del día en el correo y en un Excel
+  Para revisarlo en el celular y guardarlo en mi contabilidad
+
+  Escenario: Correo del cierre de caja
+    Dado que la cajera ejecuta el cierre de caja
+    Cuando sale el correo del día
+    Entonces debe traer el resumen legible (ventas, métodos de pago, vendedores, tipos, gastos, nómina y caja)
+    Y adjunto un Excel con dos hojas: el mismo resumen y las ventas una a una de ese día
+
+  Escenario: Día con nómina pagada
+    Dado que ese día se confirmó al menos un pago de nómina
+    Cuando sale el correo del día
+    Entonces también debe adjuntar el Excel de nómina con una hoja por mes
+    Y cada hoja de mes debe listar los pagos agrupados por empleado con subtotal
+
+  Escenario: El administrador aparece con su cargo
+    Dado que el gerente tiene rol de administrador y registró ventas
+    Cuando se consulta cualquier reporte, Excel o la hoja de Google
+    Entonces su nombre debe aparecer como "Pepito Pérez (Administrador)"
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Reportes mensuales
+  Como dueño del restaurante
+  Quiero recibir al final del mes la nómina del mes y el resumen del mes
+  Para cerrar la contabilidad mensual sin armar nada a mano
+
+  Escenario: Cierre del último día del mes
+    Dado que hoy es el último día del mes
+    Cuando la cajera ejecuta el cierre de caja
+    Entonces deben salir dos correos adicionales: "Nómina del mes" y "Resumen mensual"
+    Y el resumen mensual debe adjuntar un Excel con el resumen día por día y todas las ventas del mes
+
+  Escenario: El último día no abrieron
+    Dado que el 31 no hubo cierre de caja
+    Cuando se hace el primer cierre del mes siguiente
+    Entonces deben salir los correos del mes anterior una sola vez
+
+  Escenario: Reenvío manual
+    Dado que el admin elige un mes en la pestaña Admin
+    Cuando toca "Enviar reportes del mes"
+    Entonces deben encolarse de nuevo los dos correos de ese mes
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Base de caja y corrección de totales por método
+  Como cajera
+  Quiero registrar con cuánto dinero arrancó el día y corregir el total de un método de pago
+  Para que el efectivo esperado y los extractos cuadren con la realidad
+
+  Escenario: Base de caja por defecto
+    Dado que ayer se contaron $120.000 en el cierre
+    Cuando hoy no se registra base de caja
+    Entonces el efectivo esperado debe partir de $120.000
+
+  Escenario: Corregir la base de caja
+    Dado que en la caja hay $100.000 y no $120.000
+    Cuando la cajera registra $100.000 como base del día
+    Entonces el efectivo esperado debe partir de $100.000 y el reporte debe decir quién lo registró
+
+  Escenario: Corregir el total de un método
+    Dado que Nequi registrado pago a pago suma $340.000 y el extracto dice $355.000
+    Cuando la cajera corrige el total de Nequi a $355.000
+    Entonces el reporte debe mostrar $355.000 con la nota de que se corrigió a mano
+    Y los almuerzos de Nequi deben mostrarse como APROXIMADO (total ÷ precio del almuerzo)
+
+  Escenario: Corregir pago por pago conserva el conteo exacto
+    Dado que la cajera cambia el método de un pago de Nequi a Tarjeta sin tocar los totales
+    Cuando se consulta el reporte
+    Entonces los almuerzos por método deben seguir siendo exactos, sin la palabra "aproximado"
+
+  Escenario: Quitar la corrección
+    Dado que Nequi tiene el total corregido
+    Cuando la cajera deja el campo vacío
+    Entonces el total vuelve a lo registrado y los almuerzos vuelven a ser exactos
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Hoja de Google Sheets por mes
+  Como dueño del restaurante
+  Quiero que la hoja en tiempo real tenga una pestaña por mes con el formato del Excel
+  Para ver el mes completo sin filtrar
+
+  Escenario: Venta pagada
+    Dado que se paga una comanda en septiembre de 2026
+    Cuando llega a Google Sheets
+    Entonces debe anotarse en la pestaña "09-2026"
+    Y con las columnas Día, Hora, Comanda, Vendedor, Entrega (Local/Domicilio), Entrada, Proteína, Bebida, Extras, Método de pago, Recargo y Total
+    Y sin el nombre del cliente
+```

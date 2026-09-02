@@ -14,13 +14,13 @@
 [Setup]
 AppId={{8F4B1E2A-POS-TIA-2026}}
 AppName=POS Restaurante
-AppVersion=6.0
+AppVersion=7.0
 AppPublisher=DavidRai1012
 DefaultDirName={sd}\POS-Restaurante
 DefaultGroupName=POS Restaurante
 DisableProgramGroupPage=yes
 OutputDir=salida
-OutputBaseFilename=Instalar-POS-Restaurante-6
+OutputBaseFilename=Instalar-POS-Restaurante-7
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin

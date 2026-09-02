@@ -11,6 +11,7 @@ const { db, ahora, jornadaHoy, horaLocal, getConfig, setConfig, getConfigAll, re
 const { ticketCocina, ticketNomina, ticketFactura, ticketAccesoQR } = require('./escpos');
 const impresion = require('./printing');
 const reportes = require('./reports');
+const informes = require('./informes');
 
 const PORT = process.env.PORT || 3000;
 const app = express();
@@ -394,9 +395,7 @@ app.post('/api/pedidos', requiere(1), (req, res) => {
     db.prepare('INSERT INTO pagos (pedido_id, metodo, monto, recibido, vueltas, recargo_tarjeta, cajero_id, jornada, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(creado.id, pagoExpress.metodo, totalCobrar, recibido, vueltas, recTarjeta, req.usuario.usuarioId, jornada, ahora());
     registrarHistorial(creado.id, req.usuario.usuarioId, 'pago', `${pagoExpress.metodo} por ${totalCobrar} (express)`);
-    const pedidoCompleto = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(creado.id);
-    reportes.encolarVentaSheets(pedidoCompleto, items.map(i => ({ cantidad: i.cantidad, plato_nombre: i.plato_nombre })),
-      { metodo: pagoExpress.metodo, creado_en: ahora(), recargo_tarjeta: recTarjeta }, req.usuario.nombre);
+    reportes.encolarVentaSheets(creado.id);
     reportes.drenarSheets().catch(() => {});
   }
 
@@ -507,9 +506,7 @@ app.post('/api/pedidos/:id/pago', requiere(2), (req, res) => {
   db.prepare('INSERT INTO pagos (pedido_id, metodo, monto, recibido, vueltas, recargo_tarjeta, cajero_id, jornada, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(pedido.id, metodo, totalCobrar, recibido, vueltas, recTarjeta, req.usuario.usuarioId, pedido.jornada, ahora());
   registrarHistorial(pedido.id, req.usuario.usuarioId, 'pago', `${metodo} por ${totalCobrar}`);
-  const items = db.prepare('SELECT * FROM pedido_items WHERE pedido_id = ?').all(pedido.id);
-  const vendedor = db.prepare('SELECT nombre FROM usuarios WHERE id = ?').get(pedido.vendedor_id).nombre;
-  reportes.encolarVentaSheets(pedido, items, { metodo, creado_en: ahora(), recargo_tarjeta: recTarjeta }, vendedor);
+  reportes.encolarVentaSheets(pedido.id);
   reportes.drenarSheets().catch(() => {}); // intento inmediato; si no hay internet queda en búfer
   emitirPedidos();
   res.json({ ok: true, vueltas, recargo_tarjeta: recTarjeta, total_cobrado: totalCobrar });
@@ -520,189 +517,108 @@ app.get('/api/reportes/dia', requiere(2), (req, res) => {
   res.json(reportes.resumenJornada(req.query.jornada || jornadaHoy()));
 });
 
-// Excel (.xlsx) con todas las comandas del día: columnas separadas por tipo
-// (Entrada/Proteína/Bebida/Extras) para poder filtrar, método de pago para
-// cuadrar contra Nequi/Daviplata/datáfono, y totales por método en otra hoja.
-const ETIQUETAS_METODO = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', nequi: 'Nequi', daviplata: 'Daviplata',
-  qr_bancolombia: 'QR Bancolombia', tarjeta_debito: 'Tarjeta débito', tarjeta_credito: 'Tarjeta crédito', billetera: 'Billetera' };
-const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
-  'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
-const ETIQUETAS_CLASE = { entrada: 'Entrada', proteina_dia: 'Del día', proteina_especial: 'Especial',
-  bebida: 'Bebida', extra: 'Extra' };
+// Excel del día para la app: resumen (igual al correo) + ventas una a una
+// + platos, tipos y gastos. Lo arma informes.js, la misma fuente del correo.
+const ETIQUETAS_METODO = reportes.ETIQUETAS_METODO;
 
-// Hojas "qué se vendió": una con el detalle plato por plato y otra con el total
-// por tipo (pollo, carne, cerdo...), que es lo que se mira para hacer las compras.
-function hojasDePlatos(XLSX, libro, ventas) {
-  const filasPlatos = [['Plato', 'Tipo (compras)', 'Clase', 'Cantidad', 'De esos, sin entrada', 'Total $']];
-  for (const p of ventas.platos) {
-    filasPlatos.push([p.nombre, p.grupo || '', ETIQUETAS_CLASE[p.tipo] || p.tipo || '', p.cantidad, p.solos, p.total]);
-  }
-  const filasGrupos = [['Tipo', 'Almuerzos vendidos', 'De esos, sin entrada', 'Total $']];
-  for (const g of ventas.grupos) filasGrupos.push([g.grupo, g.cantidad, g.solos, g.total]);
-  filasGrupos.push([]);
-  filasGrupos.push(['TOTAL', ventas.grupos.reduce((s, g) => s + g.cantidad, 0), '',
-    ventas.grupos.reduce((s, g) => s + g.total, 0)]);
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasPlatos, [30, 16, 12, 10, 20, 12]), 'Platos vendidos');
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasGrupos, [18, 20, 20, 12]), 'Por tipo');
-}
-
-function enviarXlsx(res, libro, nombre) {
-  const XLSX = require('xlsx');
-  const buf = XLSX.write(libro, { type: 'buffer', bookType: 'xlsx' });
+function enviarXlsx(res, buffer, nombre) {
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename=${nombre}`);
-  res.send(buf);
-}
-
-function hojaConFiltro(XLSX, filas, anchos) {
-  const ws = XLSX.utils.aoa_to_sheet(filas);
-  if (filas.length > 1) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: filas.length - 1, c: filas[0].length - 1 } }) };
-  if (anchos) ws['!cols'] = anchos.map(w => ({ wch: w }));
-  return ws;
+  res.send(buffer);
 }
 
 app.get('/api/reportes/excel', requiere(1), (req, res) => {
-  const XLSX = require('xlsx');
   const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jornada || '')) ? req.query.jornada : jornadaHoy();
-  const resumen = reportes.resumenJornada(jornada);
-  const fmtCop = (n) => Number(n || 0);
-
-  // --- Hoja 1: Resumen del día (ingresos y egresos, para todos los empleados) ---
-  const filasResumen = [
-    ['RESUMEN DEL DIA', jornada],
-    [],
-    ['INGRESOS', ''],
-    ['Almuerzos completos (cantidad)', resumen.numAlmuerzos],
-    ['Almuerzos completos ($)', fmtCop(resumen.totalAlmuerzos)],
-    ['Sueltos y extras ($)', fmtCop(resumen.totalExtras)],
-    ['Domicilios cobrados', fmtCop(resumen.totalRecargos)],
-    ['TOTAL GENERAL VENDIDO', fmtCop(resumen.totalVentas)],
-    ['Recargos por tarjeta', fmtCop(resumen.totalRecargoTarjeta)],
-    ['Total cobrado', fmtCop(resumen.totalCobrado)],
-    [],
-    ['POR METODO DE PAGO', '']
-  ];
-  for (const [m, v] of Object.entries(resumen.porMetodo)) {
-    filasResumen.push([ETIQUETAS_METODO[m] || m, fmtCop(v)]);
-  }
-  filasResumen.push([]);
-  filasResumen.push(['EGRESOS', '']);
-  filasResumen.push(['Gastos del local', fmtCop(resumen.totalGastos)]);
-  filasResumen.push(['Nomina pagada', fmtCop(resumen.totalNomina)]);
-  filasResumen.push([]);
-  filasResumen.push(['EFECTIVO ESPERADO EN CAJA', fmtCop(resumen.efectivoEsperado)]);
-  filasResumen.push(['(ventas en efectivo menos gastos y nomina)', '']);
-
-  // --- Hoja 2: Ventas en detalle ---
-  const pedidos = db.prepare(
-    `SELECT p.*, u.nombre AS vendedor, pg.metodo, pg.monto AS cobrado, pg.recargo_tarjeta, pg.creado_en AS pagado_en
-     FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
-     LEFT JOIN pagos pg ON pg.pedido_id = p.id
-     WHERE p.jornada = ? ORDER BY p.numero_comanda`).all(jornada);
-  const itemsDe = db.prepare(
-    `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
-     FROM pedido_items pi WHERE pi.pedido_id = ?`);
-  const filasVentas = [['Comanda', 'Hora', 'Vendedor', 'Entrega', 'Entrada', 'Proteína', 'Bebida', 'Extras',
-    'Método de pago', 'Domicilio', 'Recargo tarjeta', 'Estado', 'Total']];
-  for (const p of pedidos) {
-    const porTipo = { entrada: [], proteina: [], bebida: [], extra: [] };
-    for (const it of itemsDe.all(p.id)) {
-      const clave = it.tipo === 'entrada' ? 'entrada'
-        : (it.tipo === 'proteina_dia' || it.tipo === 'proteina_especial') ? 'proteina'
-        : it.tipo === 'bebida' ? 'bebida' : 'extra';
-      porTipo[clave].push(`${it.cantidad > 1 ? it.cantidad + 'x ' : ''}${it.plato_nombre}${it.solo ? ' (solo)' : ''}`);
-    }
-    const estado = p.estado === 'cancelado' ? 'ANULADA' : (p.metodo ? 'PAGADA' : 'POR COBRAR');
-    const hora = ((p.pagado_en || p.creado_en) || '').slice(11, 16);
-    filasVentas.push([p.numero_comanda, hora, p.vendedor, p.tipo_entrega === 'llevar' ? 'Domicilio' : 'Mesa',
-      porTipo.entrada.join(' | '), porTipo.proteina.join(' | '), porTipo.bebida.join(' | '), porTipo.extra.join(' | '),
-      p.metodo ? (ETIQUETAS_METODO[p.metodo] || p.metodo) : '', p.recargo, p.recargo_tarjeta || 0,
-      estado, p.estado === 'cancelado' ? 0 : (p.cobrado ?? p.total)]);
-  }
-
-  // --- Hoja 3: Gastos del día ---
-  const filasGastos = [['Concepto', 'Valor', 'Registró']];
-  for (const g of resumen.gastos) filasGastos.push([g.concepto, g.valor, g.usuario]);
-  filasGastos.push([]);
-  filasGastos.push(['TOTAL GASTOS', resumen.totalGastos, '']);
-
-  const libro = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasResumen, [34, 14]), 'Resumen del día');
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasVentas, [9, 6, 12, 10, 18, 20, 14, 18, 14, 9, 9, 11, 10]), 'Ventas');
-  hojasDePlatos(XLSX, libro, { platos: resumen.porPlato, grupos: resumen.porGrupo });
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasGastos, [46, 12, 14]), 'Gastos del día');
-  enviarXlsx(res, libro, `resumen-${jornada}.xlsx`);
+  enviarXlsx(res, informes.excelResumenDia(jornada, true), `resumen-${jornada}.xlsx`);
 });
 
-// Excel de "qué se vendió" entre dos fechas: sirve para decidir las compras de
-// la semana (cuántos pollos, cuánta carne) y ver qué plato no se está moviendo.
-app.get('/api/reportes/platos-excel', requiere(1), (req, res) => {
-  const XLSX = require('xlsx');
-  const fecha = (v, alt) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : alt;
-  const desde = fecha(req.query.desde, jornadaHoy());
-  const hasta = fecha(req.query.hasta, desde);
-  if (hasta < desde) return res.status(400).json({ error: 'La fecha final es anterior a la inicial' });
-  const ventas = reportes.ventasPorPlato(desde, hasta);
-  if (!ventas.platos.length) return res.status(404).json({ error: `No hay ventas entre ${desde} y ${hasta}` });
-  const libro = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, [
-    ['PLATOS VENDIDOS'], ['Desde', desde], ['Hasta', hasta], [],
-    ['Almuerzos (proteínas) vendidos', ventas.grupos.reduce((s, g) => s + g.cantidad, 0)],
-    ['Platos distintos vendidos', ventas.platos.length]
-  ], [32, 14]), 'Periodo');
-  hojasDePlatos(XLSX, libro, ventas);
-  enviarXlsx(res, libro, `platos-${desde}_a_${hasta}.xlsx`);
+// Excel del mes: resumen con la tabla día por día + todas las ventas del mes
+app.get('/api/reportes/excel-mes', requiere(2), (req, res) => {
+  const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || '')) ? req.query.mes : jornadaHoy().slice(0, 7);
+  enviarXlsx(res, informes.excelResumenMes(mes), `resumen-${mes}.xlsx`);
 });
 
-// Excel de nómina del año: una hoja por empleado (como la tarjeta Kardex que
-// llevan a mano) + hoja RESUMEN con el total por empleado y mes.
+// Excel de nómina del año: hoja RESUMEN (empleado × mes) + una hoja por mes
+// con los pagos agrupados por empleado (estilo Kardex)
 app.get('/api/nomina/excel', requiere(2), (req, res) => {
-  const XLSX = require('xlsx');
   const anio = /^\d{4}$/.test(String(req.query.anio || '')) ? req.query.anio : jornadaHoy().slice(0, 4);
-  const pagosAnio = db.prepare(
-    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
-     WHERE n.estado = 'confirmado' AND n.jornada LIKE ? ORDER BY u.nombre, n.jornada, n.id`).all(anio + '-%');
-  if (!pagosAnio.length) return res.status(404).json({ error: `No hay pagos de nómina confirmados en ${anio}` });
+  const buffer = informes.excelNomina(anio);
+  if (!buffer) return res.status(404).json({ error: `No hay pagos de nómina confirmados en ${anio}` });
+  enviarXlsx(res, buffer, `nomina-${anio}.xlsx`);
+});
 
-  const libro = XLSX.utils.book_new();
+// ---------- Base de caja (dinero con el que arrancó el día) ----------
+// Opcional: si no se registra, se asume que lo contado en el cierre anterior
+// sigue en la caja. Vacío = volver a ese valor automático.
+// Los valores de dinero llegan como los teclea la cajera: "12.000", "$12.000"
+// o "12 000". Number('12.000') sería 12, así que se dejan solo los dígitos.
+function aEntero(valor) {
+  const limpio = String(valor ?? '').replace(/[^\d]/g, '');
+  return limpio === '' ? null : Number(limpio);
+}
 
-  // Hoja RESUMEN: empleados x meses
-  const empleados = [...new Set(pagosAnio.map(p => p.empleado))];
-  const filasResumen = [['Empleado', ...MESES, 'TOTAL ' + anio]];
-  for (const emp of empleados) {
-    const fila = [emp];
-    let totalAnio = 0;
-    for (let m = 1; m <= 12; m++) {
-      const suma = pagosAnio.filter(p => p.empleado === emp && Number(p.jornada.slice(5, 7)) === m)
-        .reduce((s, p) => s + p.total, 0);
-      fila.push(suma || 0);
-      totalAnio += suma;
-    }
-    fila.push(totalAnio);
-    filasResumen.push(fila);
+app.put('/api/caja/base', requiere(2), (req, res) => {
+  if (!validarJornadaAbierta(res)) return;
+  const hoy = jornadaHoy();
+  const crudo = String(req.body.valor ?? '').trim();
+  if (crudo === '') {
+    db.prepare('DELETE FROM base_caja WHERE jornada = ?').run(hoy);
+  } else {
+    const valor = aEntero(crudo);
+    if (valor === null || !Number.isFinite(valor) || valor < 0) return res.status(400).json({ error: 'Valor no válido' });
+    db.prepare(`INSERT INTO base_caja (jornada, valor, usuario_id, creado_en) VALUES (?, ?, ?, ?)
+                ON CONFLICT(jornada) DO UPDATE SET valor = excluded.valor, usuario_id = excluded.usuario_id, creado_en = excluded.creado_en`)
+      .run(hoy, valor, req.usuario.usuarioId, ahora());
+    registrarHistorial(null, req.usuario.usuarioId, 'base_caja', `${hoy}: ${valor}`);
   }
-  XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasResumen, [16, ...MESES.map(() => 11), 13]), 'RESUMEN');
+  io.emit('caja:actualizada');
+  res.json({ ok: true, base: reportes.baseCajaDe(hoy) });
+});
 
-  // Una hoja por empleado, estilo tarjeta Kardex
-  const usados = new Set(['RESUMEN']);
-  for (const emp of empleados) {
-    const filas = [['Fecha', 'Mes', 'Día', 'Turno', 'Descuento', 'Bono', 'Concepto', 'Total', 'Confirmado']];
-    let total = 0;
-    for (const p of pagosAnio.filter(x => x.empleado === emp)) {
-      filas.push([p.jornada, MESES[Number(p.jornada.slice(5, 7)) - 1], Number(p.jornada.slice(8, 10)),
-        p.valor_turno, p.descuento, p.bono, p.concepto || '', p.total, (p.confirmado_en || '').slice(0, 16)]);
-      total += p.total;
-    }
-    filas.push([]);
-    filas.push(['', '', '', '', '', '', 'TOTAL ' + anio, total, '']);
-    // nombre de hoja: máximo 31 caracteres, sin caracteres prohibidos, único
-    let nombre = emp.replace(/[\\\/\?\*\[\]:]/g, ' ').trim().slice(0, 28) || 'Empleado';
-    let n = 2;
-    while (usados.has(nombre)) nombre = nombre.slice(0, 25) + ' ' + (n++);
-    usados.add(nombre);
-    XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filas, [11, 11, 5, 10, 10, 10, 26, 10, 16]), nombre);
+// ---------- Corrección del TOTAL del día por método de pago ----------
+// Para cuadrar contra el extracto (Nequi, datáfono) sin tocar pago por pago.
+// El reporte muestra el total real y los almuerzos de ese método pasan a ser
+// un aproximado (total ÷ precio del almuerzo).
+// El EFECTIVO no se corrige aquí: no tiene extracto contra el cual cuadrar, y
+// permitirlo dejaría a la cajera fijar el efectivo esperado al valor que tenga
+// la caja, con lo que el descuadre del cierre siempre daría cero y el dueño
+// perdería el control. El efectivo se cuadra contando la caja (base + cierre).
+const METODOS_AJUSTABLES = ['tarjeta', 'nequi', 'daviplata', 'qr_bancolombia'];
+
+app.get('/api/pagos/ajustes', requiere(2), (req, res) => {
+  const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.jornada || '')) ? req.query.jornada : jornadaHoy();
+  const r = reportes.resumenJornada(jornada);
+  res.json({ jornada, cerrada: jornadaCerrada(jornada), ajustables: METODOS_AJUSTABLES,
+    registrado: r.porMetodoRegistrado, real: r.porMetodo,
+    ajustados: r.ajustados, detalle: r.ajustesDetalle, almuerzos: r.almuerzosPorMetodo });
+});
+
+app.put('/api/pagos/ajustes', requiere(2), (req, res) => {
+  const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.jornada || '')) ? req.body.jornada : jornadaHoy();
+  if (jornadaCerrada(jornada)) return res.status(409).json({ error: 'Ese día ya tiene cierre de caja: no se puede corregir' });
+  const metodo = req.body.metodo;
+  if (metodo === 'efectivo') {
+    return res.status(400).json({ error: 'El efectivo no se corrige así: se cuadra contando la caja (base del día y cierre)' });
   }
-  enviarXlsx(res, libro, `nomina-${anio}.xlsx`);
+  if (!METODOS_AJUSTABLES.includes(metodo)) return res.status(400).json({ error: 'Método no válido' });
+  const registrado = db.prepare('SELECT COALESCE(SUM(monto), 0) AS t FROM pagos WHERE jornada = ? AND metodo = ?').get(jornada, metodo).t;
+  const crudo = String(req.body.total_real ?? '').trim();
+  const totalReal = crudo === '' ? null : aEntero(crudo);
+  if (totalReal !== null && (!Number.isFinite(totalReal) || totalReal < 0)) return res.status(400).json({ error: 'Valor no válido' });
+  if (totalReal === null || totalReal === registrado) {
+    // Vacío o igual a lo registrado: se quita la corrección y vuelve a ser exacto
+    db.prepare('DELETE FROM ajustes_metodo WHERE jornada = ? AND metodo = ?').run(jornada, metodo);
+    registrarHistorial(null, req.usuario.usuarioId, 'ajuste_metodo', `${jornada} ${metodo}: sin corrección`);
+  } else {
+    // Se guarda contra QUÉ se corrigió: la corrección vale como diferencia
+    db.prepare(`INSERT INTO ajustes_metodo (jornada, metodo, total_real, registrado, usuario_id, creado_en) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(jornada, metodo) DO UPDATE SET total_real = excluded.total_real, registrado = excluded.registrado, usuario_id = excluded.usuario_id, creado_en = excluded.creado_en`)
+      .run(jornada, metodo, totalReal, registrado, req.usuario.usuarioId, ahora());
+    registrarHistorial(null, req.usuario.usuarioId, 'ajuste_metodo', `${jornada} ${metodo}: registrado ${registrado} -> real ${totalReal}`);
+  }
+  io.emit('caja:actualizada');
+  const r = reportes.resumenJornada(jornada);
+  res.json({ ok: true, registrado, real: r.porMetodo[metodo] || 0, ajustado: !!r.ajustados[metodo], almuerzos: r.almuerzosPorMetodo[metodo] || null });
 });
 
 // Cuenta de venta para el cliente (documento informativo con los datos del negocio)
@@ -806,7 +722,10 @@ app.post('/api/cierre', requiere(2), async (req, res) => {
     const resultado = reportes.ejecutarCierre(jornadaHoy(), efectivo, req.usuario.usuarioId);
     io.emit('jornada:cerrada', { jornada: jornadaHoy() });
     // El cierre dispara el reporte por correo al dueño (con el arqueo incluido)
+    // y, si es fin de mes, los dos correos mensuales (nómina y resumen)
     reportes.encolarReporteDiario(jornadaHoy());
+    try { reportes.encolarReportesMensuales(jornadaHoy()); }
+    catch (e) { console.error('[reportes] No se pudieron armar los reportes mensuales:', e.message); }
     const envio = await reportes.drenarCorreos();
     // También empuja lo que quede pendiente hacia Google Sheets
     reportes.drenarSheets().catch(() => {});
@@ -820,12 +739,7 @@ app.post('/api/cierre', requiere(2), async (req, res) => {
 
 // Prueba de la conexión con Google Sheets: encola una fila de prueba y la envía ya
 app.post('/api/sheets/prueba', requiere(3), async (req, res) => {
-  reportes.encolarVentaSheets(
-    { jornada: jornadaHoy(), numero_comanda: 0, comensal: 'FILA DE PRUEBA', tipo_entrega: 'mesa', recargo: 0, total: 0 },
-    [{ cantidad: 1, plato_nombre: 'Conexión verificada desde el POS' }],
-    { metodo: 'efectivo', creado_en: ahora() },
-    req.usuario.nombre
-  );
+  reportes.encolarFilaPruebaSheets(reportes.nombreReporte(req.usuario.nombre, req.usuario.rol, true));
   const r = await reportes.drenarSheets();
   if (r.ok) res.json({ ok: true, enviados: r.enviados });
   else res.status(502).json({ error: r.error, pendientes: r.pendientes });
@@ -860,6 +774,16 @@ app.post('/api/reportes/enviar-ahora', requiere(3), (req, res) => {
   reportes.encolarReporteDiario(jornadaHoy());
   reportes.drenarCorreos().catch(() => {});
   res.json({ ok: true });
+});
+
+// (Re)enviar los dos correos mensuales de un mes dado (nómina + resumen)
+app.post('/api/reportes/enviar-mes', requiere(3), (req, res) => {
+  const mes = /^\d{4}-\d{2}$/.test(String(req.body.mes || '')) ? req.body.mes : jornadaHoy().slice(0, 7);
+  try {
+    reportes.encolarReportesMensuales(jornadaHoy(), mes);
+    reportes.drenarCorreos().catch(() => {});
+    res.json({ ok: true, mes });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ---------- Usuarios (solo admin) ----------

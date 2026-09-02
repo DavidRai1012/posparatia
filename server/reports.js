@@ -1,6 +1,6 @@
 // Reportes, cierre de caja, cola de correo del reporte diario y
 // sincronización con Google Sheets (vía webhook de Google Apps Script).
-const { db, ahora, jornadaHoy, getConfig } = require('./db');
+const { db, ahora, jornadaHoy, getConfig, setConfig } = require('./db');
 
 // Toda salida a internet lleva tope de tiempo. El restaurante navega por el
 // hotspot de un teléfono: cuando los datos se acaban o la señal se cae, la
@@ -57,14 +57,79 @@ function ventasPorPlato(desde, hasta) {
 }
 
 // ---- Resumen de una jornada ----
+// En los reportes, quien es administrador aparece con su cargo: el gerente del
+// restaurante también vende, y "Pepito Pérez (Administrador)" deja claro quién
+// es. `corto` da "(Admin)" para columnas estrechas (Google Sheets).
+function nombreReporte(nombre, rol, corto) {
+  return rol === 'admin' ? `${nombre} (${corto ? 'Admin' : 'Administrador'})` : nombre;
+}
+
+// Base de caja: el dinero con el que arrancó el día. La registrada hoy manda;
+// si no hay, se asume que lo contado en el cierre anterior sigue en la caja
+// (y si ayer no contaron, lo que el sistema esperaba que hubiera).
+function baseCajaDe(jornada) {
+  const reg = db.prepare(
+    `SELECT b.valor, u.nombre AS usuario FROM base_caja b LEFT JOIN usuarios u ON u.id = b.usuario_id WHERE b.jornada = ?`).get(jornada);
+  if (reg) return { valor: reg.valor, origen: 'registrada', usuario: reg.usuario, jornadaOrigen: jornada, incierta: false };
+  const ant = db.prepare('SELECT jornada, efectivo_contado, datos FROM cierres WHERE jornada < ? ORDER BY jornada DESC LIMIT 1').get(jornada);
+  if (!ant) return { valor: 0, origen: 'ninguna', jornadaOrigen: null, incierta: false, diasSinCierre: [] };
+  // Días con ventas entre ese cierre y hoy que quedaron SIN cerrar: su efectivo
+  // también está en la caja y nadie lo contó, así que la base es una suposición
+  // y hay que avisarlo en vez de dar un número falsamente exacto.
+  const diasSinCierre = db.prepare(
+    `SELECT DISTINCT p.jornada FROM pedidos p WHERE p.jornada > ? AND p.jornada < ?
+       AND NOT EXISTS (SELECT 1 FROM cierres c WHERE c.jornada = p.jornada) ORDER BY p.jornada`)
+    .all(ant.jornada, jornada).map(r => r.jornada);
+  const base = { jornadaOrigen: ant.jornada, incierta: diasSinCierre.length > 0, diasSinCierre };
+  if (ant.efectivo_contado !== null) return { ...base, valor: ant.efectivo_contado, origen: 'contado_anterior' };
+  let esperado = 0;
+  try { esperado = Number(JSON.parse(ant.datos).efectivoEsperado) || 0; } catch { }
+  return { ...base, valor: esperado, origen: 'esperado_anterior' };
+}
+
 function resumenJornada(jornada) {
   const pedidos = db.prepare(
-    `SELECT p.*, u.nombre AS vendedor FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
+    `SELECT p.*, u.nombre AS vendedor_nombre, u.rol AS vendedor_rol FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
      WHERE p.jornada = ?`).all(jornada);
+  for (const p of pedidos) p.vendedor = nombreReporte(p.vendedor_nombre, p.vendedor_rol);
   const pagos = db.prepare('SELECT * FROM pagos WHERE jornada = ?').all(jornada);
 
-  const porMetodo = {};
-  for (const pg of pagos) porMetodo[pg.metodo] = (porMetodo[pg.metodo] || 0) + pg.monto;
+  // Lo registrado pago a pago, y encima la corrección del TOTAL por método si
+  // la cajera la hizo (p. ej. el Nequi real según el extracto del banco)
+  const porMetodoRegistrado = {};
+  for (const pg of pagos) porMetodoRegistrado[pg.metodo] = (porMetodoRegistrado[pg.metodo] || 0) + pg.monto;
+  const porMetodo = { ...porMetodoRegistrado };
+  const ajustados = {}, ajustesDetalle = {};
+  for (const a of db.prepare('SELECT * FROM ajustes_metodo WHERE jornada = ?').all(jornada)) {
+    // Diferencia, no reemplazo: si después de corregir entra un pago, se anula
+    // uno o se rectifica su método, el total real se mueve con ellos.
+    const registradoAhora = porMetodoRegistrado[a.metodo] || 0;
+    const diferencia = a.total_real - a.registrado;
+    porMetodo[a.metodo] = Math.max(0, registradoAhora + diferencia);
+    ajustados[a.metodo] = true;
+    ajustesDetalle[a.metodo] = { diferencia, registradoAlCorregir: a.registrado, registradoAhora,
+      cambiaronPagos: registradoAhora !== a.registrado };
+  }
+
+  // Almuerzos por método de pago. Exacto: proteínas de los pedidos pagados con
+  // ese método. Si el total del método fue corregido a mano ya no se sabe a
+  // qué pedidos corresponde: se estima dividiendo por el precio del almuerzo
+  // y se marca APROXIMADO.
+  const almuerzosExactos = {};
+  for (const r of db.prepare(
+    `SELECT pg.metodo, SUM(pi.cantidad) AS n
+     FROM pagos pg JOIN pedidos p ON p.id = pg.pedido_id JOIN pedido_items pi ON pi.pedido_id = p.id
+     WHERE pg.jornada = ? AND p.estado != 'cancelado' AND pi.solo = 0
+       AND (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1)
+           IN ('proteina_dia', 'proteina_especial')
+     GROUP BY pg.metodo`).all(jornada)) almuerzosExactos[r.metodo] = r.n;
+  const precioAlmuerzo = Number(getConfig('precio_dia_entrada')) || 0;
+  const almuerzosPorMetodo = {};
+  for (const m of Object.keys(porMetodo)) {
+    almuerzosPorMetodo[m] = ajustados[m] && precioAlmuerzo
+      ? { cantidad: Math.round(porMetodo[m] / precioAlmuerzo), aproximado: true }
+      : { cantidad: almuerzosExactos[m] || 0, aproximado: false };
+  }
 
   const porVendedor = {};
   for (const p of pedidos) {
@@ -82,9 +147,10 @@ function resumenJornada(jornada) {
   const nominaDia = db.prepare(
     `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
      WHERE n.jornada = ? AND n.estado = 'confirmado'`).all(jornada);
-  const ventasEfectivo = pagos.filter(pg => pg.metodo === 'efectivo').reduce((s, pg) => s + pg.monto, 0);
+  const ventasEfectivo = porMetodo.efectivo || 0; // el real, si el total fue corregido
   const totalGastos = gastos.reduce((s, g) => s + g.valor, 0);
   const totalNomina = nominaDia.reduce((s, n) => s + n.total, 0);
+  const baseCaja = baseCajaDe(jornada);
 
   // Almuerzos vs extras: cada proteína vendida = un almuerzo; entradas y bebidas
   // (normalmente en $0) suman al almuerzo; lo demás cuenta como extras
@@ -105,13 +171,15 @@ function resumenJornada(jornada) {
   return {
     jornada,
     totalVentas: efectivos.reduce((s, p) => s + p.total, 0),
-    totalCobrado: pagos.reduce((s, pg) => s + pg.monto, 0),
+    totalCobrado: Object.values(porMetodo).reduce((s, v) => s + v, 0), // con los totales corregidos
+    totalCobradoRegistrado: pagos.reduce((s, pg) => s + pg.monto, 0),
     numPedidos: efectivos.length,
     numCancelados: cancelados.length,
     totalCancelado: cancelados.reduce((s, p) => s + p.total, 0),
     totalRecargos: efectivos.reduce((s, p) => s + p.recargo, 0),
     totalRecargoTarjeta: pagos.reduce((s, pg) => s + (pg.recargo_tarjeta || 0), 0),
-    porMetodo, porVendedor,
+    porMetodo, porMetodoRegistrado, ajustados, ajustesDetalle, almuerzosPorMetodo, porVendedor,
+    baseCaja, ventasEfectivo,
     porCobrar: porCobrar.map(p => ({ id: p.id, numero_comanda: p.numero_comanda, comensal: p.comensal, total: p.total, vendedor: p.vendedor })),
     gastos: gastos.map(g => ({ id: g.id, concepto: g.concepto, valor: g.valor, usuario: g.usuario })),
     totalGastos,
@@ -120,9 +188,123 @@ function resumenJornada(jornada) {
     numAlmuerzos, totalAlmuerzos, totalExtras,
     // Detalle de qué se vendió (por plato y por tipo de proteína)
     ...(() => { const v = ventasPorPlato(jornada, jornada); return { porPlato: v.platos, porGrupo: v.grupos }; })(),
-    // Efectivo que debería haber físicamente: ventas en efectivo menos lo que salió de la caja
-    efectivoEsperado: ventasEfectivo - totalGastos - totalNomina
+    // Efectivo que debería haber físicamente: lo que había al arrancar, más las
+    // ventas en efectivo, menos lo que salió de la caja
+    efectivoEsperado: baseCaja.valor + ventasEfectivo - totalGastos - totalNomina
   };
+}
+
+// ---- Resumen de un mes ('YYYY-MM'): suma de los resúmenes de cada día ----
+// Se arma día por día para respetar las correcciones de totales y la base de
+// caja de cada jornada, exactamente como salieron en los reportes diarios.
+function resumenMes(mes) {
+  const desde = mes + '-01', hasta = mes + '-31';
+  const jornadas = [...new Set([
+    ...db.prepare('SELECT DISTINCT jornada FROM pedidos WHERE jornada >= ? AND jornada <= ?').all(desde, hasta).map(r => r.jornada),
+    ...db.prepare('SELECT DISTINCT jornada FROM gastos WHERE jornada >= ? AND jornada <= ?').all(desde, hasta).map(r => r.jornada),
+    ...db.prepare("SELECT DISTINCT jornada FROM nomina WHERE estado = 'confirmado' AND jornada >= ? AND jornada <= ?").all(desde, hasta).map(r => r.jornada),
+    ...db.prepare('SELECT DISTINCT jornada FROM cierres WHERE jornada >= ? AND jornada <= ?').all(desde, hasta).map(r => r.jornada)
+  ])].sort();
+  const cierres = new Map(db.prepare('SELECT * FROM cierres WHERE jornada >= ? AND jornada <= ?').all(desde, hasta).map(c => [c.jornada, c]));
+
+  const acumulado = {
+    mes, desde, hasta, dias: [],
+    totalVentas: 0, totalCobrado: 0, numPedidos: 0, numCancelados: 0, totalCancelado: 0,
+    numAlmuerzos: 0, totalAlmuerzos: 0, totalExtras: 0, totalRecargos: 0, totalRecargoTarjeta: 0,
+    porMetodo: {}, porMetodoRegistrado: {}, ajustados: {}, almuerzosPorMetodo: {}, porVendedor: {},
+    gastos: [], totalGastos: 0, nomina: [], totalNomina: 0, porCobrar: []
+  };
+  const nominaPorEmpleado = new Map();
+  for (const j of jornadas) {
+    const r = resumenJornada(j);
+    const cierre = cierres.get(j);
+    acumulado.dias.push({
+      jornada: j, totalVentas: r.totalVentas, totalCobrado: r.totalCobrado, numPedidos: r.numPedidos,
+      numAlmuerzos: r.numAlmuerzos, totalGastos: r.totalGastos, totalNomina: r.totalNomina,
+      baseCaja: r.baseCaja.valor, efectivoEsperado: r.efectivoEsperado,
+      efectivoContado: cierre ? cierre.efectivo_contado : null, descuadre: cierre ? cierre.descuadre : null,
+      conCierre: !!cierre
+    });
+    for (const k of ['totalVentas', 'totalCobrado', 'numPedidos', 'numCancelados', 'totalCancelado', 'numAlmuerzos',
+                     'totalAlmuerzos', 'totalExtras', 'totalRecargos', 'totalRecargoTarjeta', 'totalGastos', 'totalNomina']) {
+      acumulado[k] += r[k];
+    }
+    for (const [m, v] of Object.entries(r.porMetodo)) {
+      acumulado.porMetodo[m] = (acumulado.porMetodo[m] || 0) + v;
+      acumulado.porMetodoRegistrado[m] = (acumulado.porMetodoRegistrado[m] || 0) + (r.porMetodoRegistrado[m] || 0);
+      if (r.ajustados[m]) acumulado.ajustados[m] = true;
+      const a = acumulado.almuerzosPorMetodo[m] || { cantidad: 0, aproximado: false };
+      a.cantidad += (r.almuerzosPorMetodo[m] || { cantidad: 0 }).cantidad;
+      a.aproximado = a.aproximado || !!(r.almuerzosPorMetodo[m] && r.almuerzosPorMetodo[m].aproximado);
+      acumulado.almuerzosPorMetodo[m] = a;
+    }
+    for (const [v, d] of Object.entries(r.porVendedor)) {
+      const acc = acumulado.porVendedor[v] || { pedidos: 0, total: 0, cancelados: 0 };
+      acc.pedidos += d.pedidos; acc.total += d.total; acc.cancelados += d.cancelados;
+      acumulado.porVendedor[v] = acc;
+    }
+    for (const g of r.gastos) acumulado.gastos.push({ ...g, jornada: j });
+    for (const n of r.nomina) {
+      const e = nominaPorEmpleado.get(n.empleado) || { empleado: n.empleado, turnos: 0, total: 0, descuentos: 0, bonos: 0 };
+      e.turnos++; e.total += n.total; e.descuentos += n.descuento; e.bonos += n.bono;
+      nominaPorEmpleado.set(n.empleado, e);
+    }
+    for (const p of r.porCobrar) acumulado.porCobrar.push({ ...p, jornada: j });
+  }
+  acumulado.nomina = [...nominaPorEmpleado.values()].sort((a, b) => b.total - a.total);
+  const v = ventasPorPlato(desde, hasta);
+  acumulado.porPlato = v.platos;
+  acumulado.porGrupo = v.grupos;
+  acumulado.diasConVentas = acumulado.dias.filter(d => d.numPedidos > 0).length;
+  return acumulado;
+}
+
+// ---- Ventas una a una (formato compartido por el Excel del día, el del mes y Google Sheets) ----
+const ETIQUETAS_METODO = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', nequi: 'Nequi', daviplata: 'Daviplata',
+  qr_bancolombia: 'QR Bancolombia', tarjeta_debito: 'Tarjeta débito', tarjeta_credito: 'Tarjeta crédito', billetera: 'Billetera' };
+
+const itemsConTipo = db.prepare(
+  `SELECT pi.*, (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo
+   FROM pedido_items pi WHERE pi.pedido_id = ?`);
+
+function filaVenta(p, items, corto) {
+  const porTipo = { entrada: [], proteina: [], bebida: [], extra: [] };
+  for (const it of items) {
+    const clave = it.tipo === 'entrada' ? 'entrada'
+      : (it.tipo === 'proteina_dia' || it.tipo === 'proteina_especial') ? 'proteina'
+      : it.tipo === 'bebida' ? 'bebida' : 'extra';
+    // Un plato del día vendido solo (sin entrada) va con los extras, que es como se cobra
+    (it.solo ? porTipo.extra : porTipo[clave]).push(`${it.cantidad > 1 ? it.cantidad + 'x ' : ''}${it.plato_nombre}${it.solo ? ' (solo)' : ''}`);
+  }
+  const cancelado = p.estado === 'cancelado';
+  return {
+    fecha: p.jornada,
+    dia: Number(p.jornada.slice(8, 10)),
+    hora: ((p.pagado_en || p.creado_en) || '').slice(11, 16),
+    comanda: p.numero_comanda,
+    vendedor: nombreReporte(p.vendedor_nombre, p.vendedor_rol, corto),
+    entrega: p.tipo_entrega === 'llevar' ? 'Domicilio' : 'Local',
+    entrada: porTipo.entrada.join(' | '), proteina: porTipo.proteina.join(' | '),
+    bebida: porTipo.bebida.join(' | '), extras: porTipo.extra.join(' | '),
+    metodo: p.metodo ? (ETIQUETAS_METODO[p.metodo] || p.metodo) : '',
+    metodo_clave: p.metodo || null,
+    recargo: (p.recargo || 0) + (p.recargo_tarjeta || 0),
+    recargo_domicilio: p.recargo || 0, recargo_tarjeta: p.recargo_tarjeta || 0,
+    estado: cancelado ? 'ANULADA' : (p.metodo ? 'PAGADA' : 'POR COBRAR'),
+    total: cancelado ? 0 : (p.cobrado ?? p.total)
+  };
+}
+
+const pedidosConPago = (filtro) => db.prepare(
+  `SELECT p.*, u.nombre AS vendedor_nombre, u.rol AS vendedor_rol,
+          pg.metodo, pg.monto AS cobrado, pg.recargo_tarjeta, pg.creado_en AS pagado_en
+   FROM pedidos p JOIN usuarios u ON u.id = p.vendedor_id
+   LEFT JOIN pagos pg ON pg.pedido_id = p.id
+   WHERE ${filtro} ORDER BY p.jornada, p.numero_comanda`);
+
+function filasVentas(desde, hasta) {
+  return pedidosConPago('p.jornada >= ? AND p.jornada <= ?').all(desde, hasta)
+    .map(p => filaVenta(p, itemsConTipo.all(p.id)));
 }
 
 // ---- Cierre de caja ----
@@ -143,79 +325,51 @@ function ejecutarCierre(jornada, efectivoContado, usuarioId) {
   return { ...resumen, efectivoSistema: resumen.porMetodo.efectivo || 0, efectivoContado, descuadre };
 }
 
-// ---- Reporte diario por correo ----
-function textoReporte(resumen) {
-  const fmt = n => '$' + Number(n || 0).toLocaleString('es-CO');
-  const lineas = [
-    `REPORTE DIARIO - ${getConfig('nombre_restaurante')} - Jornada ${resumen.jornada}`,
-    '',
-    `Ventas totales: ${fmt(resumen.totalVentas)} (${resumen.numPedidos} pedidos)`,
-    `  - Almuerzos completos: ${resumen.numAlmuerzos} por ${fmt(resumen.totalAlmuerzos)}`,
-    `  - Extras: ${fmt(resumen.totalExtras)}`,
-    `Cobrado: ${fmt(resumen.totalCobrado)}`,
-    `Cancelados: ${resumen.numCancelados} por ${fmt(resumen.totalCancelado)}`,
-    `Recargos por empaque: ${fmt(resumen.totalRecargos)}`,
-    '',
-    'Por método de pago:'
-  ];
-  for (const [m, v] of Object.entries(resumen.porMetodo)) lineas.push(`  - ${m}: ${fmt(v)}`);
-  if (resumen.totalRecargoTarjeta) lineas.push(`  (incluye ${fmt(resumen.totalRecargoTarjeta)} de recargos por tarjeta)`);
-  lineas.push('', 'Por vendedor:');
-  for (const [v, d] of Object.entries(resumen.porVendedor)) {
-    lineas.push(`  - ${v}: ${d.pedidos} pedidos, ${fmt(d.total)} (cancelados: ${d.cancelados})`);
-  }
-  // Lo que sirve para decidir las compras del día siguiente
-  if (resumen.porGrupo && resumen.porGrupo.length) {
-    lineas.push('', 'ALMUERZOS POR TIPO (para las compras):');
-    for (const g of resumen.porGrupo) {
-      lineas.push(`  - ${g.grupo}: ${g.cantidad}${g.solos ? ` (${g.solos} sin entrada)` : ''} = ${fmt(g.total)}`);
-    }
-  }
-  if (resumen.porPlato && resumen.porPlato.length) {
-    const proteinas = resumen.porPlato.filter(p => p.tipo === 'proteina_dia' || p.tipo === 'proteina_especial');
-    if (proteinas.length) {
-      lineas.push('', 'PROTEINAS VENDIDAS (de la más vendida a la menos):');
-      for (const p of proteinas) {
-        lineas.push(`  - ${p.cantidad} x ${p.nombre}${p.grupo ? ` [${p.grupo}]` : ''} = ${fmt(p.total)}`);
-      }
-    }
-  }
-  if (resumen.gastos.length) {
-    lineas.push('', `GASTOS DEL LOCAL (${fmt(resumen.totalGastos)}):`);
-    for (const g of resumen.gastos) lineas.push(`  - ${g.concepto}: ${fmt(g.valor)} (registró ${g.usuario})`);
-  }
-  if (resumen.nomina.length) {
-    lineas.push('', `NOMINA PAGADA (${fmt(resumen.totalNomina)}):`);
-    for (const n of resumen.nomina) {
-      lineas.push(`  - ${n.empleado}: turno ${fmt(n.turno)}${n.descuento ? `, descuento -${fmt(n.descuento)}` : ''}${n.bono ? `, bono +${fmt(n.bono)}` : ''} = ${fmt(n.total)}${n.concepto ? ` (${n.concepto})` : ''}`);
-    }
-  }
-  lineas.push('', `Efectivo esperado en caja: ${fmt(resumen.efectivoEsperado)}`);
-  lineas.push('(ventas en efectivo menos gastos y nómina)');
-  if (resumen.porCobrar.length) {
-    lineas.push('', 'PENDIENTES DE COBRO:');
-    for (const p of resumen.porCobrar) lineas.push(`  - Comanda ${p.numero_comanda}: ${fmt(p.total)}`);
-  }
-  return lineas.join('\n');
+// ---- Correos: reporte diario y reportes mensuales ----
+// El contenido (texto, HTML y los Excel adjuntos) lo arma informes.js; aquí
+// solo se encola. Los adjuntos van en base64 para que esperen sin internet.
+function encolarCorreo(jornada, correo) {
+  db.prepare('INSERT INTO cola_correos (jornada, asunto, cuerpo, html, adjuntos, estado, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(jornada, correo.asunto, correo.texto, correo.html || null,
+         correo.adjuntos && correo.adjuntos.length ? JSON.stringify(correo.adjuntos) : null, 'pendiente', ahora());
 }
 
 function encolarReporteDiario(jornada) {
-  const resumen = resumenJornada(jornada);
-  const asunto = `Reporte diario ${jornada} - ${getConfig('nombre_restaurante')}`;
-  let cuerpo = textoReporte(resumen);
-  // Si la jornada ya tiene cierre de caja, el reporte incluye el arqueo
-  const cierre = db.prepare('SELECT * FROM cierres WHERE jornada = ?').get(jornada);
-  if (cierre) {
-    const fmt = n => '$' + Number(n || 0).toLocaleString('es-CO');
-    const efectivoSistema = (JSON.parse(cierre.datos).porMetodo || {}).efectivo || 0;
-    cuerpo += `\n\nCIERRE DE CAJA:\n  Efectivo según sistema: ${fmt(efectivoSistema)}`;
-    if (cierre.efectivo_contado !== null) {
-      cuerpo += `\n  Efectivo contado: ${fmt(cierre.efectivo_contado)}`;
-      cuerpo += `\n  Descuadre: ${cierre.descuadre === 0 ? 'caja cuadrada' : (cierre.descuadre > 0 ? 'sobran ' : 'faltan ') + fmt(Math.abs(cierre.descuadre))}`;
+  const informes = require('./informes');
+  encolarCorreo(jornada, informes.correoDiario(jornada));
+}
+
+// El último día del mes (o el primer cierre después, si ese día no abrieron)
+// salen dos correos más: la nómina del mes y el resumen del mes con todas las
+// ventas. Cada mes se reporta una sola vez.
+function mesesPorReportar(jornada) {
+  let reportados = [];
+  try { reportados = JSON.parse(getConfig('meses_reportados') || '[]'); } catch { }
+  const [anio, mes, dia] = jornada.split('-').map(Number);
+  const ultimoDia = new Date(anio, mes, 0).getDate();
+  const candidatos = new Set();
+  if (dia === ultimoDia) candidatos.add(jornada.slice(0, 7));
+  // Meses anteriores con ventas que quedaron sin reportar (máximo los 2 últimos,
+  // para que la primera vez no salga un correo por cada mes viejo)
+  const limite = new Date(anio, mes - 3, 1).toLocaleDateString('sv-SE').slice(0, 7);
+  for (const r of db.prepare('SELECT DISTINCT substr(jornada, 1, 7) AS m FROM pedidos WHERE substr(jornada, 1, 7) < ? AND substr(jornada, 1, 7) >= ?')
+      .all(jornada.slice(0, 7), limite)) candidatos.add(r.m);
+  return [...candidatos].filter(m => !reportados.includes(m)).sort();
+}
+
+function encolarReportesMensuales(jornada, forzarMes) {
+  const informes = require('./informes');
+  const meses = forzarMes ? [forzarMes] : mesesPorReportar(jornada);
+  for (const mes of meses) {
+    for (const correo of informes.correosMensuales(mes)) encolarCorreo(jornada, correo);
+    if (!forzarMes) {
+      let reportados = [];
+      try { reportados = JSON.parse(getConfig('meses_reportados') || '[]'); } catch { }
+      if (!reportados.includes(mes)) setConfig('meses_reportados', JSON.stringify([...reportados, mes]));
     }
+    console.log(`[reportes] Reportes mensuales de ${mes} encolados`);
   }
-  db.prepare('INSERT INTO cola_correos (jornada, asunto, cuerpo, estado, creado_en) VALUES (?, ?, ?, ?, ?)')
-    .run(jornada, asunto, cuerpo, 'pendiente', ahora());
+  return meses;
 }
 
 async function drenarCorreos() {
@@ -237,12 +391,18 @@ async function drenarCorreos() {
   let enviados = 0;
   for (const correo of pendientes) {
     try {
+      const retraso = correo.jornada !== jornadaHoy() ? `(Enviado con retraso; corresponde a la jornada ${correo.jornada})` : '';
+      let adjuntos = [];
+      try { adjuntos = JSON.parse(correo.adjuntos || '[]'); } catch { }
       await transporte.sendMail({
         from: usuario, to: destino,
         subject: correo.asunto,
-        text: correo.cuerpo + (correo.jornada !== jornadaHoy() ? `\n\n(Enviado con retraso; corresponde a la jornada ${correo.jornada})` : '')
+        text: correo.cuerpo + (retraso ? `\n\n${retraso}` : ''),
+        html: correo.html ? correo.html + (retraso ? `<p style="color:#888">${retraso}</p>` : '') : undefined,
+        attachments: adjuntos.map(a => ({ filename: a.nombre, content: Buffer.from(a.base64, 'base64') }))
       });
-      db.prepare("UPDATE cola_correos SET estado = 'enviado', enviado_en = ? WHERE id = ?").run(ahora(), correo.id);
+      // Los adjuntos ya cumplieron: se sueltan para no engordar la base de datos
+      db.prepare("UPDATE cola_correos SET estado = 'enviado', enviado_en = ?, adjuntos = NULL WHERE id = ?").run(ahora(), correo.id);
       enviados++;
       console.log(`[reportes] Correo enviado: ${correo.asunto}`);
     } catch (err) {
@@ -254,22 +414,50 @@ async function drenarCorreos() {
 }
 
 // ---- Google Sheets (webhook de Apps Script, sin OAuth para mantenerlo simple) ----
-function encolarVentaSheets(pedido, items, pago, vendedor) {
-  // Privacidad: el nombre del comensal NUNCA se envía a Google Sheets
+// Cada venta pagada va a la hoja de su mes ("09-2026") con el mismo formato
+// del Excel: Día, Hora, Comanda, Vendedor, Entrega, Entrada, Proteína, Bebida,
+// Extras, Método de pago, Recargo, Total. Privacidad: el nombre del comensal
+// NUNCA se envía.
+function payloadSheets(f) {
+  return {
+    // Campos del formato NUEVO (una hoja por mes)
+    hoja: `${f.fecha.slice(5, 7)}-${f.fecha.slice(0, 4)}`,
+    dia: f.dia, hora: f.hora, comanda: f.comanda, vendedor: f.vendedor, entrega: f.entrega,
+    entrada: f.entrada, proteina: f.proteina, bebida: f.bebida, extras: f.extras,
+    metodo: f.metodo,                 // etiqueta: "Nequi"
+    recargo_total: f.recargo,         // domicilio + tarjeta, la columna "Recargo"
+    total: f.total,
+    // Campos del script ANTERIOR, con EXACTAMENTE el mismo significado de antes,
+    // para que la hoja vieja siga bien mientras el cliente actualiza el script:
+    // recargo = solo domicilio (el script viejo suma aparte recargo_tarjeta),
+    // metodo_pago = clave ('nequi'), tipo_entrega = 'mesa' | 'llevar'.
+    fecha: f.fecha,
+    metodo_pago: f.metodo_clave || '',
+    tipo_entrega: f.entrega === 'Domicilio' ? 'llevar' : 'mesa',
+    recargo: f.recargo_domicilio,
+    recargo_tarjeta: f.recargo_tarjeta,
+    detalle: [f.entrada, f.proteina, f.bebida, f.extras].filter(Boolean).join('; ')
+  };
+}
+
+function encolarVentaSheets(pedidoId) {
+  const p = pedidosConPago('p.id = ?').get(pedidoId);
+  if (!p || !p.metodo) return;
+  const fila = filaVenta(p, itemsConTipo.all(p.id), true);
+  db.prepare('INSERT INTO cola_sheets (payload, estado, creado_en) VALUES (?, ?, ?)')
+    .run(JSON.stringify(payloadSheets(fila)), 'pendiente', ahora());
+}
+
+// Fila de prueba para verificar la conexión desde Admin
+function encolarFilaPruebaSheets(vendedor) {
+  const hoy = jornadaHoy();
   const fila = {
-    fecha: pedido.jornada,
-    hora: (pago.creado_en || '').slice(11, 16),
-    comanda: pedido.numero_comanda,
-    vendedor,
-    tipo_entrega: pedido.tipo_entrega,
-    detalle: items.map(i => `${i.cantidad}x ${i.plato_nombre}`).join('; '),
-    metodo_pago: pago.metodo,
-    recargo: pedido.recargo,
-    recargo_tarjeta: pago.recargo_tarjeta || 0,
-    total: pedido.total + (pago.recargo_tarjeta || 0)
+    fecha: hoy, dia: Number(hoy.slice(8, 10)), hora: ahora().slice(11, 16), comanda: 0, vendedor,
+    entrega: 'Local', entrada: 'FILA DE PRUEBA', proteina: 'Conexión verificada desde el POS', bebida: '', extras: '',
+    metodo: 'Efectivo', metodo_clave: 'efectivo', recargo: 0, recargo_domicilio: 0, recargo_tarjeta: 0, total: 0
   };
   db.prepare('INSERT INTO cola_sheets (payload, estado, creado_en) VALUES (?, ?, ?)')
-    .run(JSON.stringify(fila), 'pendiente', ahora());
+    .run(JSON.stringify(payloadSheets(fila)), 'pendiente', ahora());
 }
 
 async function drenarSheets() {
@@ -357,4 +545,8 @@ function iniciarPlanificador() {
   }, 30000);
 }
 
-module.exports = { resumenJornada, ventasPorPlato, ejecutarCierre, encolarReporteDiario, encolarVentaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync, hayInternet };
+module.exports = {
+  resumenJornada, resumenMes, ventasPorPlato, filasVentas, nombreReporte, baseCajaDe, ETIQUETAS_METODO,
+  ejecutarCierre, encolarReporteDiario, encolarReportesMensuales, mesesPorReportar,
+  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync, hayInternet
+};

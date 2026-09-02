@@ -18,20 +18,31 @@ Se hace UNA sola vez y toma unos 15 minutos. Necesita una cuenta de Google (Gmai
 3. Borre todo lo que aparece en el editor y pegue exactamente esto:
 
 ```javascript
+// POS Restaurante - recibe cada venta pagada y la anota en la hoja de su mes
 function doPost(e) {
-  const hoja = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
-  if (hoja.getLastRow() === 0) {
-    hoja.appendRow(['Fecha', 'Hora', 'Comanda', 'Vendedor', 'Tipo entrega',
-                    'Detalle', 'Método de pago', 'Domicilio', 'Recargo tarjeta', 'Total']);
-  }
+  const libro = SpreadsheetApp.getActiveSpreadsheet();
+  const CABECERA = ['Día', 'Hora', 'Comanda', 'Vendedor', 'Entrega', 'Entrada', 'Proteína',
+                    'Bebida', 'Extras', 'Método de pago', 'Recargo', 'Total'];
   const filas = JSON.parse(e.postData.contents).filas;
   for (const f of filas) {
-    hoja.appendRow([f.fecha, f.hora, f.comanda, f.vendedor, f.tipo_entrega,
-                    f.detalle, f.metodo_pago, f.recargo, f.recargo_tarjeta, f.total]);
+    const nombre = f.hoja || 'Ventas';          // una hoja por mes: "09-2026"
+    let hoja = libro.getSheetByName(nombre);
+    if (!hoja) {
+      hoja = libro.insertSheet(nombre, 0);       // el mes nuevo queda de primero
+      hoja.appendRow(CABECERA);
+      hoja.setFrozenRows(1);
+    }
+    hoja.appendRow([f.dia, f.hora, f.comanda, f.vendedor, f.entrega, f.entrada, f.proteina,
+                    f.bebida, f.extras, f.metodo, f.recargo_total, f.total]);
   }
   return ContentService.createTextOutput('ok');
 }
 ```
+
+> Cada mes tendrá su propia pestaña (por ejemplo **09-2026**) con las columnas:
+> Día · Hora · Comanda · Vendedor (el administrador aparece como "Pepito Pérez (Admin)") ·
+> Entrega (Local / Domicilio) · Entrada · Proteína · Bebida · Extras · Método de pago ·
+> Recargo (domicilio + tarjeta) · Total. El nombre del cliente nunca se envía.
 
 4. Guarde (icono del disquete) y luego: **Implementar → Nueva implementación**.
 5. En el engranaje ⚙️ elija tipo **Aplicación web** y configure:
@@ -115,3 +126,29 @@ El botón "📊 Probar Google Sheets" ahora dice exactamente qué pasó:
 > El internet NO afecta la app local: los teléfonos siguen tomando pedidos y
 > la impresora sigue imprimiendo aunque no haya datos. Todo lo de internet
 > (Sheets y correo) espera en cola y sale solo cuando vuelva la señal.
+
+---
+
+## Si ya tenía la hoja de la versión anterior (una sola pestaña)
+
+El formato cambió a **una pestaña por mes**. Hay dos caminos:
+
+**A) Actualizar el script en la misma hoja (la URL no cambia):**
+1. Abra la hoja → **Extensiones → Apps Script** → borre todo y pegue el script nuevo de arriba → Guardar.
+2. **Implementar → Administrar implementaciones → ✏️ (editar) → Versión: "Nueva versión" → Implementar.**
+3. Listo: la URL del POS sigue siendo la misma. Las ventas nuevas caen en la pestaña del mes;
+   la pestaña vieja queda como historial.
+
+**B) Hoja nueva desde cero:** siga la Parte 1 completa; al final pegue la URL nueva en el POS
+(Admin → URL del webhook) y pruebe con "📊 Probar Google Sheets".
+
+## Qué correos llegan y cuándo
+
+| Cuándo | Correo | Adjuntos |
+|---|---|---|
+| Cada **cierre de caja** | Reporte diario (ventas, métodos de pago con almuerzos por método, vendedores, tipos de proteína, gastos, nómina, caja) | `resumen-FECHA.xlsx` (hoja 1: el mismo resumen · hoja 2: ventas una a una). Si ese día se pagó nómina, también `nomina-AÑO.xlsx` (una hoja por mes). |
+| **Último día del mes** (o el primer cierre después, si ese día no abrieron) | Nómina del mes | `nomina-AÑO-MES.xlsx` (hoja RESUMEN + la del mes, por empleado) |
+| Ídem | Resumen mensual | `resumen-AÑO-MES.xlsx` (hoja 1: resumen con tabla día por día · hoja 2: todas las ventas del mes · platos · tipos · gastos) |
+
+Desde **Admin** se puede reenviar el reporte de hoy ("📨 Enviar reporte ahora") y los dos
+correos de cualquier mes ("📅 Enviar reportes del mes").
