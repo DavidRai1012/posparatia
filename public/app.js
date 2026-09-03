@@ -1698,7 +1698,7 @@ function renderMenu() {
       </div>
       <label class="check-linea" id="np-default-caja">
         <input type="checkbox" id="np-default" ${nuevo.usaDefault ? 'checked' : ''}>
-        <span>Usar el precio por defecto (<b id="np-default-txt"></b>)</span>
+        <span>Usar el precio por defecto (<b id="np-default-txt"></b>) — no hay que escribir precio</span>
       </label>
       <div class="fila" id="np-precios" style="margin-top:8px">
         <div class="crece"><label>Precio con entrada</label>
@@ -1816,22 +1816,26 @@ function renderMenu() {
     }).join('')}`;
 
   // El tipo de compras y el precio por defecto solo aplican a proteínas
-  const sincronizarFormNuevo = () => {
+  const sincronizarFormNuevo = (cambioDeClase) => {
     nuevo.tipo = $('#np-tipo').value;
     nuevo.grupo = $('#np-grupo') ? $('#np-grupo').value : '';
     const lleva = LLEVA_GRUPO(nuevo.tipo);
     const def = preciosDefault()[nuevo.tipo];
-    if (!lleva) $('#np-default').checked = false;
+    // Al cambiar de clase, el precio por defecto vuelve a quedar marcado si esa
+    // clase lo tiene. Antes, pasar por "Entrada" (que no lo tiene) lo dejaba
+    // desmarcado para siempre y volvía a pedir el precio de cada almuerzo.
+    if (cambioDeClase) $('#np-default').checked = lleva;
+    else if (!lleva) $('#np-default').checked = false;
     nuevo.usaDefault = $('#np-default').checked;
     $('#np-grupo-caja').style.display = lleva ? '' : 'none';
     $('#np-default-caja').style.display = lleva ? '' : 'none';
     if (def) $('#np-default-txt').textContent = `${fmt(def.precio)} con entrada · ${fmt(def.solo)} solo`;
     $('#np-precios').style.display = nuevo.usaDefault ? 'none' : '';
   };
-  $('#np-tipo').onchange = sincronizarFormNuevo;
-  $('#np-default').onchange = sincronizarFormNuevo;
-  if ($('#np-grupo')) $('#np-grupo').onchange = sincronizarFormNuevo;
-  sincronizarFormNuevo();
+  $('#np-tipo').onchange = () => sincronizarFormNuevo(true);
+  $('#np-default').onchange = () => sincronizarFormNuevo(false);
+  if ($('#np-grupo')) $('#np-grupo').onchange = () => sincronizarFormNuevo(false);
+  sincronizarFormNuevo(false);
   if (zona) zona.scrollTop = scrollPrevio;
   // Tras agregar un plato el menú se redibuja solo: hay que devolver el cursor
   if (state.enfocarNuevoPlato) { state.enfocarNuevoPlato = false; $('#np-nombre').focus(); }
@@ -2247,8 +2251,9 @@ async function renderAdmin(usarCache) {
       </div>
       <div class="fila" style="margin-top:10px">
         <button class="btn-mini primario" id="btn-reporte-ahora">📨 Enviar reporte ahora</button>
-        <button class="btn-mini primario" id="btn-sheets-prueba">📊 Probar Google Sheets</button>
+        <button class="btn-mini primario" id="btn-sheets-diag">🔎 Revisar Google Sheets</button>
       </div>
+      <div id="sheets-diag"></div>
       <div class="fila" style="margin-top:8px">
         <input id="cf-mes-reporte" type="month" value="${state.jornada.slice(0, 7)}" style="flex:1">
         <button class="btn-mini primario" id="btn-reporte-mes" style="flex:1.4">📅 Enviar reportes del mes</button>
@@ -2345,12 +2350,26 @@ async function renderAdmin(usarCache) {
     try { const r = await api('/reportes/enviar-mes', { method: 'POST', body: { mes } }); toast(`Reportes de ${r.mes} encolados para envío`); }
     catch (e) { toast(e.message, true); }
   };
-  $('#btn-sheets-prueba').onclick = async () => {
-    toast('Enviando fila de prueba a Google Sheets...');
-    try {
-      const r = await api('/sheets/prueba', { method: 'POST' });
-      toast(`✅ ${r.enviados} fila(s) llegaron a Google Sheets. Revise la hoja.`);
-    } catch (e) { toast('❌ ' + e.message, true); }
+  // Solucionador: revisa paso por paso y dice qué corregir
+  $('#btn-sheets-diag').onclick = async () => {
+    const caja = $('#sheets-diag');
+    caja.innerHTML = '<div class="suave" style="margin-top:10px">🔎 Revisando (puede tardar unos segundos)...</div>';
+    let d;
+    try { d = await api('/sheets/diagnostico', { method: 'POST' }); }
+    catch (e) { caja.innerHTML = `<div class="suave" style="margin-top:10px;color:var(--peligro)">${esc(e.message)}</div>`; return; }
+    if (state.vista !== 'admin') return;
+    caja.innerHTML = `
+      <div class="tarjeta" style="margin-top:10px;border-color:${d.resumen.startsWith('✅') ? 'var(--ok)' : 'var(--alerta)'}">
+        <b>${esc(d.resumen)}</b>
+        ${d.pasos.map(p => `
+          <div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--borde)">
+            <div class="fila"><span>${p.ok ? '✅' : '❌'} <b>${esc(p.paso)}</b></span></div>
+            <div class="suave" style="word-break:break-all">${esc(p.detalle)}</div>
+            ${p.consejo ? `<div class="suave" style="color:var(--alerta);margin-top:3px">→ ${esc(p.consejo)}</div>` : ''}
+          </div>`).join('')}
+        ${d.ultimoOk ? `<div class="suave" style="margin-top:8px">Última venta subida: ${esc(d.ultimoOk)}</div>` : ''}
+        ${d.ultimoError ? `<div class="suave" style="color:var(--peligro)">Último error: ${esc(d.ultimoError)}</div>` : ''}
+      </div>`;
   };
   $('#btn-nuevo-usuario').onclick = async () => {
     try {

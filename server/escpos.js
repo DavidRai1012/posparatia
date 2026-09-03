@@ -13,6 +13,8 @@
 
 const ESC = 0x1b, GS = 0x1d;
 
+const fmtCop = (n) => '$' + Number(n || 0).toLocaleString('es-CO');
+
 // Las impresoras térmicas económicas suelen usar CP437 sin acentos:
 // transliteramos para que el ticket nunca salga con caracteres basura.
 function transliterar(s) {
@@ -177,6 +179,16 @@ function ticketCocina(pedido, items, tipo, opciones = {}) {
     }
   }
   t.separador();
+
+  // Total de la comanda. No es una factura: no lleva el precio de cada plato,
+  // pero sí lo que hay que cobrar, con el domicilio incluido si aplica.
+  if (opciones.total) {
+    if (opciones.recargoDomicilio) t.linea(`(incluye domicilio ${fmtCop(opciones.recargoDomicilio)})`);
+    if (opciones.recargoTarjeta) t.linea(`(incluye recargo tarjeta ${fmtCop(opciones.recargoTarjeta)})`);
+    t.linea(`TOTAL ${fmtCop(opciones.total)}`, { anchoX2: true, altoX2: true, bold: true });
+    t.linea(opciones.metodoPago ? `Pagado: ${opciones.metodoPago}` : 'PENDIENTE DE PAGO', { bold: !opciones.metodoPago });
+    t.separador();
+  }
 
   t.saltos(1);
   t.linea(`Nombre: ${pedido.comensal}`, { altoX2: true });

@@ -460,41 +460,118 @@ function encolarFilaPruebaSheets(vendedor) {
     .run(JSON.stringify(payloadSheets(fila)), 'pendiente', ahora());
 }
 
+// Envía filas al webhook y devuelve lo que respondió, ya interpretado.
+// Lanza error con un mensaje que dice QUÉ corregir, no solo que falló.
+async function enviarASheets(url, filas) {
+  const res = await fetchConTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filas })
+  });
+  const cuerpo = (await res.text()).trim();
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Google negó el acceso (HTTP ${res.status}): la implementación del Apps Script debe tener "Quién tiene acceso: Cualquier persona".`);
+    }
+    throw new Error(`El webhook respondió HTTP ${res.status}. ${cuerpo.slice(0, 120)}`);
+  }
+  // El script de la guía NUEVA responde JSON {ok, hoja, fila}; el de la guía
+  // vieja respondía el texto 'ok'. Un script mal implementado (acceso distinto
+  // de "Cualquier persona") devuelve la página de login de Google CON ESTADO
+  // 200: sin esta verificación las ventas se marcaban enviadas sin llegar.
+  let json = null;
+  try { json = JSON.parse(cuerpo); } catch { }
+  const jsonOk = !!(json && (json.ok || json.result === 'ok' || json.status === 'ok'));
+  if (cuerpo.toLowerCase() !== 'ok' && !jsonOk) {
+    if (/<html|<!doctype/i.test(cuerpo)) {
+      throw new Error('Google pidió iniciar sesión: la implementación del Apps Script debe tener acceso "Cualquier persona" (paso 5 de la guía). Vuelva a Implementar y pegue la URL nueva.');
+    }
+    if (json && json.error) throw new Error(`El Apps Script falló: ${String(json.error).slice(0, 160)}`);
+    throw new Error(`La URL no respondió como el Apps Script de la guía (¿pegó el enlace que termina en /exec?). Respondió: "${cuerpo.slice(0, 100)}"`);
+  }
+  return { status: res.status, cuerpo, json: jsonOk ? json : null, versionNueva: !!(json && json.hoja) };
+}
+
 async function drenarSheets() {
   const url = String(getConfig('sheets_webhook_url') || '').trim();
   const pendientes = db.prepare("SELECT * FROM cola_sheets WHERE estado = 'pendiente' ORDER BY id LIMIT 100").all();
   if (!pendientes.length) return { ok: true, enviados: 0, pendientes: 0 };
   if (!url) return { ok: false, enviados: 0, pendientes: pendientes.length, error: 'No hay URL del webhook de Google Sheets configurada' };
   try {
-    const res = await fetchConTimeout(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filas: pendientes.map(p => JSON.parse(p.payload)) })
-    });
-    const cuerpo = (await res.text()).trim();
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    // El Apps Script de la guía responde el texto 'ok'. Un Apps Script mal
-    // implementado (acceso distinto de "Cualquier persona") responde la página
-    // de login de Google CON ESTADO 200: sin esta verificación, las ventas se
-    // marcaban como enviadas sin llegar jamás a la hoja.
-    let esJsonOk = false;
-    try { const j = JSON.parse(cuerpo); esJsonOk = !!(j && (j.ok || j.result === 'ok' || j.status === 'ok')); } catch { }
-    if (cuerpo.toLowerCase() !== 'ok' && !esJsonOk) {
-      if (/<html|<!doctype/i.test(cuerpo)) {
-        throw new Error('Google pidió iniciar sesión: la implementación del Apps Script debe tener acceso "Cualquier persona" (paso 5 de la guía). Vuelva a Implementar y pegue la URL nueva.');
-      }
-      throw new Error(`La URL no respondió como el Apps Script de la guía (¿pegó el enlace que termina en /exec?). Respondió: "${cuerpo.slice(0, 80)}"`);
-    }
+    const r = await enviarASheets(url, pendientes.map(p => JSON.parse(p.payload)));
     const marcar = db.prepare("UPDATE cola_sheets SET estado = 'enviado', enviado_en = ? WHERE id = ?");
     const tx = db.transaction(() => { for (const p of pendientes) marcar.run(ahora(), p.id); });
     tx();
-    console.log(`[sheets] ${pendientes.length} venta(s) sincronizada(s)`);
-    return { ok: true, enviados: pendientes.length, pendientes: 0 };
+    setConfig('sheets_ultimo_ok', ahora() + (r.json && r.json.hoja ? ` (hoja ${r.json.hoja})` : ''));
+    setConfig('sheets_ultimo_error', '');
+    console.log(`[sheets] ${pendientes.length} venta(s) sincronizada(s)${r.json && r.json.hoja ? ` en la hoja ${r.json.hoja}` : ''}`);
+    return { ok: true, enviados: pendientes.length, pendientes: 0, hoja: r.json && r.json.hoja };
   } catch (err) {
     const detalle = errorDeRed(err);
+    setConfig('sheets_ultimo_error', ahora() + ' — ' + detalle);
     console.error('[sheets] Sin conexión o error del webhook (quedan en búfer):', detalle);
     return { ok: false, enviados: 0, pendientes: pendientes.length, error: detalle };
   }
+}
+
+// ---- Solucionador de problemas de Google Sheets ----
+// Revisa paso por paso y dice exactamente qué corregir. Lo más útil: si el
+// Apps Script responde el JSON de la guía nueva, informa EN QUÉ HOJA Y FILA
+// escribió — así se sabe si de verdad llegó y a dónde.
+async function diagnosticoSheets(vendedor) {
+  const pasos = [];
+  const agregar = (paso, ok, detalle, consejo) => pasos.push({ paso, ok, detalle, consejo: consejo || '' });
+  const url = String(getConfig('sheets_webhook_url') || '').trim();
+
+  if (!url) {
+    agregar('Enlace configurado', false, 'No hay URL guardada',
+      'Pegue en Admin la URL que da Google al Implementar el Apps Script (termina en /exec).');
+    return { pasos, pendientes: db.prepare("SELECT COUNT(*) AS n FROM cola_sheets WHERE estado = 'pendiente'").get().n, resumen: 'Falta configurar el enlace de Google Sheets.' };
+  }
+  const formaOk = /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(url);
+  agregar('Enlace configurado', formaOk, url, formaOk ? ''
+    : 'No parece el enlace de una implementación de Apps Script. Debe empezar por https://script.google.com/macros/s/ y TERMINAR en /exec. Si termina en /dev o es el enlace de la hoja, está mal.');
+
+  const net = await hayInternet();
+  agregar('Internet en el PC', net, net ? 'Hay salida a internet' : 'El PC no tiene salida a internet',
+    net ? '' : 'Revise que el teléfono que comparte los datos tenga señal y datos. Las ventas quedan en cola y suben solas al volver.');
+
+  let resumen;
+  if (!net) {
+    resumen = 'No hay internet: no se puede probar el envío. Las ventas están guardadas y suben solas.';
+  } else {
+    const hoy = jornadaHoy();
+    const filaPrueba = payloadSheets({
+      fecha: hoy, dia: Number(hoy.slice(8, 10)), hora: ahora().slice(11, 16), comanda: 0,
+      vendedor: vendedor || 'Prueba', entrega: 'Local', entrada: 'PRUEBA DEL SOLUCIONADOR',
+      proteina: 'Si ve esta fila, la conexión sirve', bebida: '', extras: '',
+      metodo: 'Efectivo', metodo_clave: 'efectivo', recargo: 0, recargo_domicilio: 0, recargo_tarjeta: 0, total: 0
+    });
+    try {
+      const r = await enviarASheets(url, [filaPrueba]);
+      agregar('Respuesta del Apps Script', true, `HTTP ${r.status}: ${r.cuerpo.slice(0, 120)}`);
+      if (r.versionNueva) {
+        agregar('Fila escrita', true, `Escribió en la hoja "${r.json.hoja}"${r.json.fila ? `, fila ${r.json.fila}` : ''}`,
+          `Abra esa pestaña de su hoja de cálculo: ahí debe estar la fila de prueba. Si no la ve, es que el enlace apunta a OTRA hoja de cálculo distinta de la que está mirando.`);
+        resumen = `✅ Funciona. La prueba quedó en la hoja "${r.json.hoja}"${r.json.fila ? `, fila ${r.json.fila}` : ''}.`;
+      } else {
+        agregar('Versión del Apps Script', false, `Respondió "${r.cuerpo.slice(0, 40)}" (versión anterior)`,
+          'El script respondió bien, pero es la versión ANTERIOR: escribe en una sola hoja con el formato viejo y no puede decir en qué fila quedó. Pegue el script nuevo de la guía y luego Implementar → Administrar implementaciones → ✏️ → Versión: "Nueva versión" → Implementar. OJO: guardar el script NO basta, hay que crear una versión nueva de la implementación.');
+        resumen = '⚠️ La conexión sirve, pero el Apps Script es la versión anterior: actualícelo e implemente una VERSIÓN NUEVA para tener una hoja por mes.';
+      }
+    } catch (e) {
+      const msj = errorDeRed(e);
+      agregar('Respuesta del Apps Script', false, msj,
+        /Cualquier persona|acceso|login/i.test(msj)
+          ? 'En el editor del Apps Script: Implementar → Administrar implementaciones → ✏️ → Quién tiene acceso: "Cualquier persona" → Implementar, y pegue en el POS la URL nueva.'
+          : 'Revise que el enlace sea el de la implementación (termina en /exec) y que el script de la guía esté pegado y guardado.');
+      resumen = '❌ El envío falla: ' + msj;
+    }
+  }
+  const pend = db.prepare("SELECT COUNT(*) AS n FROM cola_sheets WHERE estado = 'pendiente'").get().n;
+  if (pend) agregar('Ventas en espera', false, `${pend} venta(s) sin subir`, 'Se suben solas apenas el envío funcione: no se pierde ninguna.');
+  else agregar('Ventas en espera', true, 'Ninguna: todo lo registrado ya se envió');
+  return { pasos, pendientes: pend, resumen, ultimoOk: getConfig('sheets_ultimo_ok') || '', ultimoError: getConfig('sheets_ultimo_error') || '' };
 }
 
 // ¿El PC tiene salida a internet en este momento? Para el diagnóstico del
@@ -548,5 +625,5 @@ function iniciarPlanificador() {
 module.exports = {
   resumenJornada, resumenMes, ventasPorPlato, filasVentas, nombreReporte, baseCajaDe, ETIQUETAS_METODO,
   ejecutarCierre, encolarReporteDiario, encolarReportesMensuales, mesesPorReportar,
-  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, estadoSync, hayInternet
+  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, diagnosticoSheets, estadoSync, hayInternet
 };

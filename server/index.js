@@ -197,7 +197,7 @@ app.post('/api/platos', requiere(1), (req, res) => {
   // Las entradas van incluidas en el precio del almuerzo: se permiten en $0
   const precioMin = (tipo === 'entrada' || tipo === 'bebida') ? 0 : 1;
   if (!nombre) return res.status(400).json({ error: 'El nombre del plato es obligatorio' });
-  if (!usaDefault && !(Number(precio) >= precioMin)) return res.status(400).json({ error: 'El precio es obligatorio' });
+  if (!usaDefault && !(Number(precio) >= precioMin)) return res.status(400).json({ error: 'Escriba el precio o marque "Usar el precio por defecto"' });
   const precioSolo = req.body.precio_solo !== undefined && String(req.body.precio_solo).trim() !== ''
     ? Math.round(Number(req.body.precio_solo)) || null : null;
   const acronimo = String(req.body.acronimo || '').trim().slice(0, 14).toUpperCase() || null;
@@ -305,7 +305,17 @@ function imprimirPedido(pedidoId, tipo) {
             (SELECT pl.tipo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS tipo,
             (SELECT pl.acronimo FROM platos pl WHERE pl.nombre = pi.plato_nombre ORDER BY pl.activo DESC, pl.id DESC LIMIT 1) AS acronimo
      FROM pedido_items pi WHERE pi.pedido_id = ?`).all(pedidoId);
-  const ticket = ticketCocina(pedido, items, tipo, opcionesTicket());
+  // La comanda muestra el total a cobrar (con domicilio y recargo de tarjeta),
+  // sin el precio de cada plato: no es una factura
+  const pago = db.prepare('SELECT metodo, recargo_tarjeta FROM pagos WHERE pedido_id = ?').get(pedidoId);
+  const recargoTarjeta = pago ? (pago.recargo_tarjeta || 0) : 0;
+  const ticket = ticketCocina(pedido, items, tipo, {
+    ...opcionesTicket(),
+    total: pedido.total + recargoTarjeta,
+    recargoDomicilio: pedido.recargo,
+    recargoTarjeta,
+    metodoPago: pago ? (ETIQUETAS_METODO[pago.metodo] || pago.metodo) : null
+  });
   impresion.encolar(pedidoId, tipo, ticket);
   // Armar la comanda debe costar milisegundos; si algún día vuelve a demorarse,
   // que quede en el registro para saberlo sin adivinar
@@ -746,6 +756,14 @@ app.post('/api/sheets/prueba', requiere(3), async (req, res) => {
 });
 
 app.get('/api/sync/estado', requiere(3), (_req, res) => res.json(reportes.estadoSync()));
+
+// Solucionador de problemas de Google Sheets: revisa paso por paso y dice
+// exactamente qué corregir (y en qué hoja y fila quedó la fila de prueba).
+app.post('/api/sheets/diagnostico', requiere(3), async (req, res) => {
+  try {
+    res.json(await reportes.diagnosticoSheets(reportes.nombreReporte(req.usuario.nombre, req.usuario.rol, true)));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // Dirección actual del servidor en la red (público: quien pregunta ya está en la LAN).
 // Útil cuando la IP cambia, p. ej. al usar el hotspot de un teléfono: el QR de

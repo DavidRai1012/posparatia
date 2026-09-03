@@ -406,6 +406,9 @@ const CONFIG_DEFAULTS = {
   precio_especial_solo: '25000',
   // Meses cuyo reporte mensual ya se encoló (para no repetirlo en cada cierre)
   meses_reportados: '[]',
+  // Última sincronización con Google Sheets (para el solucionador de problemas)
+  sheets_ultimo_ok: '',
+  sheets_ultimo_error: '',
   // Cuenta de venta para el cliente (documento informativo; para factura
   // electrónica DIAN se requiere un proveedor autorizado)
   factura_titulo: 'FACTURA DE VENTA',

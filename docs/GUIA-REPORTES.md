@@ -24,6 +24,7 @@ function doPost(e) {
   const CABECERA = ['Día', 'Hora', 'Comanda', 'Vendedor', 'Entrega', 'Entrada', 'Proteína',
                     'Bebida', 'Extras', 'Método de pago', 'Recargo', 'Total'];
   const filas = JSON.parse(e.postData.contents).filas;
+  let ultima = { hoja: '', fila: 0 };
   for (const f of filas) {
     const nombre = f.hoja || 'Ventas';          // una hoja por mes: "09-2026"
     let hoja = libro.getSheetByName(nombre);
@@ -34,8 +35,11 @@ function doPost(e) {
     }
     hoja.appendRow([f.dia, f.hora, f.comanda, f.vendedor, f.entrega, f.entrada, f.proteina,
                     f.bebida, f.extras, f.metodo, f.recargo_total, f.total]);
+    ultima = { hoja: nombre, fila: hoja.getLastRow() };
   }
-  return ContentService.createTextOutput('ok');
+  // Responder en qué hoja y fila quedó: así el POS puede confirmarlo
+  return ContentService.createTextOutput(JSON.stringify({ ok: true, hoja: ultima.hoja, fila: ultima.fila }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 ```
 
@@ -53,8 +57,15 @@ function doPost(e) {
 7. **Copie la URL** que aparece (termina en `/exec`).
 8. En la app del POS: entrar como administrador → pestaña **Admin** →
    campo **"URL del webhook de Google Sheets"** → pegar la URL → **💾 Guardar configuración**.
-9. Toque el botón **"📊 Probar Google Sheets"**. En la hoja debe aparecer una
-   fila "FILA DE PRUEBA". Si aparece, ya quedó: cada venta pagada se anota sola.
+9. Toque el botón **"🔎 Revisar Google Sheets"**. El POS revisa paso por paso y
+   le dice **en qué pestaña y en qué fila** quedó la fila de prueba. Ábrala en
+   la hoja: si está ahí, ya quedó y cada venta pagada se anota sola.
+
+> ⚠️ **Lo que más falla:** editar el script y solo darle Guardar. Guardar NO
+> cambia lo que está publicado. Después de pegar el script hay que ir a
+> **Implementar → Administrar implementaciones → ✏️ → Versión: "Nueva versión"
+> → Implementar**. Si no, Google sigue ejecutando el código viejo. El
+> solucionador del POS detecta justo eso y lo avisa.
 
 > Nota de privacidad: el nombre de los clientes NO se envía a Google Sheets.
 
