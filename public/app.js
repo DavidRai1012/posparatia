@@ -54,6 +54,7 @@ const state = {
   notas: {},                                // uid de proteína -> {chips, custom} (nota del almuerzo)
   notaExtras: { chips: [], custom: '' },    // nota del bloque de extras sueltos
   pantalla: 'entrada', itemAbierto: null, ticketAbierto: false, busqueda: '', busquedaMenu: '',
+  gruposAbiertos: {},                       // tipos de plato desplegados en el Menú
   comensal: '', tipoEntrega: 'mesa', editandoId: null,
   valorDomicilio: '', imprimirExtras: false,
   enviandoPedido: false, pagoMetodo: null, pagoRecibido: '',
@@ -288,8 +289,12 @@ function mostrarConfirmacionNomina() {
   div.innerHTML = `
     <div class="red-caja">
       <h2>💰 Pago de nómina</h2>
-      <div class="suave" style="margin:6px 0">Fecha del turno: ${esc(n.jornada)}</div>
-      <div class="fila suave"><span>Turno</span><span class="der">${fmt(n.valor_turno)}</span></div>
+      ${n.turnos && n.turnos.length ? `
+      <div class="suave" style="margin:6px 0">Le están pagando ${n.turnos.length} turno(s):</div>
+      ${n.turnos.map(t => `<div class="fila suave"><span>${esc(fechaCorta(t.jornada))} · ${esc(t.cargo)}</span><span class="der">${fmt(t.valor)}</span></div>`).join('')}
+      <div class="fila suave" style="border-top:1px dashed var(--borde);margin-top:4px;padding-top:4px"><span>Suma de turnos</span><span class="der">${fmt(n.valor_turno)}</span></div>`
+      : `<div class="suave" style="margin:6px 0">Fecha del turno: ${esc(n.jornada)}</div>
+      <div class="fila suave"><span>Turno</span><span class="der">${fmt(n.valor_turno)}</span></div>`}
       ${n.descuento ? `<div class="fila suave"><span>Descuento</span><span class="der">-${fmt(n.descuento)}</span></div>` : ''}
       ${n.bono ? `<div class="fila suave"><span>Bono</span><span class="der">+${fmt(n.bono)}</span></div>` : ''}
       ${n.concepto ? `<div class="suave" style="margin:4px 0">📝 ${esc(n.concepto)}</div>` : ''}
@@ -334,7 +339,15 @@ function conectarSocket() {
   });
   socket.on('chips:actualizados', (chips) => { state.config.chips_notas = chips; refrescarVistaEnVivo(['tomar', 'menu']); });
   socket.on('caja:actualizada', () => refrescarVistaEnVivo(['caja']));
-  socket.on('nomina:actualizada', () => refrescarVistaEnVivo(['caja']));
+  socket.on('nomina:actualizada', () => {
+    // En la pantalla de nómina se recargan los datos sin tumbar lo que se esté escribiendo
+    if (state.vista === 'caja' && state.enNomina) {
+      const activo = document.activeElement;
+      if (activo && /^(INPUT|SELECT|TEXTAREA)$/.test(activo.tagName) && activo.type !== 'checkbox') return;
+      return cargarNominaDatos();
+    }
+    refrescarVistaEnVivo(['caja']);
+  });
   socket.on('nomina:pendiente', (n) => { state.nominaPendientes.push(n); mostrarConfirmacionNomina(); });
   socket.on('trabajo:imprimir', manejarTrabajoImpresion);
   socket.on('connect', renderBanner);
@@ -350,6 +363,8 @@ function refrescarVistaEnVivo(soloVistas) {
   // extracto y cada venta de un mesero le cerraba el teclado y le borraba el
   // filtro de fecha. Esa pantalla se refresca sola con sus propios botones.
   if (state.vista === 'caja' && state.enRectificar) return;
+  // La pantalla de nómina se refresca con sus propios datos (ver socket nomina:actualizada)
+  if (state.vista === 'caja' && state.enNomina) return;
   if (['historial', 'caja', 'menu', 'impresora', 'admin', 'tomar'].includes(state.vista)) renderVista();
 }
 
@@ -382,6 +397,7 @@ function renderTabs() {
 function cambiarVista(vista) {
   state.vista = vista;
   state.enRectificar = false;
+  state.enNomina = false;
   renderTabs();
   renderBanner();
   renderVista();
@@ -1230,6 +1246,7 @@ async function descargarArchivo(ruta, nombre) {
 // ---------------- Vista: caja ----------------
 function renderCaja() {
   if (state.enRectificar) return renderRectificar();
+  if (state.enNomina) return renderNomina();
   const sinPagar = state.pedidos.filter(p => p.estado !== 'cancelado' && !p.pagado);
   const cobrando = state.cobrandoId ? state.pedidos.find(p => p.id === state.cobrandoId) : null;
 
@@ -1308,10 +1325,9 @@ function renderCaja() {
     </div>
 
     <h3>👥 Nómina</h3>
-    <div class="tarjeta" id="zona-nomina"><span class="suave">Cargando...</span></div>
-    <div class="fila" style="margin:8px 0 4px">
-      <input id="excel-anio" type="number" min="2026" max="2100" value="${state.jornada.slice(0, 4)}" style="flex:1">
-      <button class="btn-mini primario" id="btn-excel-nomina" style="flex:2">📥 Excel de nómina (hoja por empleado)</button>
+    <div class="tarjeta">
+      <div class="suave">Registrar turnos (qué día vino cada quien y qué hizo), pagar el acumulado, y corregir días pasados.</div>
+      <button class="btn gris" id="btn-ir-nomina" style="margin-top:8px">👥 Turnos y pagos de nómina →</button>
     </div>
 
     <h3>Cierre de caja</h3>
@@ -1445,8 +1461,8 @@ function renderCaja() {
     } catch (e) { toast(e.message, true); }
   };
 
+  if ($('#btn-ir-nomina')) $('#btn-ir-nomina').onclick = () => { state.enNomina = true; renderNomina(); };
   cargarGastos();
-  cargarNomina();
   cargarResumenDia();
 }
 
@@ -1485,101 +1501,325 @@ async function cargarGastos() {
   } catch { /* la vista pudo cambiar */ }
 }
 
-async function cargarNomina() {
-  try {
-    const r = await api('/nomina/resumen');
-    const cont = $('#zona-nomina');
-    if (!cont) return;
-    const hoy = new Date().toLocaleDateString('sv-SE');
-    cont.innerHTML = `
-      <label>Empleado</label>
-      <select id="no-emp">${r.empleados.map(e =>
-        `<option value="${e.id}">${esc(e.nombre)}${e.turnos ? '' : ` (turno ${fmt(e.valor_turno)})`}</option>`).join('')}</select>
-      <div class="fila" style="margin-top:8px">
-        <div class="crece"><label>Fecha del turno</label><input id="no-fecha" type="date" value="${hoy}"></div>
-        <div class="crece"><label>Valor del turno <span id="no-turno-dia" class="suave"></span>${state.usuario.rol === 'admin' ? '' : ' (fijo)'}</label>
-          <input id="no-turno" type="text" inputmode="numeric" pattern="[0-9]*"
-          value="${r.empleados.length ? valorTurnoCliente(r.empleados[0], hoy) : 0}" ${state.usuario.rol === 'admin' ? '' : 'readonly style="opacity:.65"'}></div>
-      </div>
-      <div class="fila" style="margin-top:8px">
-        <div class="crece"><label>Descuento</label><input id="no-desc" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
-        <div class="crece"><label>Bono</label><input id="no-bono" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"></div>
-      </div>
-      <label>Concepto (opcional: motivo del bono o descuento)</label>
-      <input id="no-concepto" placeholder="Ej: bono por festivo, descuento por adelanto" autocomplete="off">
-      <div class="fila" style="margin-top:8px"><span class="crece suave">Total a pagar</span><b id="no-total" class="grande" style="font-size:17px"></b></div>
-      <button class="btn ok" id="btn-nomina-registrar" style="margin-top:8px">Registrar pago (el empleado confirma en su app)</button>
-      <div class="suave" style="margin-top:4px">El valor del turno por empleado lo configura el admin en la pestaña Admin.</div>
+// ---------------- Vista: nómina (submenú de Caja) ----------------
+// Como el Kardex de papel: por un lado los TURNOS (qué día vino y qué hizo),
+// por otro los PAGOS (cuándo se le pagó el acumulado). El admin puede
+// corregir o borrar cualquiera, también de días pasados.
+const DIAS_CORTOS = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
+const diaCorto = (f) => DIAS_CORTOS[new Date(f + 'T12:00:00').getDay()];
+const fechaCorta = (f) => `${diaCorto(f)} ${Number(f.slice(8, 10))}/${Number(f.slice(5, 7))}`;
 
-      ${r.pendientes.length ? `<hr class="sep"><b>Pendientes de confirmación:</b>
-        ${r.pendientes.map(n => `
-        <div class="fila suave" style="padding:4px 0">
-          <span class="crece">${esc(n.empleado)} · ${esc(n.jornada)}${n.concepto ? ` · <em>${esc(n.concepto)}</em>` : ''}</span>
-          <span>${fmt(n.total)}</span>
-          ${state.usuario.rol === 'admin' || (state.usuario.rol === 'cajero' && n.empleado_rol === 'cocinera') ?
-            `<button class="btn-mini ok" data-nomina-conf="${n.id}">✓</button>` : ''}
-          ${state.usuario.rol === 'admin' ? `<button class="btn-mini peligro" data-nomina-anular="${n.id}">✕</button>` : ''}
-        </div>`).join('')}` : ''}
+// Mismo cálculo que el servidor: sábado y domingo pueden pagar distinto
+function valorCargoCliente(cargos, cargo, fecha) {
+  const c = (cargos || []).find(x => x.nombre === cargo);
+  if (!c) return 0;
+  const d = new Date(fechaTurnoValida(fecha) + 'T12:00:00').getDay();
+  return Number(d === 0 ? (c.domingo || c.valor) : d === 6 ? (c.sabado || c.valor) : c.valor) || 0;
+}
 
-      <hr class="sep">
-      <b>Totales pagados por empleado:</b>
-      <div style="overflow-x:auto"><table>
-        <tr><th>Empleado</th><th class="num">Hoy</th><th class="num">Semana</th><th class="num">Quincena</th><th class="num">Mes</th></tr>
-        ${r.empleados.map(e => `
-        <tr><td>${esc(e.nombre)}</td><td class="num">${fmt(e.dia)}</td><td class="num">${fmt(e.semana)}</td>
-        <td class="num">${fmt(e.quincena)}</td><td class="num">${fmt(e.mes)}</td></tr>`).join('')}
-      </table></div>`;
+function renderNomina() {
+  const esAdmin = state.usuario.rol === 'admin';
+  if (!state.nominaMes) state.nominaMes = state.jornada.slice(0, 7);
+  $('#vista').innerHTML = `
+    <div class="ticket-cab">
+      <button class="btn-mini" id="btn-nom-volver">← Volver a Caja</button>
+      <h2 style="margin:0">👥 Nómina</h2>
+    </div>
+    <div class="tarjeta" id="nom-registrar"><span class="suave">Cargando...</span></div>
+    <div id="nom-sin-pagar"></div>
+    <div id="nom-pendientes"></div>
+    <div class="tarjeta">
+      <div class="fila"><b class="crece">📅 Historial del mes</b>
+        <input type="month" id="nom-mes" value="${esc(state.nominaMes)}" style="width:175px"></div>
+      <div class="suave" style="margin:4px 0 6px">Días trabajados y pagos.${esAdmin ? ' Como administrador puede corregir o borrar cualquier día, también de meses pasados.' : ''}</div>
+      <div id="nom-historial"><span class="suave">Cargando...</span></div>
+    </div>
+    <div class="tarjeta" id="nom-totales"><span class="suave">Cargando...</span></div>
+    <div class="fila" style="margin:8px 0 4px">
+      <input id="excel-anio" type="number" min="2026" max="2100" value="${state.jornada.slice(0, 4)}" style="flex:1">
+      <button class="btn-mini primario" id="btn-excel-nomina" style="flex:2">📥 Excel de nómina (hoja por mes)</button>
+    </div>`;
+  $('#btn-nom-volver').onclick = () => { state.enNomina = false; renderCaja(); };
+  $('#nom-mes').onchange = () => { state.nominaMes = $('#nom-mes').value || state.jornada.slice(0, 7); cargarNominaDatos(); };
+  $('#btn-excel-nomina').onclick = async () => {
+    const anio = $('#excel-anio').value || state.jornada.slice(0, 4);
+    try {
+      await descargarArchivo(`/api/nomina/excel?anio=${anio}`, `nomina-${anio}.xlsx`);
+      toast('📥 Excel de nómina descargado (una hoja por mes)');
+    } catch (e) { toast(e.message, true); }
+  };
+  cargarNominaDatos();
+}
 
-    const actualizarTotalNomina = () => {
-      const t = (Number($('#no-turno').value) || 0) - (Number($('#no-desc').value) || 0) + (Number($('#no-bono').value) || 0);
-      $('#no-total').textContent = fmt(t);
+async function cargarNominaDatos() {
+  let r;
+  try { r = await api(`/nomina/resumen?mes=${state.nominaMes || state.jornada.slice(0, 7)}`); }
+  catch (e) { return toast(e.message, true); }
+  if (!state.enNomina || !$('#nom-registrar')) return; // la vista cambió
+  state.nominaDatos = r;
+  pintarRegistrarTurno(r);
+  pintarSinPagar(r);
+  pintarPendientesNomina(r);
+  pintarHistorialNomina(r);
+  pintarTotalesNomina(r);
+}
+
+// --- Registrar un turno: quién, qué día, qué hizo ---
+function pintarRegistrarTurno(r) {
+  const cont = $('#nom-registrar');
+  const esAdmin = state.usuario.rol === 'admin';
+  const conValor = r.cargos.filter(c => c.valor > 0);
+  if (!r.empleados.length) { cont.innerHTML = '<span class="suave">No hay empleados activos.</span>'; return; }
+  if (!r.cargos.length) {
+    cont.innerHTML = '<b>Registrar turno</b><div class="suave" style="margin-top:4px">No hay cargos configurados. El administrador los crea en Admin → 👥 Cargos de nómina.</div>';
+    return;
+  }
+  const empSel = r.empleados.find(e => e.id === state.nomEmpleado) || r.empleados[0];
+  cont.innerHTML = `
+    <b>📝 Registrar turno</b>
+    <div class="suave" style="margin:2px 0 6px">Qué día vino y qué hizo. Se paga después, por acumulado.</div>
+    <div class="fila">
+      <div class="crece"><label>Empleado</label>
+        <select id="tu-emp">${r.empleados.map(e => `<option value="${e.id}" ${e.id === empSel.id ? 'selected' : ''}>${esc(e.nombre)}</option>`).join('')}</select></div>
+      <div class="crece"><label>Día</label><input id="tu-fecha" type="date" value="${r.hoy}" max="${r.hoy}"></div>
+    </div>
+    <div class="fila" style="margin-top:6px">
+      <div class="crece"><label>Cargo (qué hizo)</label>
+        <select id="tu-cargo">${r.cargos.map(c => `<option value="${esc(c.nombre)}" ${c.valor > 0 ? '' : 'style="color:var(--texto2)"'}>${esc(c.nombre)}${c.valor > 0 ? '' : ' (sin valor)'}</option>`).join('')}</select></div>
+      <div class="crece"><label>Valor del turno${esAdmin ? '' : ' (fijo)'}</label>
+        <input id="tu-valor" type="text" inputmode="numeric" ${esAdmin ? '' : 'readonly style="opacity:.65"'}></div>
+    </div>
+    <input id="tu-nota" placeholder="Nota (opcional: ej. medio turno, reemplazo)" autocomplete="off" style="margin-top:6px">
+    <button class="btn ok" id="btn-turno" style="margin-top:8px">Registrar turno</button>
+    ${conValor.length < r.cargos.length ? '<div class="suave" style="margin-top:4px">Los cargos "(sin valor)" no se pueden registrar hasta que el administrador les ponga valor.</div>' : ''}`;
+
+  const elegirCargoHabitual = () => {
+    const emp = r.empleados.find(e => e.id === Number($('#tu-emp').value));
+    if (emp && emp.cargo_habitual && r.cargos.some(c => c.nombre === emp.cargo_habitual)) $('#tu-cargo').value = emp.cargo_habitual;
+  };
+  let valorAuto = null;
+  const actualizarValor = (forzar) => {
+    const campo = $('#tu-valor');
+    const escritoAMano = valorAuto !== null && campo.value !== String(valorAuto);
+    if (forzar || !escritoAMano || !esAdmin) {
+      valorAuto = valorCargoCliente(r.cargos, $('#tu-cargo').value, $('#tu-fecha').value);
+      campo.value = valorAuto || '';
+    }
+  };
+  $('#tu-emp').onchange = () => { state.nomEmpleado = Number($('#tu-emp').value); elegirCargoHabitual(); actualizarValor(true); };
+  $('#tu-cargo').onchange = () => actualizarValor(true);
+  $('#tu-fecha').onchange = () => actualizarValor(false);
+  if ($('#tu-valor')) $('#tu-valor').oninput = (e) => { const l = e.target.value.replace(/[^0-9]/g, ''); if (e.target.value !== l) e.target.value = l; };
+  elegirCargoHabitual();
+  actualizarValor(true);
+
+  $('#btn-turno').onclick = async (ev, repetir) => {
+    const cuerpo = {
+      empleado_id: Number($('#tu-emp').value), jornada: $('#tu-fecha').value, cargo: $('#tu-cargo').value,
+      nota: $('#tu-nota').value, repetir: !!repetir
     };
-    // El turno depende del empleado Y del día de la semana de la fecha elegida
-    const NOMBRES_DIA = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
-    let turnoAutomatico = null; // último valor puesto por el sistema
-    const actualizarTurnoDelDia = (forzar) => {
-      const emp = r.empleados.find(e => e.id === Number($('#no-emp').value));
-      const fecha = $('#no-fecha').value;
-      if (!emp) return;
-      const campo = $('#no-turno');
-      // El admin puede escribir un valor propio: cambiar la fecha no se lo borra
-      const escritoAMano = turnoAutomatico !== null && campo.value !== String(turnoAutomatico);
-      if (forzar || !escritoAMano) {
-        turnoAutomatico = valorTurnoCliente(emp, fecha);
-        campo.value = turnoAutomatico;
+    if (esAdmin) cuerpo.valor = $('#tu-valor').value;
+    try {
+      const resp = await api('/turnos', { method: 'POST', body: cuerpo });
+      beep(880, 0.08); vibrar(40);
+      toast(`Turno registrado: ${fechaCorta(cuerpo.jornada)} · ${cuerpo.cargo} · ${fmt(resp.valor)}`);
+      $('#tu-nota').value = '';
+    } catch (e) {
+      if (/ya tiene un turno/.test(e.message) && !repetir) {
+        if (confirm(`${e.message}.\n\n¿Registrar otro turno igual ese mismo día (por ejemplo, doble turno)?`)) return $('#btn-turno').onclick(null, true);
+        return;
       }
-      const el = $('#no-turno-dia');
-      if (el) el.textContent = emp.turnos ? `(${NOMBRES_DIA[new Date(fechaTurnoValida(fecha) + 'T12:00:00').getDay()]})` : '';
-      actualizarTotalNomina();
-    };
-    // Cambiar de empleado empieza de cero; cambiar la fecha respeta lo escrito
-    $('#no-emp').onchange = () => actualizarTurnoDelDia(true);
-    $('#no-fecha').onchange = () => actualizarTurnoDelDia(false);
-    ['#no-turno', '#no-desc', '#no-bono'].forEach(s => { $(s).oninput = actualizarTotalNomina; });
-    actualizarTurnoDelDia(true);
+      toast(e.message, true);
+    }
+  };
+}
 
-    $('#btn-nomina-registrar').onclick = async () => {
-      try {
-        await api('/nomina', { method: 'POST', body: {
-          empleado_id: Number($('#no-emp').value), jornada: $('#no-fecha').value,
-          valor_turno: $('#no-turno').value, descuento: $('#no-desc').value || 0, bono: $('#no-bono').value || 0,
-          concepto: $('#no-concepto').value
-        }});
-        toast('Pago registrado: el empleado debe confirmarlo en su teléfono');
-        cargarNomina();
-      } catch (e) { toast(e.message, true); }
-    };
-    cont.querySelectorAll('[data-nomina-conf]').forEach(b => b.onclick = async () => {
-      if (!confirm('¿Confirmar este pago en nombre del empleado? (para quien no usa la app)')) return;
-      try { await api(`/nomina/${b.dataset.nominaConf}/confirmar`, { method: 'POST' }); toast('Pago confirmado; sale el ticket'); cargarNomina(); cargarResumenDia(); }
-      catch (e) { toast(e.message, true); }
-    });
-    cont.querySelectorAll('[data-nomina-anular]').forEach(b => b.onclick = async () => {
-      if (!confirm('¿Anular este registro de pago?')) return;
-      try { await api(`/nomina/${b.dataset.nominaAnular}/anular`, { method: 'POST' }); cargarNomina(); }
-      catch (e) { toast(e.message, true); }
-    });
-  } catch { /* la vista pudo cambiar */ }
+// Fila de un turno, con edición en línea para el admin
+function filaTurno(t, r, opciones = {}) {
+  const esAdmin = state.usuario.rol === 'admin';
+  const editando = state.turnoEditando === t.id;
+  const pagado = !!t.pago_id;
+  const estado = pagado
+    ? `<span class="chip pagado">pagado ${t.pagado_en ? fechaCorta(t.pagado_en) : ''}</span>`
+    : '<span class="chip porcobrar">sin pagar</span>';
+  return `
+    <div class="turno-fila">
+      <div class="fila" style="flex-wrap:nowrap">
+        ${opciones.seleccionable ? `<input type="checkbox" class="turno-check" data-turno-check="${t.id}" data-valor="${t.valor}" checked style="width:20px;height:20px;flex:none">` : ''}
+        <span class="crece"><b>${fechaCorta(t.jornada)}</b> · ${esc(t.cargo)}${opciones.conEmpleado ? ` · <b>${esc(t.empleado)}</b>` : ''}${t.nota ? ` <span class="suave">(${esc(t.nota)})</span>` : ''}</span>
+        <span style="font-weight:700;white-space:nowrap">${fmt(t.valor)}</span>
+        ${opciones.conEstado ? estado : ''}
+        ${esAdmin && !pagado ? `<button class="btn-mini" data-turno-editar="${t.id}">✏️</button><button class="btn-mini peligro" data-turno-borrar="${t.id}">🗑</button>` : ''}
+      </div>
+      ${editando ? `
+      <div class="lt-detalle" style="margin-top:6px">
+        <div class="fila">
+          <div class="crece"><label>Día</label><input type="date" data-te-fecha="${t.id}" value="${t.jornada}" max="${r.hoy}"></div>
+          <div class="crece"><label>Cargo</label><select data-te-cargo="${t.id}">${r.cargos.map(c => `<option value="${esc(c.nombre)}" ${c.nombre === t.cargo ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></div>
+        </div>
+        <div class="fila" style="margin-top:6px">
+          <div class="crece"><label>Valor</label><input type="text" inputmode="numeric" data-te-valor="${t.id}" value="${t.valor}"></div>
+          <div class="crece"><label>Nota</label><input data-te-nota="${t.id}" value="${esc(t.nota || '')}"></div>
+        </div>
+        <div class="fila" style="margin-top:8px">
+          <button class="btn-mini" data-te-cancelar="${t.id}">Cancelar</button>
+          <button class="btn-mini ok" data-te-guardar="${t.id}">💾 Guardar</button>
+        </div>
+      </div>` : ''}
+    </div>`;
+}
+
+function conectarBotonesTurno(cont, r) {
+  cont.querySelectorAll('[data-turno-editar]').forEach(b => b.onclick = () => {
+    const id = Number(b.dataset.turnoEditar);
+    state.turnoEditando = state.turnoEditando === id ? null : id;
+    cargarNominaDatos();
+  });
+  cont.querySelectorAll('[data-te-cancelar]').forEach(b => b.onclick = () => { state.turnoEditando = null; cargarNominaDatos(); });
+  cont.querySelectorAll('[data-te-guardar]').forEach(b => b.onclick = async () => {
+    const id = b.dataset.teGuardar;
+    try {
+      await api(`/turnos/${id}`, { method: 'PUT', body: {
+        jornada: cont.querySelector(`[data-te-fecha="${id}"]`).value, cargo: cont.querySelector(`[data-te-cargo="${id}"]`).value,
+        valor: cont.querySelector(`[data-te-valor="${id}"]`).value, nota: cont.querySelector(`[data-te-nota="${id}"]`).value
+      }});
+      state.turnoEditando = null;
+      toast('Turno corregido');
+    } catch (e) { toast(e.message, true); }
+  });
+  cont.querySelectorAll('[data-turno-borrar]').forEach(b => b.onclick = async () => {
+    if (!confirm('¿Borrar este turno? (No se puede deshacer.)')) return;
+    try { await api(`/turnos/${b.dataset.turnoBorrar}`, { method: 'DELETE' }); toast('Turno borrado'); }
+    catch (e) { toast(e.message, true); }
+  });
+}
+
+// --- Turnos sin pagar, por empleado, con el formulario de pago ---
+function pintarSinPagar(r) {
+  const cont = $('#nom-sin-pagar');
+  const conDeuda = r.empleados.filter(e => e.sinPagar.length);
+  if (!conDeuda.length) { cont.innerHTML = '<div class="tarjeta suave">💵 No hay turnos pendientes de pago.</div>'; return; }
+  cont.innerHTML = conDeuda.map(e => `
+    <div class="tarjeta" style="border-color:var(--alerta)">
+      <div class="fila"><b class="crece">💵 ${esc(e.nombre)}: ${e.sinPagar.length} turno(s) sin pagar</b><b>${fmt(e.totalSinPagar)}</b></div>
+      <div class="suave" style="margin-bottom:4px">Desmarque los turnos que no entren en este pago.</div>
+      ${e.sinPagar.map(t => filaTurno(t, r, { seleccionable: true })).join('')}
+      <div class="fila" style="margin-top:8px">
+        <div class="crece"><label>Descuento</label><input type="text" inputmode="numeric" data-pg-desc="${e.id}" placeholder="0"></div>
+        <div class="crece"><label>Bono</label><input type="text" inputmode="numeric" data-pg-bono="${e.id}" placeholder="0"></div>
+      </div>
+      <input data-pg-concepto="${e.id}" placeholder="Concepto (opcional: motivo del bono o descuento)" autocomplete="off" style="margin-top:6px">
+      <button class="btn ok" data-pagar="${e.id}" style="margin-top:8px">Pagar <span data-pg-total="${e.id}">${fmt(e.totalSinPagar)}</span> (${esc(e.nombre)} confirma en su app)</button>
+    </div>`).join('');
+
+  const totalDe = (id) => {
+    let suma = 0;
+    cont.querySelectorAll(`[data-pagar="${id}"]`).forEach(() => {});
+    const tarjeta = cont.querySelector(`[data-pagar="${id}"]`).closest('.tarjeta');
+    tarjeta.querySelectorAll('.turno-check:checked').forEach(c => { suma += Number(c.dataset.valor); });
+    const t = suma - (Number(tarjeta.querySelector(`[data-pg-desc="${id}"]`).value) || 0) + (Number(tarjeta.querySelector(`[data-pg-bono="${id}"]`).value) || 0);
+    cont.querySelector(`[data-pg-total="${id}"]`).textContent = fmt(t);
+  };
+  cont.querySelectorAll('.turno-check').forEach(c => c.onchange = () => totalDe(Number(c.closest('.tarjeta').querySelector('[data-pagar]').dataset.pagar)));
+  cont.querySelectorAll('[data-pg-desc],[data-pg-bono]').forEach(i => i.oninput = () => {
+    const l = i.value.replace(/[^0-9]/g, ''); if (i.value !== l) i.value = l;
+    totalDe(Number(i.dataset.pgDesc || i.dataset.pgBono));
+  });
+  conectarBotonesTurno(cont, r);
+  cont.querySelectorAll('[data-pagar]').forEach(b => b.onclick = async () => {
+    const id = Number(b.dataset.pagar);
+    const tarjeta = b.closest('.tarjeta');
+    const ids = [...tarjeta.querySelectorAll('.turno-check:checked')].map(c => Number(c.dataset.turnoCheck));
+    if (!ids.length) return toast('Marque al menos un turno para pagar', true);
+    const emp = r.empleados.find(e => e.id === id);
+    if (!confirm(`¿Registrar el pago de ${ids.length} turno(s) a ${emp.nombre} por ${cont.querySelector(`[data-pg-total="${id}"]`).textContent}?\n${emp.nombre} debe confirmarlo en su teléfono.`)) return;
+    try {
+      await api('/nomina', { method: 'POST', body: {
+        empleado_id: id, turno_ids: ids,
+        descuento: tarjeta.querySelector(`[data-pg-desc="${id}"]`).value || 0, bono: tarjeta.querySelector(`[data-pg-bono="${id}"]`).value || 0,
+        concepto: tarjeta.querySelector(`[data-pg-concepto="${id}"]`).value
+      }});
+      beep(990, 0.12); vibrar(80);
+      toast(`Pago registrado: ${emp.nombre} debe confirmarlo en su teléfono`);
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
+function resumenTurnosPago(n) {
+  if (!n.turnos || !n.turnos.length) return `turno ${fmt(n.valor_turno)}`;
+  return `${n.turnos.length} turno(s): ${n.turnos.map(t => `${fechaCorta(t.jornada)} ${t.cargo}`).join(', ')}`;
+}
+
+function pintarPendientesNomina(r) {
+  const cont = $('#nom-pendientes');
+  if (!r.pendientes.length) { cont.innerHTML = ''; return; }
+  const esAdmin = state.usuario.rol === 'admin';
+  cont.innerHTML = `<div class="tarjeta"><b>⏳ Pendientes de confirmación por el empleado</b>
+    ${r.pendientes.map(n => `
+    <div class="fila suave" style="padding:6px 0;border-bottom:1px dashed var(--borde)">
+      <span class="crece"><b>${esc(n.empleado)}</b> · ${esc(resumenTurnosPago(n))}${n.concepto ? ` · <em>${esc(n.concepto)}</em>` : ''}</span>
+      <b>${fmt(n.total)}</b>
+      ${esAdmin || (state.usuario.rol === 'cajero' && n.empleado_rol === 'cocinera') ? `<button class="btn-mini ok" data-nomina-conf="${n.id}">✓</button>` : ''}
+      ${esAdmin ? `<button class="btn-mini peligro" data-pago-borrar="${n.id}">🗑</button>` : ''}
+    </div>`).join('')}</div>`;
+  cont.querySelectorAll('[data-nomina-conf]').forEach(b => b.onclick = async () => {
+    if (!confirm('¿Confirmar este pago en nombre del empleado? (para quien no usa la app)')) return;
+    try { await api(`/nomina/${b.dataset.nominaConf}/confirmar`, { method: 'POST' }); toast('Pago confirmado'); }
+    catch (e) { toast(e.message, true); }
+  });
+  conectarBorrarPago(cont);
+}
+
+function conectarBorrarPago(cont) {
+  cont.querySelectorAll('[data-pago-borrar]').forEach(b => b.onclick = async () => {
+    if (!confirm('¿Borrar este pago?\nSus turnos vuelven a quedar SIN PAGAR (no se pierden) y el dinero deja de contarse como salido de la caja ese día.')) return;
+    try { await api(`/nomina/${b.dataset.pagoBorrar}`, { method: 'DELETE' }); toast('Pago borrado: sus turnos quedaron sin pagar'); }
+    catch (e) { toast(e.message, true); }
+  });
+  cont.querySelectorAll('[data-pago-editar]').forEach(b => b.onclick = async () => {
+    const id = b.dataset.pagoEditar;
+    const n = (state.nominaDatos.pagosMes || []).find(x => x.id === Number(id)) || (state.nominaDatos.pendientes || []).find(x => x.id === Number(id));
+    const desc = prompt('Descuento:', n ? n.descuento : 0); if (desc === null) return;
+    const bono = prompt('Bono:', n ? n.bono : 0); if (bono === null) return;
+    const concepto = prompt('Concepto:', n ? (n.concepto || '') : ''); if (concepto === null) return;
+    try { const x = await api(`/nomina/${id}`, { method: 'PUT', body: { descuento: desc, bono, concepto } }); toast(`Pago corregido: total ${fmt(x.total)}`); }
+    catch (e) { toast(e.message, true); }
+  });
+}
+
+// --- Historial del mes: días trabajados y pagos ---
+function pintarHistorialNomina(r) {
+  const cont = $('#nom-historial');
+  const esAdmin = state.usuario.rol === 'admin';
+  const porEmpleado = new Map();
+  for (const t of r.turnosMes) { if (!porEmpleado.has(t.empleado)) porEmpleado.set(t.empleado, []); porEmpleado.get(t.empleado).push(t); }
+  const turnosHtml = porEmpleado.size ? [...porEmpleado.entries()].map(([nombre, lista]) => `
+    <div style="margin-top:8px"><b>${esc(nombre)}</b> <span class="suave">· ${lista.length} día(s) · ${fmt(lista.reduce((s, t) => s + t.valor, 0))}</span></div>
+    ${lista.map(t => filaTurno(t, r, { conEstado: true })).join('')}`).join('')
+    : '<div class="suave">Sin turnos registrados este mes.</div>';
+  const pagosHtml = r.pagosMes.length ? r.pagosMes.map(n => `
+    <div class="fila" style="padding:6px 0;border-bottom:1px dashed var(--borde)">
+      <span class="crece"><b>${fechaCorta(n.jornada)}</b> · ${esc(n.empleado)} <span class="suave">· ${esc(resumenTurnosPago(n))}${n.descuento ? ` · desc. -${fmt(n.descuento)}` : ''}${n.bono ? ` · bono +${fmt(n.bono)}` : ''}${n.concepto ? ` · ${esc(n.concepto)}` : ''}</span></span>
+      <b style="white-space:nowrap">${fmt(n.total)}</b>
+      <span class="chip ${n.estado === 'confirmado' ? 'pagado' : n.estado === 'anulado' ? '' : 'porcobrar'}">${n.estado}</span>
+      ${esAdmin ? `<button class="btn-mini" data-pago-editar="${n.id}">✏️</button><button class="btn-mini peligro" data-pago-borrar="${n.id}">🗑</button>` : ''}
+    </div>`).join('') : '<div class="suave">Sin pagos este mes.</div>';
+  cont.innerHTML = `
+    <div class="suave" style="font-weight:700;margin-top:4px">📆 Días trabajados</div>${turnosHtml}
+    <div class="suave" style="font-weight:700;margin-top:12px">💵 Pagos</div>${pagosHtml}`;
+  conectarBotonesTurno(cont, r);
+  conectarBorrarPago(cont);
+}
+
+function pintarTotalesNomina(r) {
+  $('#nom-totales').innerHTML = `
+    <b>Totales pagados (confirmados)</b>
+    <div style="overflow-x:auto;margin-top:6px"><table>
+      <tr><th>Empleado</th><th class="num">Hoy</th><th class="num">Semana</th><th class="num">Quincena</th><th class="num">Mes</th><th class="num">Sin pagar</th></tr>
+      ${r.empleados.map(e => `
+      <tr><td>${esc(e.nombre)}</td><td class="num">${fmt(e.dia)}</td><td class="num">${fmt(e.semana)}</td>
+      <td class="num">${fmt(e.quincena)}</td><td class="num">${fmt(e.mes)}</td><td class="num" style="${e.totalSinPagar ? 'color:var(--alerta);font-weight:700' : ''}">${fmt(e.totalSinPagar)}</td></tr>`).join('')}
+    </table></div>`;
 }
 
 async function cargarResumenDia() {
@@ -1658,9 +1898,20 @@ const OPCIONES_TIPO = [
 function gruposPlato() { return (state.config && state.config.grupos_plato) || []; }
 function preciosDefault() {
   return (state.config && state.config.precios_default) ||
-    { proteina_dia: { precio: 0, solo: 0 }, proteina_especial: { precio: 0, solo: 0 } };
+    { proteina_dia: { precio: 0, solo: 0 }, proteina_especial: { precio: 0, solo: 0 }, entrada: { precio: 0, solo: 0 } };
 }
+// El tipo para el reporte de compras (pollo, carne...) es solo de proteínas;
+// el precio por defecto también lo tienen las entradas (la sopa vendida sola)
 const LLEVA_GRUPO = (tipo) => tipo === 'proteina_dia' || tipo === 'proteina_especial';
+const TIENE_DEFAULT = (tipo) => !!preciosDefault()[tipo];
+// Cómo se lee el precio por defecto de cada clase
+function textoDefault(tipo) {
+  const def = preciosDefault()[tipo];
+  if (!def) return '';
+  return tipo === 'entrada'
+    ? `${fmt(def.solo)} vendida sola · incluida en el almuerzo`
+    : `${fmt(def.precio)} con entrada · ${fmt(def.solo)} solo`;
+}
 const MAX_LISTA_MENU = 40; // con ~150 proteínas, pintarlas todas hace lenta la pestaña
 
 function selectGrupos(id, sel) {
@@ -1685,6 +1936,9 @@ function renderMenu() {
 
   $('#vista').innerHTML = `
     <h2>Menú del día</h2>
+    <input id="buscar-menu" class="input-buscar buscador-pegado" type="search"
+      placeholder="🔎 Buscar entre ${state.platos.length} platos (nombre, acrónimo o tipo)"
+      value="${esc(state.busquedaMenu)}" autocomplete="off" autocorrect="off">
     <div class="tarjeta">
       <h3 style="margin-top:0">Agregar plato</h3>
       <input id="np-nombre" placeholder="Nombre del plato" autocomplete="off">
@@ -1724,11 +1978,16 @@ function renderMenu() {
         <div class="crece"><label>⭐ Especial, solo</label>
           <input id="pd-esp-solo" type="number" inputmode="numeric" value="${pd.proteina_especial.solo || ''}"></div>
       </div>
+      <label>🥣 Entrada vendida sola (ej: piden solo una sopa)</label>
+      <input id="pd-entrada-sola" type="number" inputmode="numeric" value="${(pd.entrada || {}).solo || ''}"
+        placeholder="Ej: 7500 — dentro del almuerzo va incluida">
       <button class="btn-mini ok" id="btn-precios-default" style="margin-top:10px">💾 Guardar precios</button>
       ${nSinDefault('proteina_dia') ? `<button class="btn-mini" data-aplicar="proteina_dia" style="margin-top:8px;width:100%">
         Poner el precio por defecto a las ${nSinDefault('proteina_dia')} proteínas del día que tienen precio propio</button>` : ''}
       ${nSinDefault('proteina_especial') ? `<button class="btn-mini" data-aplicar="proteina_especial" style="margin-top:6px;width:100%">
         Poner el precio por defecto a los ${nSinDefault('proteina_especial')} especiales con precio propio</button>` : ''}
+      ${nSinDefault('entrada') ? `<button class="btn-mini" data-aplicar="entrada" style="margin-top:6px;width:100%">
+        Poner el precio por defecto a las ${nSinDefault('entrada')} entradas con precio propio</button>` : ''}
     </div>
 
     <div class="tarjeta">
@@ -1752,15 +2011,10 @@ function renderMenu() {
       </div>
     </div>
 
-    <input id="buscar-menu" class="input-buscar" type="search" placeholder="🔎 Buscar plato en el menú (${state.platos.length})"
-      value="${esc(state.busquedaMenu)}" autocomplete="off" autocorrect="off">
+    ${TIPOS_UI.map(([tipo, titulo]) => seccionMenu(tipo, titulo)).join('')}`;
 
-    ${TIPOS_UI.map(([tipo, titulo]) => {
-      const todos = state.platos.filter(p => p.tipo === tipo);
-      const filtrados = q ? todos.filter(p => normalizar(p.nombre).includes(q) || normalizar(p.acronimo).includes(q)) : todos;
-      if (!filtrados.length) return '';
-      const visibles = filtrados.slice(0, MAX_LISTA_MENU);
-      return `<h3>${titulo} (${filtrados.length})</h3>` + visibles.map(p => `
+  function tarjetaPlato(p) {
+    return `
       <div class="tarjeta ${p.disponible ? '' : 'plato-oculto'}">
         <div class="fila">
           <div class="crece">
@@ -1793,10 +2047,10 @@ function renderMenu() {
               </select></div>
             <div class="crece"><label>Tipo (para compras)</label>${selectGrupos('ep-grupo', p.grupo || '')}</div>
           </div>
-          <label class="check-linea">
+          ${TIENE_DEFAULT(p.tipo) ? `<label class="check-linea">
             <input type="checkbox" id="ep-default" ${p.usa_default ? 'checked' : ''}>
-            <span>Usar el precio por defecto</span>
-          </label>
+            <span>Usar el precio por defecto (${esc(textoDefault(p.tipo))})</span>
+          </label>` : ''}
           <div class="fila" style="margin-top:8px">
             <div class="crece"><label>Precio (en almuerzo)</label>
               <input id="ep-precio" type="number" inputmode="numeric" value="${p.precio}"></div>
@@ -1810,26 +2064,70 @@ function renderMenu() {
             <button class="btn-mini ok" id="ep-guardar">💾 Guardar cambios</button>
           </div>
         </div>` : ''}
-      </div>`).join('') +
-      (filtrados.length > visibles.length
-        ? `<div class="tarjeta suave">…y ${filtrados.length - visibles.length} más. Use el buscador para encontrarlos.</div>` : '');
-    }).join('')}`;
+      </div>`;
+  }
+
+  // Un plato coincide por nombre, por acrónimo o por su tipo de compras:
+  // escribir "pollo" saca todos los de pollo aunque no lo lleven en el nombre
+  function coincide(p) {
+    return !q || normalizar(p.nombre).includes(q) || normalizar(p.acronimo).includes(q) || normalizar(p.grupo).includes(q);
+  }
+
+  function recorte(lista) {
+    if (lista.length <= MAX_LISTA_MENU) return lista.map(tarjetaPlato).join('');
+    return lista.slice(0, MAX_LISTA_MENU).map(tarjetaPlato).join('') +
+      `<div class="tarjeta suave">…y ${lista.length - MAX_LISTA_MENU} más. Use el buscador para encontrarlos.</div>`;
+  }
+
+  // Las proteínas se separan por tipo (Pollo, Carne, Cerdo...). Con muchas,
+  // los tipos arrancan plegados: se ve la lista de tipos con su cantidad y se
+  // abre el que interese, en vez de desplazarse por 150 platos.
+  function seccionMenu(tipo, titulo) {
+    const filtrados = state.platos.filter(p => p.tipo === tipo && coincide(p));
+    if (!filtrados.length) return '';
+    const cabecera = `<h3>${titulo} (${filtrados.length})</h3>`;
+    if (!LLEVA_GRUPO(tipo)) return cabecera + recorte(filtrados);
+
+    const porGrupo = new Map();
+    for (const p of filtrados) {
+      const g = p.grupo || 'Sin tipo';
+      if (!porGrupo.has(g)) porGrupo.set(g, []);
+      porGrupo.get(g).push(p);
+    }
+    // En el orden en que están configurados los tipos; "Sin tipo" de último
+    const orden = [...gruposPlato(), 'Sin tipo'];
+    const claves = [...porGrupo.keys()].sort((a, b) => {
+      const ia = orden.indexOf(a), ib = orden.indexOf(b);
+      return (ia < 0 ? 998 : ia) - (ib < 0 ? 998 : ib) || a.localeCompare(b);
+    });
+    // Buscando, todo abierto: lo que se busca es ver los resultados
+    const plegar = !q && filtrados.length > 25 && claves.length > 1;
+    return cabecera + claves.map(g => {
+      const lista = porGrupo.get(g);
+      const clave = tipo + '|' + g;
+      const abierto = !plegar || !!state.gruposAbiertos[clave];
+      return `<button class="grupo-cab" data-grupo-toggle="${esc(clave)}">
+          <span>${plegar ? (abierto ? '▾' : '▸') + ' ' : ''}${esc(g)}</span>
+          <span class="chip">${lista.length}</span></button>` +
+        (abierto ? recorte(lista) : '');
+    }).join('');
+  }
 
   // El tipo de compras y el precio por defecto solo aplican a proteínas
   const sincronizarFormNuevo = (cambioDeClase) => {
     nuevo.tipo = $('#np-tipo').value;
     nuevo.grupo = $('#np-grupo') ? $('#np-grupo').value : '';
     const lleva = LLEVA_GRUPO(nuevo.tipo);
-    const def = preciosDefault()[nuevo.tipo];
+    const conDefault = TIENE_DEFAULT(nuevo.tipo);
     // Al cambiar de clase, el precio por defecto vuelve a quedar marcado si esa
-    // clase lo tiene. Antes, pasar por "Entrada" (que no lo tiene) lo dejaba
+    // clase lo tiene. Antes, pasar por una clase sin defecto lo dejaba
     // desmarcado para siempre y volvía a pedir el precio de cada almuerzo.
-    if (cambioDeClase) $('#np-default').checked = lleva;
-    else if (!lleva) $('#np-default').checked = false;
+    if (cambioDeClase) $('#np-default').checked = conDefault;
+    else if (!conDefault) $('#np-default').checked = false;
     nuevo.usaDefault = $('#np-default').checked;
     $('#np-grupo-caja').style.display = lleva ? '' : 'none';
-    $('#np-default-caja').style.display = lleva ? '' : 'none';
-    if (def) $('#np-default-txt').textContent = `${fmt(def.precio)} con entrada · ${fmt(def.solo)} solo`;
+    $('#np-default-caja').style.display = conDefault ? '' : 'none';
+    if (conDefault) $('#np-default-txt').textContent = textoDefault(nuevo.tipo);
     $('#np-precios').style.display = nuevo.usaDefault ? 'none' : '';
   };
   $('#np-tipo').onchange = () => sincronizarFormNuevo(true);
@@ -1855,6 +2153,9 @@ function renderMenu() {
   };
 
   $('#btn-nuevo-plato').onclick = async () => {
+    // Se abre el tipo ANTES de guardar: al volver el servidor, el menú se
+    // redibuja solo y el plato nuevo tiene que quedar a la vista
+    if (LLEVA_GRUPO(nuevo.tipo)) state.gruposAbiertos[`${nuevo.tipo}|${nuevo.grupo || 'Sin tipo'}`] = true;
     try {
       await api('/platos', { method: 'POST', body: {
         nombre: $('#np-nombre').value, precio: $('#np-precio').value || 0, tipo: $('#np-tipo').value,
@@ -1876,7 +2177,8 @@ function renderMenu() {
     try {
       const r = await api('/precios-default', { method: 'PUT', body: {
         precio_dia_entrada: $('#pd-dia-entrada').value || 0, precio_dia_solo: $('#pd-dia-solo').value || 0,
-        precio_especial_entrada: $('#pd-esp-entrada').value || 0, precio_especial_solo: $('#pd-esp-solo').value || 0
+        precio_especial_entrada: $('#pd-esp-entrada').value || 0, precio_especial_solo: $('#pd-esp-solo').value || 0,
+        precio_entrada_sola: $('#pd-entrada-sola').value || 0
       }});
       state.config.precios_default = r.precios;
       toast('Precios guardados: aplican a todos los platos con precio por defecto');
@@ -1887,15 +2189,18 @@ function renderMenu() {
     const def = preciosDefault()[tipo];
     const afectados = state.platos.filter(p => p.tipo === tipo && !p.usa_default);
     // Aviso explícito de los que HOY valen otra cosa (ej: la bandeja paisa):
-    // esos son los que cambiarían de precio sin querer
-    const distintos = afectados.filter(p => p.precio !== def.precio);
+    // esos son los que cambiarían de precio sin querer. En las entradas lo que
+    // cambia es el precio de venderlas solas.
+    const propio = (p) => tipo === 'entrada' ? (p.precio_solo || 0) : p.precio;
+    const esperado = tipo === 'entrada' ? def.solo : def.precio;
+    const distintos = afectados.filter(p => propio(p) !== esperado);
     const aviso = distintos.length
-      ? `\n\n⚠️ OJO: ${distintos.length} tienen hoy otro precio y pasarían a ${fmt(def.precio)}:\n` +
-        distintos.slice(0, 8).map(p => `  · ${p.nombre} (${fmt(p.precio)})`).join('\n') +
+      ? `\n\n⚠️ OJO: ${distintos.length} tienen hoy otro precio y pasarían a ${fmt(esperado)}:\n` +
+        distintos.slice(0, 8).map(p => `  · ${p.nombre} (${fmt(propio(p))})`).join('\n') +
         (distintos.length > 8 ? `\n  · ...y ${distintos.length - 8} más` : '') +
         '\n\nSi alguno debe conservar su precio, cancele y desmárquelo después con ✏️.'
       : '';
-    if (!confirm(`¿Poner el precio por defecto (${fmt(def.precio)} con entrada / ${fmt(def.solo)} solo) a ${afectados.length} plato(s)?${aviso}`)) return;
+    if (!confirm(`¿Poner el precio por defecto (${textoDefault(tipo)}) a ${afectados.length} plato(s)?${aviso}`)) return;
     try {
       const r = await api('/platos/aplicar-default', { method: 'POST', body: { tipo } });
       toast(`${r.cambiados} plato(s) quedaron con el precio por defecto`);
@@ -1945,6 +2250,12 @@ function renderMenu() {
     state.editandoPlatoId = state.editandoPlatoId === id ? null : id;
     renderMenu();
   });
+  // Abrir/cerrar un tipo de proteína en la lista
+  $('#vista').querySelectorAll('[data-grupo-toggle]').forEach(b => b.onclick = () => {
+    const clave = b.dataset.grupoToggle;
+    state.gruposAbiertos[clave] = !state.gruposAbiertos[clave];
+    renderMenu();
+  });
   // Asignar el tipo desde la misma lista: son ~150 proteínas por clasificar
   $('#vista').querySelectorAll('[data-grupo-de]').forEach(sel => sel.onchange = async () => {
     try { await api(`/platos/${sel.dataset.grupoDe}`, { method: 'PUT', body: { grupo: sel.value } }); }
@@ -1955,7 +2266,8 @@ function renderMenu() {
       await api(`/platos/${state.editandoPlatoId}`, { method: 'PUT', body: {
         nombre: $('#ep-nombre').value, precio: $('#ep-precio').value || 0, tipo: $('#ep-tipo').value,
         precio_solo: $('#ep-solo').value, acronimo: $('#ep-acronimo').value,
-        grupo: $('#ep-grupo') ? $('#ep-grupo').value : '', usa_default: $('#ep-default').checked
+        grupo: $('#ep-grupo') ? $('#ep-grupo').value : '',
+        usa_default: $('#ep-default') ? $('#ep-default').checked : false
       }});
       state.editandoPlatoId = null;
       toast('Plato actualizado en todos los teléfonos');
@@ -2167,19 +2479,34 @@ function imprimirPorRawBT(trabajo) {
 // usarCache: para abrir/cerrar el editor de turnos sin volver a pedir los datos
 // al servidor (así no se pierde lo que esté escrito en el formulario de arriba
 // ni se queda la vista en "Cargando..." si falla una de las tres consultas)
+function filaCargo(c) {
+  return `<div class="fila cargo-fila" style="margin-top:6px;flex-wrap:nowrap">
+    <input data-cargo-nombre value="${esc(c.nombre || '')}" placeholder="Ej: Auxiliar de caja" style="flex:2">
+    <input data-cargo-valor type="text" inputmode="numeric" value="${c.valor || ''}" placeholder="Valor" style="flex:1.2">
+    <input data-cargo-sab type="text" inputmode="numeric" value="${c.sabado || ''}" placeholder="=" style="flex:1">
+    <input data-cargo-dom type="text" inputmode="numeric" value="${c.domingo || ''}" placeholder="=" style="flex:1">
+    <button class="btn-mini peligro" data-cargo-quitar style="width:36px;padding:7px 0">✕</button>
+  </div>`;
+}
+function horasReporte(cfg) {
+  try { const h = JSON.parse(cfg.horas_reporte || '[]'); return Array.isArray(h) && h.length === 7 ? h : ['', '', '', '', '', '', '']; }
+  catch { return ['', '', '', '', '', '', '']; }
+}
+
 async function renderAdmin(usarCache) {
   let cfg, usuarios, sync;
   const escritos = {};
+  let cargos;
   if (usarCache && state.adminCache) {
-    ({ cfg, usuarios, sync } = state.adminCache);
+    ({ cfg, usuarios, sync, cargos } = state.adminCache);
     // Conservar lo que el admin tenga escrito y sin guardar en la configuración
     $('#vista').querySelectorAll('input[id^="cf-"], textarea[id^="cf-"], select[id^="cf-"]')
       .forEach(el => { escritos[el.id] = el.value; });
   } else {
     $('#vista').innerHTML = '<h2>Administración</h2><div class="tarjeta suave">Cargando...</div>';
-    try { [cfg, usuarios, sync] = await Promise.all([api('/config'), api('/usuarios'), api('/sync/estado')]); }
+    try { [cfg, usuarios, sync, cargos] = await Promise.all([api('/config'), api('/usuarios'), api('/sync/estado'), api('/cargos')]); }
     catch (e) { return toast(e.message, true); }
-    state.adminCache = { cfg, usuarios, sync };
+    state.adminCache = { cfg, usuarios, sync, cargos };
   }
   if (state.vista !== 'admin') return;
 
@@ -2261,6 +2588,26 @@ async function renderAdmin(usarCache) {
       <div class="suave" style="margin-top:4px">Los dos correos del mes (nómina y resumen con todas las ventas) salen solos en el cierre del último día; con este botón se reenvían cuando quiera.</div>
     </div>
 
+    <div class="tarjeta">
+      <h3 style="margin-top:0">👥 Cargos de nómina (valor por turno)</h3>
+      <div class="suave">Qué hace cada quien un día y cuánto vale ese turno. Un mismo empleado puede ser cajero un día y auxiliar de cocina otro. Sábado y domingo vacíos = igual que el valor normal. La cajera solo elige el cargo: el valor sale de aquí.</div>
+      <div class="fila suave" style="margin-top:8px;font-size:12px"><span style="flex:2">Cargo</span><span style="flex:1.2">Valor</span><span style="flex:1">Sábado</span><span style="flex:1">Domingo</span><span style="width:36px"></span></div>
+      <div id="cargos-lista">${(cargos || []).map(c => filaCargo(c)).join('')}</div>
+      <div class="fila" style="margin-top:8px">
+        <button class="btn-mini" id="btn-cargo-agregar">＋ Agregar cargo</button>
+        <button class="btn-mini ok" id="btn-cargos-guardar">💾 Guardar cargos</button>
+      </div>
+    </div>
+
+    <div class="tarjeta">
+      <h3 style="margin-top:0">🕐 Hora de cierre por día</h3>
+      <div class="suave">Si ese día se olvida el cierre de caja, a esta hora sale solo el reporte del día. No todos los días se cierra a la misma hora. Vacío = la hora general (${esc(cfg.hora_reporte)}).</div>
+      <div class="turnos-grid">
+        ${DIAS_TURNO.map(([dia, nombre]) => `<div><label>${nombre}</label><input type="time" data-hora-dia="${dia}" value="${esc((horasReporte(cfg))[dia] || '')}"></div>`).join('')}
+      </div>
+      <button class="btn-mini ok" id="btn-horas-guardar" style="margin-top:10px">💾 Guardar horas</button>
+    </div>
+
     <button class="btn ok" id="btn-guardar-cfg">💾 Guardar configuración</button>
 
     <h3>Usuarios</h3>
@@ -2282,32 +2629,20 @@ async function renderAdmin(usarCache) {
         <div class="fila">
           <div class="crece">
             <b>${esc(u.nombre)}</b> <span class="chip">${esc(u.rol)}</span>
-            <span class="chip">${u.turnos ? '💰 turno por día' : `turno ${fmt(u.valor_turno || 0)}`}</span>
             ${u.activo ? '' : '<span class="chip porcobrar">INACTIVO</span>'}
           </div>
-          <button class="btn-mini ${state.turnosAbiertoId === u.id ? 'primario' : ''}" data-uturno="${u.id}">💰</button>
           <button class="btn-mini" data-upin="${u.id}">🔑 PIN</button>
           <button class="btn-mini ${u.activo ? 'peligro' : 'ok'}" data-uactivo="${u.id}" data-estado="${u.activo}">
             ${u.activo ? 'Desactivar' : 'Reactivar'}</button>
           <button class="btn-mini peligro" data-uborrar="${u.id}">🗑</button>
         </div>
-        ${state.turnosAbiertoId === u.id ? `
-        <div class="lt-detalle" style="border-top:1px dashed var(--borde);margin-top:8px">
-          <b>💰 Valor del turno de ${esc(u.nombre)}</b>
-          <div class="suave" style="margin:4px 0">El turno vale distinto según el día. Un día vacío (o en 0) usa el valor base.</div>
-          <label>Valor base (para los días sin valor propio)</label>
-          <input id="tu-base" type="text" inputmode="numeric" pattern="[0-9]*" value="${u.valor_turno || ''}">
-          <div class="turnos-grid">
-            ${DIAS_TURNO.map(([dia, nombre]) => `
-            <div><label>${nombre}</label>
-              <input data-tu-dia="${dia}" type="text" inputmode="numeric" pattern="[0-9]*"
-                value="${u.turnos && u.turnos[dia] ? u.turnos[dia] : ''}" placeholder="${u.valor_turno || 0}"></div>`).join('')}
-          </div>
-          <div class="fila" style="margin-top:10px">
-            <button class="btn-mini" id="tu-cancelar">Cancelar</button>
-            <button class="btn-mini ok" id="tu-guardar" data-tu-usuario="${u.id}">💾 Guardar turnos</button>
-          </div>
-        </div>` : ''}
+        <div class="fila" style="margin-top:6px">
+          <span class="suave">Cargo habitual:</span>
+          <select data-cargo-habitual="${u.id}" style="flex:1">
+            <option value="">— sin cargo —</option>
+            ${cargos.map(c => `<option value="${esc(c.nombre)}" ${c.nombre === u.cargo_habitual ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}
+          </select>
+        </div>
       </div>`).join('')}`;
 
   $('#btn-guardar-cfg').onclick = async () => {
@@ -2327,6 +2662,31 @@ async function renderAdmin(usarCache) {
       state.config.recargo_empaque = Number($('#cf-recargo').value);
       $('#titulo-app').textContent = state.config.nombre_restaurante;
     } catch (e) { toast(e.message, true); }
+  };
+  // Cargos de nómina: filas editables, se guardan todas juntas
+  $('#btn-cargo-agregar').onclick = () => { $('#cargos-lista').insertAdjacentHTML('beforeend', filaCargo({ nombre: '', valor: '', sabado: '', domingo: '' })); conectarFilasCargo(); };
+  const conectarFilasCargo = () => {
+    $('#cargos-lista').querySelectorAll('[data-cargo-quitar]').forEach(b => b.onclick = () => b.closest('.cargo-fila').remove());
+    $('#cargos-lista').querySelectorAll('input[inputmode="numeric"]').forEach(i => i.oninput = () => { const l = i.value.replace(/[^0-9]/g, ''); if (i.value !== l) i.value = l; });
+  };
+  conectarFilasCargo();
+  $('#btn-cargos-guardar').onclick = async () => {
+    const lista = [...$('#cargos-lista').querySelectorAll('.cargo-fila')].map(f => ({
+      nombre: f.querySelector('[data-cargo-nombre]').value, valor: f.querySelector('[data-cargo-valor]').value,
+      sabado: f.querySelector('[data-cargo-sab]').value, domingo: f.querySelector('[data-cargo-dom]').value
+    })).filter(c => c.nombre.trim());
+    try {
+      const r = await api('/cargos', { method: 'PUT', body: { cargos: lista } });
+      state.adminCache = null;
+      toast(`${r.cargos.length} cargo(s) guardado(s)`);
+      renderAdmin();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#btn-horas-guardar').onclick = async () => {
+    const horas = ['', '', '', '', '', '', ''];
+    $('#vista').querySelectorAll('[data-hora-dia]').forEach(i => { horas[Number(i.dataset.horaDia)] = i.value || ''; });
+    try { await api('/config', { method: 'PUT', body: { horas_reporte: JSON.stringify(horas) } }); toast('Horas de cierre guardadas'); }
+    catch (e) { toast(e.message, true); }
   };
   $('#btn-prueba').onclick = async () => {
     try { await api('/impresion/prueba', { method: 'POST' }); toast('Ticket de prueba encolado'); }
@@ -2383,26 +2743,11 @@ async function renderAdmin(usarCache) {
     if (el) el.value = valor;
   }
 
-  // 💰 abre el submenú de turnos por día (lunes a jueves un valor, sábado otro...)
-  $('#vista').querySelectorAll('[data-uturno]').forEach(b => b.onclick = () => {
-    const id = Number(b.dataset.uturno);
-    state.turnosAbiertoId = state.turnosAbiertoId === id ? null : id;
-    renderAdmin(true); // sin refetch: no se pierde nada de lo escrito arriba
+  // Cargo habitual: lo que suele hacer, para que el turno salga preseleccionado
+  $('#vista').querySelectorAll('[data-cargo-habitual]').forEach(sel => sel.onchange = async () => {
+    try { await api(`/usuarios/${sel.dataset.cargoHabitual}`, { method: 'PUT', body: { cargo_habitual: sel.value } }); toast('Cargo habitual guardado'); }
+    catch (e) { toast(e.message, true); }
   });
-  if ($('#tu-cancelar')) $('#tu-cancelar').onclick = () => { state.turnosAbiertoId = null; renderAdmin(true); };
-  if ($('#tu-guardar')) $('#tu-guardar').onclick = async () => {
-    const id = Number($('#tu-guardar').dataset.tuUsuario);
-    const turnos = [0, 0, 0, 0, 0, 0, 0];
-    $('#vista').querySelectorAll('[data-tu-dia]').forEach(inp => {
-      turnos[Number(inp.dataset.tuDia)] = Math.max(0, Math.round(Number(inp.value) || 0));
-    });
-    try {
-      await api(`/usuarios/${id}`, { method: 'PUT', body: { valor_turno: Number($('#tu-base').value) || 0, turnos } });
-      state.turnosAbiertoId = null;
-      toast('Turnos guardados: la nómina usará el valor del día que corresponda');
-      renderAdmin();
-    } catch (e) { toast(e.message, true); }
-  };
   $('#vista').querySelectorAll('[data-uborrar]').forEach(b => b.onclick = async () => {
     const u = usuarios.find(x => x.id === Number(b.dataset.uborrar));
     if (!confirm(`¿Eliminar a "${u.nombre}" definitivamente?\n\nYa no aparecerá en ninguna lista y su PIN queda libre para otro empleado.\nSi tiene ventas o nómina registradas, esos reportes viejos conservan su nombre.\n\n(Si solo es temporal — vacaciones, retiro con posible regreso — mejor use "Desactivar".)`)) return;

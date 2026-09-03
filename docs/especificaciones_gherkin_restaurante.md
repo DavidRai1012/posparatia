@@ -818,3 +818,67 @@ Característica: Hoja de Google Sheets por mes
     Y con las columnas Día, Hora, Comanda, Vendedor, Entrega (Local/Domicilio), Entrada, Proteína, Bebida, Extras, Método de pago, Recargo y Total
     Y sin el nombre del cliente
 ```
+
+---
+
+```gherkin
+# language: es
+Característica: Nómina en dos pasos (turnos y pagos)
+  Como dueño del restaurante
+  Quiero registrar qué día vino cada empleado y qué hizo, y pagarle después el acumulado
+  Porque un mismo empleado es cajero un día y auxiliar de cocina otro, como en el Kardex
+
+  Escenario: Registrar un turno
+    Dado que el cargo "Auxiliar de caja" vale $200.000 y "Cajero" vale $450.000
+    Cuando la cajera registra que Pedro vino el lunes como "Auxiliar de caja"
+    Entonces debe quedar un turno del lunes por $200.000 sin pagar
+    Y la cajera no debe poder cambiar ese valor
+
+  Escenario: Sábado y domingo pagan distinto
+    Dado que el cargo "Cajero" tiene valor de domingo $500.000
+    Cuando se registra un turno de "Cajero" en un domingo
+    Entonces el turno debe valer $500.000
+
+  Escenario: Pagar el acumulado
+    Dado que Pedro tiene 5 turnos sin pagar
+    Cuando la cajera marca 3 de ellos y registra el pago con un descuento
+    Entonces debe crearse un pago pendiente de confirmación con esos 3 turnos
+    Y deben quedar 2 turnos sin pagar
+    Y Pedro debe ver en su teléfono qué días le están pagando
+
+  Escenario: Borrar un pago hecho por error (solo admin)
+    Dado que hoy se pagó una nómina por equivocación
+    Cuando el administrador la borra desde el historial
+    Entonces sus turnos deben volver a quedar sin pagar
+    Y el dinero no debe contarse como salido de la caja ese día
+
+  Escenario: Un turno pagado no se corrige sin borrar el pago
+    Dado que un turno ya está incluido en un pago
+    Cuando el administrador intenta borrarlo o cambiarlo
+    Entonces el sistema debe pedir borrar primero el pago
+
+  Escenario: Cargo sin valor
+    Dado que el cargo "Cocinera" tiene valor $0
+    Cuando la cajera intenta registrar un turno de "Cocinera"
+    Entonces el sistema debe rechazarlo y pedir que el administrador ponga el valor
+
+  Escenario: Excel estilo Kardex
+    Cuando se descarga el Excel de nómina
+    Entonces cada mes debe tener una hoja con, por empleado, los días trabajados (fecha, día, cargo, valor, pagado o sin pagar) y sus pagos
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Hora de cierre por día de la semana
+  Como administrador
+  Quiero una hora de cierre distinta para cada día
+  Porque no todos los días se cierra a la misma hora
+
+  Escenario: Reporte de respaldo del día
+    Dado que el sábado tiene hora de cierre 23:45 y el lunes no tiene hora propia
+    Cuando llega la hora en un sábado sin cierre de caja
+    Entonces debe salir solo el reporte del día
+    Y el lunes debe usarse la hora general
+```

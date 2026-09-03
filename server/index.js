@@ -107,7 +107,10 @@ function preciosPorDefecto() {
   const n = (c) => Math.max(0, Math.round(Number(getConfig(c)) || 0));
   return {
     proteina_dia: { precio: n('precio_dia_entrada'), solo: n('precio_dia_solo') },
-    proteina_especial: { precio: n('precio_especial_entrada'), solo: n('precio_especial_solo') }
+    proteina_especial: { precio: n('precio_especial_entrada'), solo: n('precio_especial_solo') },
+    // La entrada va incluida en el almuerzo (precio 0); lo que se configura es
+    // cuánto vale vendida sola, para cuando piden solo una sopa
+    entrada: { precio: 0, solo: n('precio_entrada_sola') }
   };
 }
 
@@ -345,9 +348,11 @@ function chipsActuales() {
 }
 
 function pendientesNominaDe(usuarioId) {
+  // Con sus turnos, para que el empleado vea qué días le están pagando
   return db.prepare(
     `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
-     WHERE n.empleado_id = ? AND n.estado = 'pendiente' ORDER BY n.id`).all(usuarioId);
+     WHERE n.empleado_id = ? AND n.estado = 'pendiente' ORDER BY n.id`).all(usuarioId)
+    .map(n => ({ ...n, turnos: db.prepare('SELECT jornada, cargo, valor FROM turnos WHERE pago_id = ? ORDER BY jornada').all(n.id) }));
 }
 
 app.post('/api/pedidos', requiere(1), (req, res) => {
@@ -828,7 +833,7 @@ function valorTurnoPara(u, jornada) {
 }
 
 app.get('/api/usuarios', requiere(3), (_req, res) => {
-  res.json(db.prepare('SELECT id, nombre, rol, valor_turno, turnos, activo FROM usuarios WHERE eliminado = 0 ORDER BY nombre').all()
+  res.json(db.prepare('SELECT id, nombre, rol, valor_turno, turnos, cargo_habitual, activo FROM usuarios WHERE eliminado = 0 ORDER BY nombre').all()
     .map(u => ({ ...u, turnos: turnosDe(u) })));
 });
 
@@ -884,8 +889,9 @@ app.put('/api/usuarios/:id', requiere(3), (req, res) => {
     }
   }
   // Desactivar no borra: sus ventas históricas quedan intactas
-  db.prepare('UPDATE usuarios SET nombre = ?, rol = ?, activo = ?, pin = ?, valor_turno = ?, turnos = ? WHERE id = ?')
-    .run(nombre, rol, activo, pin, valorTurno, turnos, u.id);
+  const cargoHabitual = req.body.cargo_habitual !== undefined ? (String(req.body.cargo_habitual).trim().slice(0, 30) || null) : u.cargo_habitual;
+  db.prepare('UPDATE usuarios SET nombre = ?, rol = ?, activo = ?, pin = ?, valor_turno = ?, turnos = ?, cargo_habitual = ? WHERE id = ?')
+    .run(nombre, rol, activo, pin, valorTurno, turnos, cargoHabitual, u.id);
   // Si se desactivó, le cambiaron el PIN o el rol, la sesión que tenga abierta
   // en su teléfono deja de valer en el acto
   if (!activo || pin !== u.pin || rol !== u.rol) cerrarSesionesDe(u.id);
@@ -928,7 +934,8 @@ app.put('/api/config', requiere(3), (req, res) => {
   const permitidas = ['nombre_restaurante', 'recargo_empaque', 'hora_reporte', 'correo_dueno', 'gmail_usuario',
     'gmail_app_password', 'sheets_webhook_url', 'modo_impresion', 'impresora_share', 'puerto_com', 'ancho_ticket', 'tamano_platos', 'tamano_obs',
     'recargo_tarjeta_fijo', 'recargo_tarjeta_umbral', 'recargo_tarjeta_pct',
-    'factura_titulo', 'factura_razon_social', 'factura_nit', 'factura_direccion', 'factura_telefono', 'factura_leyenda'];
+    'factura_titulo', 'factura_razon_social', 'factura_nit', 'factura_direccion', 'factura_telefono', 'factura_leyenda',
+    'horas_reporte'];
   for (const [clave, valor] of Object.entries(req.body || {})) {
     if (!permitidas.includes(clave)) continue;
     if (clave === 'gmail_app_password' && valor === '(guardada)') continue;
@@ -971,7 +978,7 @@ app.put('/api/grupos', requiere(1), (req, res) => {
 // pueden fijar precios al crear platos; el cambio aplica a todos los platos
 // marcados con "precio por defecto" (las ventas ya registradas no se tocan).
 app.put('/api/precios-default', requiere(1), (req, res) => {
-  const claves = ['precio_dia_entrada', 'precio_dia_solo', 'precio_especial_entrada', 'precio_especial_solo'];
+  const claves = ['precio_dia_entrada', 'precio_dia_solo', 'precio_especial_entrada', 'precio_especial_solo', 'precio_entrada_sola'];
   for (const clave of claves) {
     if (req.body[clave] === undefined) continue;
     const v = Math.max(0, Math.round(Number(req.body[clave])));
@@ -1008,7 +1015,12 @@ app.delete('/api/gastos/:id', requiere(2), (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Nómina ----------
+// ---------- Nómina: turnos (días trabajados) y pagos ----------
+// Dos pasos, como el Kardex de papel: primero se registra el TURNO (qué día
+// vino y qué hizo: "lunes, auxiliar de caja"), y otro día se le PAGA el
+// acumulado. El cargo va en el turno porque un mismo empleado hace cosas
+// distintas cada día. El valor lo fija el cargo (Admin → Cargos de nómina);
+// solo el admin puede poner otro valor a mano.
 function inicioSemana() {
   const d = new Date();
   d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // lunes de esta semana
@@ -1019,34 +1031,140 @@ function inicioQuincena() {
   return hoy.slice(0, 8) + (Number(hoy.slice(8)) <= 15 ? '01' : '16');
 }
 function inicioMes() { return jornadaHoy().slice(0, 8) + '01'; }
+const fechaValida = (v, alt) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : alt;
 
-// El cajero registra el pago; el empleado lo confirma desde su propia sesión
+function cargosNomina() {
+  try { return JSON.parse(getConfig('cargos_nomina') || '[]'); } catch { return []; }
+}
+// Valor de un cargo en una fecha: sábado y domingo pueden pagar distinto
+function valorCargo(cargo, jornada) {
+  const c = cargosNomina().find(x => x.nombre === cargo);
+  if (!c) return null;
+  const dia = new Date(jornada + 'T12:00:00').getDay();
+  const v = dia === 0 ? (c.domingo || c.valor) : dia === 6 ? (c.sabado || c.valor) : c.valor;
+  return Math.max(0, Math.round(Number(v) || 0));
+}
+
+app.get('/api/cargos', requiere(2), (_req, res) => res.json(cargosNomina()));
+
+app.put('/api/cargos', requiere(3), (req, res) => {
+  const lista = Array.isArray(req.body.cargos) ? req.body.cargos : null;
+  if (!lista) return res.status(400).json({ error: 'Formato no válido' });
+  const limpios = [], vistos = new Set();
+  const n = (v) => v === null || v === undefined || String(v).trim() === '' ? null : (aEntero(v) || 0);
+  for (const c of lista) {
+    const nombre = String(c.nombre || '').trim().slice(0, 30);
+    if (!nombre || vistos.has(nombre.toLowerCase())) continue;
+    vistos.add(nombre.toLowerCase());
+    limpios.push({ nombre, valor: n(c.valor) || 0, sabado: n(c.sabado), domingo: n(c.domingo) });
+  }
+  setConfig('cargos_nomina', JSON.stringify(limpios.slice(0, 30)));
+  io.emit('nomina:actualizada');
+  res.json({ ok: true, cargos: limpios });
+});
+
+// ---- Turnos ----
+const consultaTurnos = db.prepare(
+  `SELECT t.*, u.nombre AS empleado, n.estado AS pago_estado, n.jornada AS pagado_en
+   FROM turnos t JOIN usuarios u ON u.id = t.empleado_id LEFT JOIN nomina n ON n.id = t.pago_id
+   WHERE t.jornada >= ? AND t.jornada <= ? ORDER BY t.jornada, u.nombre, t.id`);
+
+app.get('/api/turnos', requiere(2), (req, res) => {
+  const hoy = jornadaHoy();
+  const desde = fechaValida(req.query.desde, hoy.slice(0, 8) + '01');
+  const hasta = fechaValida(req.query.hasta, hoy);
+  let lista = consultaTurnos.all(desde, hasta);
+  if (req.query.empleado) lista = lista.filter(t => t.empleado_id === Number(req.query.empleado));
+  res.json(lista);
+});
+
+app.post('/api/turnos', requiere(2), (req, res) => {
+  const empleado = db.prepare('SELECT * FROM usuarios WHERE id = ? AND activo = 1 AND eliminado = 0').get(req.body.empleado_id);
+  if (!empleado) return res.status(404).json({ error: 'Empleado no encontrado' });
+  const jornada = fechaValida(req.body.jornada, jornadaHoy());
+  if (jornada > jornadaHoy()) return res.status(400).json({ error: 'No se puede registrar un turno de una fecha futura' });
+  const cargo = String(req.body.cargo || '').trim();
+  if (!cargosNomina().some(c => c.nombre === cargo)) return res.status(400).json({ error: 'Elija un cargo (se configuran en Admin → Cargos de nómina)' });
+  // El valor es el del cargo ese día; solo el admin puede poner otro a mano
+  let valor = valorCargo(cargo, jornada);
+  if (req.usuario.rol === 'admin' && String(req.body.valor ?? '').trim() !== '') valor = aEntero(req.body.valor);
+  if (!(valor > 0)) return res.status(400).json({ error: `El cargo "${cargo}" no tiene valor configurado: el administrador debe ponerlo en Admin → Cargos de nómina` });
+  if (!req.body.repetir && db.prepare('SELECT id FROM turnos WHERE empleado_id = ? AND jornada = ? AND cargo = ?').get(empleado.id, jornada, cargo)) {
+    return res.status(409).json({ error: `${empleado.nombre} ya tiene un turno de ${cargo} el ${jornada}`, duplicado: true });
+  }
+  const nota = String(req.body.nota || '').trim().slice(0, 80) || null;
+  const r = db.prepare('INSERT INTO turnos (empleado_id, jornada, cargo, valor, nota, registrado_por, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(empleado.id, jornada, cargo, valor, nota, req.usuario.usuarioId, ahora());
+  registrarHistorial(null, req.usuario.usuarioId, 'turno', `${empleado.nombre} ${jornada} ${cargo} ${valor}`);
+  io.emit('nomina:actualizada');
+  res.json({ id: r.lastInsertRowid, valor });
+});
+
+// Editar o borrar un turno (solo admin, también de días pasados). Si ya está
+// pagado, primero hay que borrar ese pago: si no, la suma del pago no cuadraría.
+app.put('/api/turnos/:id', requiere(3), (req, res) => {
+  const t = db.prepare('SELECT * FROM turnos WHERE id = ?').get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Turno no encontrado' });
+  if (t.pago_id) return res.status(409).json({ error: 'Ese turno ya está pagado: borre primero el pago para poder cambiarlo' });
+  const jornada = fechaValida(req.body.jornada, t.jornada);
+  const cargo = req.body.cargo !== undefined ? String(req.body.cargo).trim() : t.cargo;
+  if (!cargosNomina().some(c => c.nombre === cargo)) return res.status(400).json({ error: 'Cargo no válido' });
+  let valor = t.valor;
+  if (String(req.body.valor ?? '').trim() !== '') valor = aEntero(req.body.valor);
+  else if (cargo !== t.cargo || jornada !== t.jornada) valor = valorCargo(cargo, jornada) || t.valor;
+  if (!(valor > 0)) return res.status(400).json({ error: 'Valor no válido' });
+  const nota = req.body.nota !== undefined ? (String(req.body.nota).trim().slice(0, 80) || null) : t.nota;
+  db.prepare('UPDATE turnos SET jornada = ?, cargo = ?, valor = ?, nota = ? WHERE id = ?').run(jornada, cargo, valor, nota, t.id);
+  registrarHistorial(null, req.usuario.usuarioId, 'turno_editado', `#${t.id}: ${jornada} ${cargo} ${valor}`);
+  io.emit('nomina:actualizada');
+  res.json({ ok: true, valor });
+});
+
+app.delete('/api/turnos/:id', requiere(3), (req, res) => {
+  const t = db.prepare('SELECT * FROM turnos WHERE id = ?').get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Turno no encontrado' });
+  if (t.pago_id) return res.status(409).json({ error: 'Ese turno ya está pagado: borre primero el pago' });
+  db.prepare('DELETE FROM turnos WHERE id = ?').run(t.id);
+  registrarHistorial(null, req.usuario.usuarioId, 'turno_borrado', `#${t.id}: ${t.jornada} ${t.cargo} ${t.valor}`);
+  io.emit('nomina:actualizada');
+  res.json({ ok: true });
+});
+
+// ---- Pagos ----
+const turnosDelPago = db.prepare('SELECT id, jornada, cargo, valor FROM turnos WHERE pago_id = ? ORDER BY jornada, id');
+function pagoConTurnos(n) { return { ...n, turnos: turnosDelPago.all(n.id) }; }
+
+// La cajera paga el acumulado de turnos sin pagar; el empleado confirma en su teléfono
 app.post('/api/nomina', requiere(2), (req, res) => {
   if (!validarJornadaAbierta(res)) return;
-  const empleado = db.prepare('SELECT * FROM usuarios WHERE id = ? AND activo = 1').get(req.body.empleado_id);
+  const empleado = db.prepare('SELECT * FROM usuarios WHERE id = ? AND activo = 1 AND eliminado = 0').get(req.body.empleado_id);
   if (!empleado) return res.status(404).json({ error: 'Empleado no encontrado' });
-  const jornada = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.jornada || '')) ? req.body.jornada : jornadaHoy();
-  // El valor del turno es FIJO para el cajero (el que configuró el admin,
-  // según el día de la semana de la fecha del turno); solo el admin puede
-  // pagar un turno con un valor distinto
-  const turno = (req.usuario.rol === 'admin' && String(req.body.valor_turno ?? '').trim() !== '')
-    ? Math.max(0, Math.round(Number(req.body.valor_turno) || 0))
-    : valorTurnoPara(empleado, jornada);
-  const descuento = Math.max(0, Math.round(Number(req.body.descuento) || 0));
-  const bono = Math.max(0, Math.round(Number(req.body.bono) || 0));
+  const ids = (Array.isArray(req.body.turno_ids) ? req.body.turno_ids : []).map(Number).filter(Number.isInteger);
+  const turnos = ids.length
+    ? db.prepare(`SELECT * FROM turnos WHERE id IN (${ids.map(() => '?').join(',')}) AND empleado_id = ? AND pago_id IS NULL`).all(...ids, empleado.id)
+    : [];
+  if (!turnos.length) return res.status(400).json({ error: 'Elija al menos un turno sin pagar' });
+  const suma = turnos.reduce((s, t) => s + t.valor, 0);
+  const descuento = aEntero(req.body.descuento) || 0;
+  const bono = aEntero(req.body.bono) || 0;
   const concepto = String(req.body.concepto || '').trim().slice(0, 80) || null;
-  const total = turno - descuento + bono;
+  const total = suma - descuento + bono;
   if (total <= 0) return res.status(400).json({ error: 'El total del pago debe ser mayor a cero' });
-  const r = db.prepare(
-    `INSERT INTO nomina (empleado_id, jornada, valor_turno, descuento, bono, total, concepto, estado, registrado_por, creado_en)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pendiente', ?, ?)`)
-    .run(empleado.id, jornada, turno, descuento, bono, total, concepto, req.usuario.usuarioId, ahora());
+  const id = db.transaction(() => {
+    const r = db.prepare(
+      `INSERT INTO nomina (empleado_id, jornada, valor_turno, descuento, bono, total, concepto, estado, registrado_por, creado_en)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pendiente', ?, ?)`)
+      .run(empleado.id, jornadaHoy(), suma, descuento, bono, total, concepto, req.usuario.usuarioId, ahora());
+    const marcar = db.prepare('UPDATE turnos SET pago_id = ? WHERE id = ?');
+    for (const t of turnos) marcar.run(r.lastInsertRowid, t.id);
+    return r.lastInsertRowid;
+  })();
+  registrarHistorial(null, req.usuario.usuarioId, 'pago_nomina', `${empleado.nombre}: ${turnos.length} turno(s) = ${total}`);
+  const pago = pagoConTurnos(db.prepare('SELECT * FROM nomina WHERE id = ?').get(id));
   // Aviso directo al teléfono del empleado para que confirme
-  io.to(`usuario:${empleado.id}`).emit('nomina:pendiente', {
-    id: r.lastInsertRowid, empleado: empleado.nombre, jornada, valor_turno: turno, descuento, bono, total, concepto
-  });
+  io.to(`usuario:${empleado.id}`).emit('nomina:pendiente', { ...pago, empleado: empleado.nombre });
   io.emit('nomina:actualizada');
-  res.json({ id: r.lastInsertRowid });
+  res.json({ id, total, turnos: turnos.length });
 });
 
 // Confirma el propio empleado (desde su sesión) o el admin (para quien no usa la app)
@@ -1067,31 +1185,78 @@ app.post('/api/nomina/:id/confirmar', requiere(1), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/nomina/:id/anular', requiere(3), (req, res) => {
-  db.prepare("UPDATE nomina SET estado = 'anulado' WHERE id = ?").run(req.params.id);
+// Corregir descuento, bono o concepto de un pago (admin, también de días
+// pasados). El total se recalcula con los turnos que tiene enlazados.
+app.put('/api/nomina/:id', requiere(3), (req, res) => {
+  const n = db.prepare('SELECT * FROM nomina WHERE id = ?').get(req.params.id);
+  if (!n) return res.status(404).json({ error: 'Pago no encontrado' });
+  const suma = turnosDelPago.all(n.id).reduce((s, t) => s + t.valor, 0) || n.valor_turno;
+  const descuento = req.body.descuento !== undefined ? (aEntero(req.body.descuento) || 0) : n.descuento;
+  const bono = req.body.bono !== undefined ? (aEntero(req.body.bono) || 0) : n.bono;
+  const concepto = req.body.concepto !== undefined ? (String(req.body.concepto).trim().slice(0, 80) || null) : n.concepto;
+  const total = suma - descuento + bono;
+  if (total <= 0) return res.status(400).json({ error: 'El total del pago debe ser mayor a cero' });
+  db.prepare('UPDATE nomina SET valor_turno = ?, descuento = ?, bono = ?, total = ?, concepto = ? WHERE id = ?')
+    .run(suma, descuento, bono, total, concepto, n.id);
+  registrarHistorial(null, req.usuario.usuarioId, 'pago_nomina_editado', `#${n.id} ${n.jornada}: total ${n.total} -> ${total}`);
+  io.emit('nomina:actualizada');
+  io.emit('caja:actualizada');
+  res.json({ ok: true, total });
+});
+
+// Borrar un pago (admin), también de días pasados: p. ej. una nómina pagada
+// por error. Sus turnos vuelven a quedar sin pagar, no se pierden.
+app.delete('/api/nomina/:id', requiere(3), (req, res) => {
+  const n = db.prepare('SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id WHERE n.id = ?').get(req.params.id);
+  if (!n) return res.status(404).json({ error: 'Pago no encontrado' });
+  db.transaction(() => {
+    db.prepare('UPDATE turnos SET pago_id = NULL WHERE pago_id = ?').run(n.id);
+    db.prepare('DELETE FROM nomina WHERE id = ?').run(n.id);
+  })();
+  registrarHistorial(null, req.usuario.usuarioId, 'pago_nomina_borrado', `${n.empleado} ${n.jornada} ${n.total} (${n.estado})`);
   io.emit('nomina:actualizada');
   io.emit('caja:actualizada');
   res.json({ ok: true });
 });
 
-// Totales por empleado: hoy, semana (desde el lunes), quincena y mes
-app.get('/api/nomina/resumen', requiere(2), (_req, res) => {
+// Anular (se conserva por compatibilidad): el pago queda marcado y sus turnos
+// vuelven a estar sin pagar
+app.post('/api/nomina/:id/anular', requiere(3), (req, res) => {
+  db.transaction(() => {
+    db.prepare("UPDATE nomina SET estado = 'anulado' WHERE id = ?").run(req.params.id);
+    db.prepare('UPDATE turnos SET pago_id = NULL WHERE pago_id = ?').run(req.params.id);
+  })();
+  io.emit('nomina:actualizada');
+  io.emit('caja:actualizada');
+  res.json({ ok: true });
+});
+
+// Todo lo que necesita la pantalla de nómina en una sola consulta
+app.get('/api/nomina/resumen', requiere(2), (req, res) => {
   const hoy = jornadaHoy();
   const sumaDesde = db.prepare(
     "SELECT COALESCE(SUM(total), 0) AS t FROM nomina WHERE empleado_id = ? AND estado = 'confirmado' AND jornada >= ? AND jornada <= ?");
-  const empleados = db.prepare('SELECT id, nombre, rol, valor_turno, turnos FROM usuarios WHERE activo = 1 AND eliminado = 0 ORDER BY nombre').all()
-    .map(u => ({
-      ...u,
-      turnos: turnosDe(u), // para que el formulario muestre el valor del día elegido
-      dia: sumaDesde.get(u.id, hoy, hoy).t,
-      semana: sumaDesde.get(u.id, inicioSemana(), hoy).t,
-      quincena: sumaDesde.get(u.id, inicioQuincena(), hoy).t,
-      mes: sumaDesde.get(u.id, inicioMes(), hoy).t
-    }));
+  const sinPagarDe = db.prepare('SELECT id, jornada, cargo, valor, nota FROM turnos WHERE empleado_id = ? AND pago_id IS NULL ORDER BY jornada, id');
+  const empleados = db.prepare('SELECT id, nombre, rol, cargo_habitual FROM usuarios WHERE activo = 1 AND eliminado = 0 ORDER BY nombre').all()
+    .map(u => {
+      const sinPagar = sinPagarDe.all(u.id);
+      return {
+        ...u, sinPagar, totalSinPagar: sinPagar.reduce((s, t) => s + t.valor, 0),
+        dia: sumaDesde.get(u.id, hoy, hoy).t,
+        semana: sumaDesde.get(u.id, inicioSemana(), hoy).t,
+        quincena: sumaDesde.get(u.id, inicioQuincena(), hoy).t,
+        mes: sumaDesde.get(u.id, inicioMes(), hoy).t
+      };
+    });
   const pendientes = db.prepare(
     `SELECT n.*, u.nombre AS empleado, u.rol AS empleado_rol FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
-     WHERE n.estado = 'pendiente' ORDER BY n.id DESC`).all();
-  res.json({ empleados, pendientes });
+     WHERE n.estado = 'pendiente' ORDER BY n.id DESC`).all().map(pagoConTurnos);
+  const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || '')) ? req.query.mes : hoy.slice(0, 7);
+  const pagosMes = db.prepare(
+    `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
+     WHERE n.jornada >= ? AND n.jornada <= ? ORDER BY n.jornada DESC, n.id DESC`).all(mes + '-01', mes + '-31').map(pagoConTurnos);
+  const turnosMes = consultaTurnos.all(mes + '-01', mes + '-31');
+  res.json({ hoy, mes, cargos: cargosNomina(), empleados, pendientes, pagosMes, turnosMes });
 });
 
 // ---------- Impresión ----------

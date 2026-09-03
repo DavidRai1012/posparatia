@@ -144,9 +144,12 @@ function resumenJornada(jornada) {
   const porCobrar = efectivos.filter(p => !pagadosIds.has(p.id));
 
   const gastos = db.prepare('SELECT g.*, u.nombre AS usuario FROM gastos g JOIN usuarios u ON u.id = g.usuario_id WHERE g.jornada = ?').all(jornada);
+  // Cada pago lleva sus turnos (qué días y qué hizo) para el reporte
+  const turnosDePago = db.prepare('SELECT jornada, cargo, valor FROM turnos WHERE pago_id = ? ORDER BY jornada');
   const nominaDia = db.prepare(
     `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
-     WHERE n.jornada = ? AND n.estado = 'confirmado'`).all(jornada);
+     WHERE n.jornada = ? AND n.estado = 'confirmado'`).all(jornada)
+    .map(n => ({ ...n, turnos: turnosDePago.all(n.id) }));
   const ventasEfectivo = porMetodo.efectivo || 0; // el real, si el total fue corregido
   const totalGastos = gastos.reduce((s, g) => s + g.valor, 0);
   const totalNomina = nominaDia.reduce((s, n) => s + n.total, 0);
@@ -183,7 +186,7 @@ function resumenJornada(jornada) {
     porCobrar: porCobrar.map(p => ({ id: p.id, numero_comanda: p.numero_comanda, comensal: p.comensal, total: p.total, vendedor: p.vendedor })),
     gastos: gastos.map(g => ({ id: g.id, concepto: g.concepto, valor: g.valor, usuario: g.usuario })),
     totalGastos,
-    nomina: nominaDia.map(n => ({ empleado: n.empleado, turno: n.valor_turno, descuento: n.descuento, bono: n.bono, concepto: n.concepto, total: n.total })),
+    nomina: nominaDia.map(n => ({ empleado: n.empleado, turno: n.valor_turno, descuento: n.descuento, bono: n.bono, concepto: n.concepto, total: n.total, turnos: n.turnos })),
     totalNomina,
     numAlmuerzos, totalAlmuerzos, totalExtras,
     // Detalle de qué se vendió (por plato y por tipo de proteína)
@@ -245,13 +248,20 @@ function resumenMes(mes) {
     }
     for (const g of r.gastos) acumulado.gastos.push({ ...g, jornada: j });
     for (const n of r.nomina) {
-      const e = nominaPorEmpleado.get(n.empleado) || { empleado: n.empleado, turnos: 0, total: 0, descuentos: 0, bonos: 0 };
-      e.turnos++; e.total += n.total; e.descuentos += n.descuento; e.bonos += n.bono;
+      const e = nominaPorEmpleado.get(n.empleado) || { empleado: n.empleado, pagos: 0, turnos: 0, total: 0, descuentos: 0, bonos: 0 };
+      e.pagos++; e.turnos += (n.turnos && n.turnos.length) || 1; e.total += n.total; e.descuentos += n.descuento; e.bonos += n.bono;
       nominaPorEmpleado.set(n.empleado, e);
     }
     for (const p of r.porCobrar) acumulado.porCobrar.push({ ...p, jornada: j });
   }
   acumulado.nomina = [...nominaPorEmpleado.values()].sort((a, b) => b.total - a.total);
+  // Días trabajados en el mes (por fecha del turno, se hayan pagado o no):
+  // lo que el dueño quiere ver es quién vino y qué hizo
+  acumulado.turnosMes = db.prepare(
+    `SELECT u.nombre AS empleado, t.cargo, COUNT(*) AS cantidad, SUM(t.valor) AS total,
+            SUM(CASE WHEN t.pago_id IS NULL THEN t.valor ELSE 0 END) AS sinPagar
+     FROM turnos t JOIN usuarios u ON u.id = t.empleado_id
+     WHERE t.jornada >= ? AND t.jornada <= ? GROUP BY u.nombre, t.cargo ORDER BY u.nombre, t.cargo`).all(desde, hasta);
   const v = ventasPorPlato(desde, hasta);
   acumulado.porPlato = v.platos;
   acumulado.porGrupo = v.grupos;
@@ -594,6 +604,17 @@ function estadoSync() {
   };
 }
 
+// Hora del reporte de respaldo del día: no todos los días se cierra a la
+// misma hora, así que hay una por día de la semana; vacía = la general
+function horaReporteDe(jornada) {
+  try {
+    const horas = JSON.parse(getConfig('horas_reporte') || '[]');
+    const h = horas[new Date(jornada + 'T12:00:00').getDay()];
+    if (/^\d{2}:\d{2}$/.test(h || '')) return h;
+  } catch { }
+  return getConfig('hora_reporte');
+}
+
 // ---- Planificador: reporte automático a la hora configurada + drenaje de colas ----
 let ultimaJornadaReportada = null;
 let drenando = false; // un ciclo a la vez: si internet está lento, no acumular intentos
@@ -603,7 +624,7 @@ function iniciarPlanificador() {
     drenando = true;
     try {
       const jornada = jornadaHoy();
-      const horaConfig = getConfig('hora_reporte'); // se lee en cada ciclo: cambia sin reiniciar
+      const horaConfig = horaReporteDe(jornada); // se lee en cada ciclo: cambia sin reiniciar
       const d = new Date();
       const horaActual = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
       const yaEncolado = db.prepare('SELECT id FROM cola_correos WHERE jornada = ?').get(jornada);
@@ -625,5 +646,5 @@ function iniciarPlanificador() {
 module.exports = {
   resumenJornada, resumenMes, ventasPorPlato, filasVentas, nombreReporte, baseCajaDe, ETIQUETAS_METODO,
   ejecutarCierre, encolarReporteDiario, encolarReportesMensuales, mesesPorReportar,
-  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, drenarCorreos, drenarSheets, diagnosticoSheets, estadoSync, hayInternet
+  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, horaReporteDe, drenarCorreos, drenarSheets, diagnosticoSheets, estadoSync, hayInternet
 };

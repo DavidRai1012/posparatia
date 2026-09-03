@@ -364,3 +364,26 @@ td.num, th.num { text-align: right; }
 .red-qr.chico { margin: 6px 0 4px; }
 #login .red-qr.chico svg, .red-qr.chico svg { max-width: 120px; }
 .red-url.chico { font-size: 13px; font-weight: 700; }
+
+/* Buscador del Menú: se queda pegado arriba al desplazarse (con 300 platos,
+   volver a subir para buscar otro era media pantalla de scroll) */
+.buscador-pegado {
+  position: sticky; top: 0; z-index: 5;
+  box-shadow: 0 4px 12px rgba(0,0,0,.45);
+}
+/* Cabecera de cada tipo de proteína (Pollo, Carne, Cerdo...) en el Menú */
+.grupo-cab {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; margin: 8px 0 6px; padding: 10px 12px; cursor: pointer;
+  background: var(--panel2); color: var(--texto);
+  border: 1px solid var(--borde); border-left: 3px solid var(--primario);
+  border-radius: 10px; font-size: 14px; font-weight: 700; text-align: left;
+}
+
+/* Pantalla de nómina: filas de turnos */
+.turno-fila { padding: 6px 0; border-bottom: 1px dashed var(--borde); font-size: 14px; }
+.turno-fila:last-child { border-bottom: none; }
+.cargo-fila input { padding: 8px 8px; font-size: 14px; }
+/* En el celular, nombre del cargo en su propia línea y los valores debajo */
+.cargo-fila { flex-wrap: wrap !important; }
+.cargo-fila [data-cargo-nombre] { flex: 1 1 100% !important; }

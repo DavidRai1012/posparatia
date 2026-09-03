@@ -171,6 +171,25 @@ CREATE TABLE IF NOT EXISTS ajustes_metodo (
   PRIMARY KEY (jornada, metodo)
 );
 
+-- Nómina en dos pasos, como el Kardex que llevaban a mano:
+--   1. TURNO: el día que vino y qué hizo ("lunes, auxiliar de caja, 200.000").
+--      Un mismo empleado hace cosas distintas cada día, así que el cargo va
+--      en el turno, no en el usuario.
+--   2. PAGO (tabla nomina): cuando se le paga el acumulado, los turnos quedan
+--      enlazados al pago (pago_id) y el empleado confirma en su teléfono.
+CREATE TABLE IF NOT EXISTS turnos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  empleado_id INTEGER NOT NULL REFERENCES usuarios(id),
+  jornada TEXT NOT NULL,
+  cargo TEXT NOT NULL,
+  valor INTEGER NOT NULL,
+  nota TEXT,
+  pago_id INTEGER REFERENCES nomina(id),
+  registrado_por INTEGER NOT NULL REFERENCES usuarios(id),
+  creado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turnos_empleado ON turnos(empleado_id, jornada);
+
 CREATE TABLE IF NOT EXISTS historial (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   pedido_id INTEGER REFERENCES pedidos(id),
@@ -362,6 +381,27 @@ if (!db.prepare('PRAGMA table_info(ajustes_metodo)').all().some(c => c.name === 
   console.log('[db] Migración aplicada: correcciones de total por método como diferencia');
 }
 
+// Migración: cargo habitual del empleado (lo que suele hacer, para preseleccionar)
+if (!db.prepare('PRAGMA table_info(usuarios)').all().some(c => c.name === 'cargo_habitual')) {
+  db.exec('ALTER TABLE usuarios ADD COLUMN cargo_habitual TEXT');
+  console.log('[db] Migración aplicada: cargo habitual del empleado');
+}
+
+// Migración: los pagos de nómina viejos eran "un turno pagado el mismo día".
+// Se les crea su turno enlazado para que el Kardex de días trabajados quede
+// completo hacia atrás (los anulados no cuentan).
+if (db.prepare('SELECT COUNT(*) AS n FROM turnos').get().n === 0 &&
+    db.prepare("SELECT COUNT(*) AS n FROM nomina WHERE estado != 'anulado'").get().n > 0) {
+  const viejos = db.prepare(
+    `SELECT n.*, u.rol FROM nomina n JOIN usuarios u ON u.id = n.empleado_id WHERE n.estado != 'anulado'`).all();
+  const ins = db.prepare('INSERT INTO turnos (empleado_id, jornada, cargo, valor, pago_id, registrado_por, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const nombreCargo = { admin: 'Administrador', cajero: 'Cajero', mesero: 'Mesero', cocinera: 'Cocinera' };
+  db.transaction(() => {
+    for (const n of viejos) ins.run(n.empleado_id, n.jornada, nombreCargo[n.rol] || n.rol, n.valor_turno, n.id, n.registrado_por, n.creado_en);
+  })();
+  console.log(`[db] Migración aplicada: ${viejos.length} pago(s) de nómina viejos convertidos en turnos`);
+}
+
 // ---- Helpers de fecha/hora local ----
 function ahora() {
   return new Date().toLocaleString('sv-SE'); // "YYYY-MM-DD HH:MM:SS" en hora local
@@ -404,8 +444,22 @@ const CONFIG_DEFAULTS = {
   precio_dia_solo: '17000',
   precio_especial_entrada: '26000',
   precio_especial_solo: '25000',
+  // La entrada va incluida en el almuerzo; este es su precio vendida sola
+  precio_entrada_sola: '7500',
   // Meses cuyo reporte mensual ya se encoló (para no repetirlo en cada cierre)
   meses_reportados: '[]',
+  // Cargos de nómina con su valor por turno. sabado/domingo vacíos = igual que
+  // el valor normal. El admin pone los valores; la cajera solo elige el cargo.
+  cargos_nomina: JSON.stringify([
+    { nombre: 'Cajero', valor: 0, sabado: null, domingo: null },
+    { nombre: 'Auxiliar de caja', valor: 0, sabado: null, domingo: null },
+    { nombre: 'Auxiliar de cocina', valor: 0, sabado: null, domingo: null },
+    { nombre: 'Mesero', valor: 0, sabado: null, domingo: null },
+    { nombre: 'Cocinera', valor: 0, sabado: null, domingo: null }
+  ]),
+  // Hora de cierre (reporte de respaldo) por día de la semana, índice getDay()
+  // (0 = domingo). Vacío = usa hora_reporte. No todos los días se cierra igual.
+  horas_reporte: '["","","","","","",""]',
   // Última sincronización con Google Sheets (para el solucionador de problemas)
   sheets_ultimo_ok: '',
   sheets_ultimo_error: '',

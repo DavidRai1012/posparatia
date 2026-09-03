@@ -16,6 +16,7 @@ const fmt = (n) => '$' + Number(n || 0).toLocaleString('es-CO');
 const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
   'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 const DIAS = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+const DIAS_CORTOS = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
 const nombreMes = (mes) => `${MESES[Number(mes.slice(5, 7)) - 1]} ${mes.slice(0, 4)}`; // '2026-09' -> 'Septiembre 2026'
 const hojaMes = (mes) => `${mes.slice(5, 7)}-${mes.slice(0, 4)}`;                          // '2026-09' -> '09-2026'
 const diaSemana = (fecha) => DIAS[new Date(fecha + 'T12:00:00').getDay()];
@@ -91,11 +92,19 @@ function seccionesResumen(r, esMes) {
       [(esMes ? g.jornada + ' · ' : '') + primeraLinea(g.concepto), fmt(g.valor), `registró ${g.usuario}`]) });
   }
   if (r.nomina.length) {
+    const detalleTurnos = (n) => n.turnos && n.turnos.length
+      ? `${n.turnos.length} turno(s): ${n.turnos.map(t => `${DIAS_CORTOS[new Date(t.jornada + 'T12:00:00').getDay()]} ${Number(t.jornada.slice(8, 10))} ${t.cargo}`).join(', ')}`
+      : `turno ${fmt(n.turno)}`;
     S.push({ titulo: `NÓMINA PAGADA (${fmt(r.totalNomina)})`, filas: esMes
       ? r.nomina.map(n => [n.empleado, fmt(n.total),
-          `${n.turnos} turno(s)${n.bonos ? `, bonos +${fmt(n.bonos)}` : ''}${n.descuentos ? `, descuentos -${fmt(n.descuentos)}` : ''}`])
+          `${n.pagos || 1} pago(s) por ${n.turnos} turno(s)${n.bonos ? `, bonos +${fmt(n.bonos)}` : ''}${n.descuentos ? `, descuentos -${fmt(n.descuentos)}` : ''}`])
       : r.nomina.map(n => [n.empleado, fmt(n.total),
-          `turno ${fmt(n.turno)}${n.descuento ? `, descuento -${fmt(n.descuento)}` : ''}${n.bono ? `, bono +${fmt(n.bono)}` : ''}${n.concepto ? ` (${n.concepto})` : ''}`]) });
+          `${detalleTurnos(n)}${n.descuento ? `, descuento -${fmt(n.descuento)}` : ''}${n.bono ? `, bono +${fmt(n.bono)}` : ''}${n.concepto ? ` (${n.concepto})` : ''}`]) });
+  }
+  // Quién vino y qué hizo en el mes, se haya pagado o no
+  if (esMes && r.turnosMes && r.turnosMes.length) {
+    S.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por cargo)', filas: r.turnosMes.map(t =>
+      [`${t.empleado} · ${t.cargo}`, t.cantidad, `${fmt(t.total)}${t.sinPagar ? ` · sin pagar ${fmt(t.sinPagar)}` : ''}`]) });
   }
 
   if (!esMes) {
@@ -271,26 +280,32 @@ function excelResumenMes(mes) {
   return XLSX.write(libro, { type: 'buffer', bookType: 'xlsx' });
 }
 
-// Excel de nómina: hoja RESUMEN (empleado × mes) + UNA HOJA POR MES, estilo
-// Kardex: dentro de cada mes, los pagos agrupados por empleado con subtotal.
-// A cada empleado se le paga distinto (hay días sin pagos, días con varios),
-// así que se lista lo que realmente se pagó, no una cuadrícula de días.
+// Excel de nómina, estilo Kardex: hoja RESUMEN (empleado × mes, lo pagado) +
+// UNA HOJA POR MES con, por empleado, los DÍAS TRABAJADOS (fecha, día, cargo,
+// valor, si ya se pagó) y luego sus PAGOS (fecha, turnos incluidos, descuento,
+// bono, total, confirmación). A cada empleado se le paga distinto (días sin
+// pago, pagos por acumulado), así que se lista lo que realmente pasó.
 // `soloMes` ('YYYY-MM') deja solo la hoja de ese mes (más el RESUMEN).
 function excelNomina(anio, soloMes) {
   const XLSX = require('xlsx');
   const pagos = db.prepare(
     `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
-     WHERE n.estado = 'confirmado' AND n.jornada LIKE ? ORDER BY n.jornada, u.nombre, n.id`).all(anio + '-%');
-  if (!pagos.length) return null;
+     WHERE n.estado != 'anulado' AND n.jornada LIKE ? ORDER BY n.jornada, u.nombre, n.id`).all(anio + '-%');
+  const turnos = db.prepare(
+    `SELECT t.*, u.nombre AS empleado, n.jornada AS pagado_en, n.estado AS pago_estado
+     FROM turnos t JOIN usuarios u ON u.id = t.empleado_id LEFT JOIN nomina n ON n.id = t.pago_id
+     WHERE t.jornada LIKE ? ORDER BY t.jornada, u.nombre, t.id`).all(anio + '-%');
+  if (!pagos.length && !turnos.length) return null;
   const libro = XLSX.utils.book_new();
+  const confirmados = pagos.filter(p => p.estado === 'confirmado');
 
-  const empleados = [...new Set(pagos.map(p => p.empleado))].sort();
+  const empleados = [...new Set([...pagos.map(p => p.empleado), ...turnos.map(t => t.empleado)])].sort();
   const filasResumen = [['Empleado', ...MESES, 'TOTAL ' + anio]];
   for (const emp of empleados) {
     const fila = [emp];
     let totalAnio = 0;
     for (let m = 1; m <= 12; m++) {
-      const suma = pagos.filter(p => p.empleado === emp && Number(p.jornada.slice(5, 7)) === m).reduce((s, p) => s + p.total, 0);
+      const suma = confirmados.filter(p => p.empleado === emp && Number(p.jornada.slice(5, 7)) === m).reduce((s, p) => s + p.total, 0);
       fila.push(suma || 0);
       totalAnio += suma;
     }
@@ -298,30 +313,49 @@ function excelNomina(anio, soloMes) {
     filasResumen.push(fila);
   }
   filasResumen.push([]);
-  const totalMes = (m) => pagos.filter(p => Number(p.jornada.slice(5, 7)) === m).reduce((s, p) => s + p.total, 0);
-  filasResumen.push(['TOTAL', ...MESES.map((_, i) => totalMes(i + 1)), pagos.reduce((s, p) => s + p.total, 0)]);
+  const totalMes = (m) => confirmados.filter(p => Number(p.jornada.slice(5, 7)) === m).reduce((s, p) => s + p.total, 0);
+  filasResumen.push(['TOTAL PAGADO', ...MESES.map((_, i) => totalMes(i + 1)), confirmados.reduce((s, p) => s + p.total, 0)]);
+  filasResumen.push([]);
+  filasResumen.push(['(pagos confirmados por el empleado; los días trabajados están en la hoja de cada mes)']);
   XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filasResumen, [18, ...MESES.map(() => 11), 13]), 'RESUMEN');
 
-  const meses = [...new Set(pagos.map(p => p.jornada.slice(0, 7)))].sort().filter(m => !soloMes || m === soloMes);
+  const meses = [...new Set([...pagos.map(p => p.jornada.slice(0, 7)), ...turnos.map(t => t.jornada.slice(0, 7))])].sort()
+    .filter(m => !soloMes || m === soloMes);
   for (const mes of meses) {
-    const delMes = pagos.filter(p => p.jornada.slice(0, 7) === mes);
-    const filas = [['Fecha', 'Día', 'Empleado', 'Turno', 'Descuento', 'Bono', 'Concepto', 'Total', 'Confirmado']];
-    let totalDelMes = 0;
+    const filas = [[`NÓMINA DE ${nombreMes(mes).toUpperCase()}`], []];
+    let totalPagadoMes = 0;
     for (const emp of empleados) {
-      const suyos = delMes.filter(p => p.empleado === emp);
-      if (!suyos.length) continue;
-      filas.push([emp.toUpperCase(), '', '', '', '', '', `${suyos.length} pago(s)`, '', '']);
-      let subtotal = 0;
-      for (const p of suyos) {
-        filas.push([p.jornada, diaSemana(p.jornada), emp, p.valor_turno, p.descuento, p.bono, p.concepto || '', p.total, (p.confirmado_en || '').slice(0, 16)]);
-        subtotal += p.total;
+      const suyos = turnos.filter(t => t.empleado === emp && t.jornada.slice(0, 7) === mes);
+      const susPagos = pagos.filter(p => p.empleado === emp && p.jornada.slice(0, 7) === mes);
+      if (!suyos.length && !susPagos.length) continue;
+      filas.push([emp.toUpperCase()]);
+      filas.push(['Días trabajados', 'Día', 'Cargo', 'Valor', 'Nota', 'Pago']);
+      let subtotalTurnos = 0, sinPagar = 0;
+      for (const t of suyos) {
+        filas.push([t.jornada, diaSemana(t.jornada), t.cargo, t.valor, t.nota || '',
+          t.pago_id ? `pagado el ${t.pagado_en}${t.pago_estado === 'pendiente' ? ' (sin confirmar)' : ''}` : 'SIN PAGAR']);
+        subtotalTurnos += t.valor;
+        if (!t.pago_id) sinPagar += t.valor;
       }
-      filas.push(['', '', '', '', '', '', `Subtotal ${emp}`, subtotal, '']);
+      if (suyos.length) filas.push(['', '', `${suyos.length} turno(s)`, subtotalTurnos, sinPagar ? `sin pagar: ${sinPagar}` : '', '']);
+      if (susPagos.length) {
+        filas.push(['Pagos', 'Turnos incluidos', 'Suma turnos', 'Descuento', 'Bono', 'Total', 'Concepto', 'Confirmado']);
+        let subtotalPagos = 0;
+        for (const p of susPagos) {
+          const incluidos = turnos.filter(t => t.pago_id === p.id).map(t => `${DIAS_CORTOS[new Date(t.jornada + 'T12:00:00').getDay()]} ${Number(t.jornada.slice(8, 10))}`).join(', ');
+          filas.push([p.jornada, incluidos, p.valor_turno, p.descuento, p.bono, p.total, p.concepto || '',
+            p.estado === 'confirmado' ? (p.confirmado_en || '').slice(0, 16) : p.estado]);
+          if (p.estado === 'confirmado') subtotalPagos += p.total;
+        }
+        filas.push(['', '', '', '', `Pagado a ${emp}`, subtotalPagos, '', '']);
+        totalPagadoMes += subtotalPagos;
+      }
       filas.push([]);
-      totalDelMes += subtotal;
     }
-    filas.push(['', '', '', '', '', '', `TOTAL ${nombreMes(mes).toUpperCase()}`, totalDelMes, '']);
-    XLSX.utils.book_append_sheet(libro, hojaConFiltro(XLSX, filas, [11, 10, 18, 10, 10, 10, 26, 11, 16]), hojaMes(mes));
+    filas.push(['', '', '', '', `TOTAL PAGADO ${nombreMes(mes).toUpperCase()}`, totalPagadoMes]);
+    const ws = XLSX.utils.aoa_to_sheet(filas);
+    ws['!cols'] = [{ wch: 14 }, { wch: 22 }, { wch: 20 }, { wch: 11 }, { wch: 22 }, { wch: 24 }, { wch: 22 }, { wch: 16 }];
+    XLSX.utils.book_append_sheet(libro, ws, hojaMes(mes));
   }
   return XLSX.write(libro, { type: 'buffer', bookType: 'xlsx' });
 }
@@ -356,10 +390,14 @@ function correosMensuales(mes) {
 
   // 1. Nómina del mes
   const filasNomina = r.nomina.length
-    ? r.nomina.map(n => [n.empleado, fmt(n.total), `${n.turnos} turno(s)${n.bonos ? `, bonos +${fmt(n.bonos)}` : ''}${n.descuentos ? `, descuentos -${fmt(n.descuentos)}` : ''}`])
+    ? r.nomina.map(n => [n.empleado, fmt(n.total), `${n.pagos || 1} pago(s) por ${n.turnos} turno(s)${n.bonos ? `, bonos +${fmt(n.bonos)}` : ''}${n.descuentos ? `, descuentos -${fmt(n.descuentos)}` : ''}`])
     : [['Sin pagos de nómina confirmados este mes', '']];
   filasNomina.push(['TOTAL NÓMINA DEL MES', fmt(r.totalNomina)]);
   const secN = [{ titulo: `NÓMINA PAGADA EN ${nm.toUpperCase()}`, filas: filasNomina }];
+  if (r.turnosMes && r.turnosMes.length) {
+    secN.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por cargo)', filas: r.turnosMes.map(t =>
+      [`${t.empleado} · ${t.cargo}`, t.cantidad, `${fmt(t.total)}${t.sinPagar ? ` · sin pagar ${fmt(t.sinPagar)}` : ''}`]) });
+  }
   const xn = excelNomina(mes.slice(0, 4), mes);
   const introN = xn
     ? `Adjunto va el Excel de nómina de ${nm} (hoja RESUMEN del año y la hoja del mes con cada pago por empleado).`
