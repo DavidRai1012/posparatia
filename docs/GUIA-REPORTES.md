@@ -55,8 +55,10 @@ function doPost(e) {
 6. Clic en **Implementar**. Google pedirá autorización: acepte
    (si sale "no verificada", clic en *Configuración avanzada → Ir al proyecto*).
 7. **Copie la URL** que aparece (termina en `/exec`).
-8. En la app del POS: entrar como administrador → pestaña **Admin** →
-   campo **"URL del webhook de Google Sheets"** → pegar la URL → **💾 Guardar configuración**.
+8. En la app del POS: entrar como administrador → pestaña **Admin** → tarjeta
+   **"📊 Excel en tiempo real"** → pegar la URL en **"URL del webhook de Google
+   Sheets"**, **marcar la casilla "Activar"** → **💾 Guardar configuración**.
+   (Viene desactivado: sin la casilla no se envía nada ni aparece ningún aviso.)
 9. Toque el botón **"🔎 Revisar Google Sheets"**. El POS revisa paso por paso y
    le dice **en qué pestaña y en qué fila** quedó la fila de prueba. Ábrala en
    la hoja: si está ahí, ya quedó y cada venta pagada se anota sola.
@@ -121,6 +123,8 @@ CIERRE DE CAJA (efectivo contado y descuadre)
 | No llega el correo | Revise Spam; verifique las 16 letras y que la verificación en 2 pasos esté activa |
 | El reporte llegó "con retraso" | Es normal: no había internet a esa hora; el sistema lo envió al reconectarse |
 | Cambié de hoja de Sheets | Repita la Parte 1 con la hoja nueva y pegue la URL nueva en Admin |
+| Arriba de la app dice "N venta(s) en espera · Internet no respondió a tiempo" | Google tardó más de 45 s o el hotspot no tiene salida. No hay que hacer nada: se reintenta solo (cada 1, 2, 4... hasta 10 min) y ninguna venta se pierde. Si dura horas, revise los datos del teléfono que comparte internet. |
+| No quiero la hoja en tiempo real | Admin → desmarque "Activar" → Guardar. No se envía nada ni aparece ningún aviso; el correo diario con Excel sigue igual. |
 
 ---
 
@@ -151,7 +155,7 @@ El formato cambió a **una pestaña por mes**. Hay dos caminos:
    la pestaña vieja queda como historial.
 
 **B) Hoja nueva desde cero:** siga la Parte 1 completa; al final pegue la URL nueva en el POS
-(Admin → URL del webhook) y pruebe con "📊 Probar Google Sheets".
+(Admin → tarjeta 📊 Excel en tiempo real, casilla "Activar") y pruebe con "🔎 Revisar Google Sheets".
 
 ## Qué correos llegan y cuándo
 

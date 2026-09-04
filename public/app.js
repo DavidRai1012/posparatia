@@ -262,6 +262,7 @@ async function iniciarApp() {
   state.config = estado.configPublica;
   state.jornada = estado.jornada;
   state.jornadaCerrada = estado.jornadaCerrada;
+  state.sheets = estado.sheets || null;
 
   $('#cabecera').classList.remove('oculto');
   $('#titulo-app').textContent = `👤 ${state.usuario.nombre}`;
@@ -349,6 +350,7 @@ function conectarSocket() {
     refrescarVistaEnVivo(['caja']);
   });
   socket.on('nomina:pendiente', (n) => { state.nominaPendientes.push(n); mostrarConfirmacionNomina(); });
+  socket.on('sheets:estado', (estado) => { state.sheets = estado; renderBanner(); });
   socket.on('trabajo:imprimir', manejarTrabajoImpresion);
   socket.on('connect', renderBanner);
   socket.on('disconnect', renderBanner);
@@ -359,6 +361,11 @@ function refrescarVistaEnVivo(soloVistas) {
   // Con el editor de turnos abierto, cada comanda que entra disparaba un
   // redibujado de Admin que borraba lo que el administrador venía escribiendo
   if (state.vista === 'admin' && state.turnosAbiertoId) return;
+  // Ídem mientras el admin escribe en cualquier campo de Admin (roles, correo...)
+  if (state.vista === 'admin') {
+    const activo = document.activeElement;
+    if (activo && $('#vista').contains(activo) && /^(INPUT|SELECT|TEXTAREA)$/.test(activo.tagName)) return;
+  }
   // Lo mismo en Rectificar: la cajera está escribiendo totales contra el
   // extracto y cada venta de un mesero le cerraba el teclado y le borraba el
   // filtro de fecha. Esa pantalla se refresca sola con sus propios botones.
@@ -412,6 +419,21 @@ function renderBanner() {
   const errores = (state.impresion.trabajos || []).filter(t => t.estado === 'error').length;
   if (errores) avisos.push(['amarillo', `⚠️ ${errores} comanda(s) con error de impresión (ver pestaña Impresora)`]);
   if (state.jornadaCerrada) avisos.push(['amarillo', 'Jornada con cierre de caja: solo consulta']);
+  // Excel en tiempo real: solo si está activado, y solo lo ven caja y admin.
+  // Apagado no aparece nada (el detector de fallos ya no sale en la terminal).
+  const s = state.sheets;
+  if (s && s.activo && state.usuario && ['admin', 'cajero'].includes(state.usuario.rol)) {
+    const hora = (t) => String(t || '').slice(11, 16);
+    const fallo = s.ultimoError && (!s.ultimoOk || s.ultimoError.slice(0, 19) > s.ultimoOk.slice(0, 19));
+    const detalle = String(s.ultimoError || '').split(' — ').slice(1).join(' — ');
+    if (fallo) {
+      avisos.push(['amarillo chico', `📊 Excel en tiempo real: ${s.pendientes ? `${s.pendientes} venta(s) en espera` : 'el último envío falló'} · ${esc(detalle)} · se reintenta solo${s.proximoIntento ? ` a las ${s.proximoIntento}` : ''}. No se pierde ninguna venta.`]);
+    } else if (s.pendientes > 0) {
+      avisos.push(['verde chico', `📊 Excel en tiempo real: enviando ${s.pendientes} venta(s)...`]);
+    } else {
+      avisos.push(['verde chico', `📊 Excel en tiempo real al día${s.ultimoOk ? ` · última venta subida ${hora(s.ultimoOk)}` : ''}`]);
+    }
+  }
   $('#banner').innerHTML = avisos.map(([c, m]) => `<div class="aviso ${c}">${m}</div>`).join('');
 }
 
@@ -1509,12 +1531,89 @@ const DIAS_CORTOS = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
 const diaCorto = (f) => DIAS_CORTOS[new Date(f + 'T12:00:00').getDay()];
 const fechaCorta = (f) => `${diaCorto(f)} ${Number(f.slice(8, 10))}/${Number(f.slice(5, 7))}`;
 
-// Mismo cálculo que el servidor: sábado y domingo pueden pagar distinto
+// Mismo cálculo que el servidor: cada día de la semana tiene su valor
 function valorCargoCliente(cargos, cargo, fecha) {
   const c = (cargos || []).find(x => x.nombre === cargo);
-  if (!c) return 0;
-  const d = new Date(fechaTurnoValida(fecha) + 'T12:00:00').getDay();
-  return Number(d === 0 ? (c.domingo || c.valor) : d === 6 ? (c.sabado || c.valor) : c.valor) || 0;
+  if (!c || !Array.isArray(c.dias)) return 0;
+  return Number(c.dias[new Date(fechaTurnoValida(fecha) + 'T12:00:00').getDay()]) || 0;
+}
+
+// --- Roles de nómina y valor del turno por día (los editan admin y cajero) ---
+// Sin "valor por defecto": cada día de la semana lleva el suyo, para que
+// nadie tenga que adivinar de dónde sale el valor de un turno.
+const DIAS_ROL = [[1, 'Lun'], [2, 'Mar'], [3, 'Mié'], [4, 'Jue'], [5, 'Vie'], [6, 'Sáb'], [0, 'Dom']];
+const DIAS_PLURAL = ['los domingos', 'los lunes', 'los martes', 'los miércoles', 'los jueves', 'los viernes', 'los sábados'];
+const ROL_POR_ACCESO = { admin: 'Administrador', cajero: 'Cajero', mesero: 'Mesero', cocinera: 'Cocinera' };
+function filaRol(c) {
+  const dias = Array.isArray(c.dias) ? c.dias : [];
+  return `<div class="rol-fila">
+    <div class="fila" style="flex-wrap:nowrap">
+      <input data-rol-nombre value="${esc(c.nombre || '')}" placeholder="Nombre del rol (ej: Auxiliar de caja)" style="flex:1">
+      <button class="btn-mini peligro" data-rol-quitar style="width:38px;padding:7px 0" title="Borrar rol">🗑</button>
+    </div>
+    <div class="rol-dias">
+      ${DIAS_ROL.map(([d, n]) => `<div><label>${n}</label><input type="text" inputmode="numeric" data-rol-dia="${d}" value="${dias[d] || ''}" placeholder="0"></div>`).join('')}
+    </div>
+  </div>`;
+}
+function htmlRoles(cargos) {
+  return `
+    <div class="suave">Qué se paga por un turno de cada rol, día por día. Un mismo empleado puede ser cajero un día y auxiliar de cocina otro: al registrar el turno se elige el rol que hizo ese día y el valor sale de aquí. Un día en 0 no se puede registrar con ese rol.</div>
+    <div id="roles-lista">${(cargos || []).map(filaRol).join('')}</div>
+    <div class="fila" style="margin-top:8px">
+      <button class="btn-mini" id="btn-rol-agregar">＋ Agregar rol</button>
+      <button class="btn-mini ok" id="btn-roles-guardar">💾 Guardar roles</button>
+    </div>`;
+}
+function leerRoles(cont) {
+  return [...cont.querySelectorAll('.rol-fila')].map(f => {
+    const dias = [0, 0, 0, 0, 0, 0, 0];
+    f.querySelectorAll('[data-rol-dia]').forEach(i => { dias[Number(i.dataset.rolDia)] = Number(i.value) || 0; });
+    return { nombre: f.querySelector('[data-rol-nombre]').value.trim(), dias };
+  }).filter(r => r.nombre);
+}
+function conectarRoles(cont, alGuardar) {
+  const enganchar = () => {
+    cont.querySelectorAll('[data-rol-quitar]').forEach(b => b.onclick = () => {
+      const fila = b.closest('.rol-fila');
+      const nombre = fila.querySelector('[data-rol-nombre]').value.trim();
+      if (nombre && !confirm(`¿Quitar el rol "${nombre}"?\nSe borra al tocar "Guardar roles". Los turnos ya registrados con ese rol no cambian.`)) return;
+      fila.remove();
+    });
+    cont.querySelectorAll('[data-rol-dia]').forEach(i => i.oninput = () => { const l = i.value.replace(/[^0-9]/g, ''); if (i.value !== l) i.value = l; });
+  };
+  enganchar();
+  cont.querySelector('#btn-rol-agregar').onclick = () => {
+    cont.querySelector('#roles-lista').insertAdjacentHTML('beforeend', filaRol({ nombre: '', dias: [] }));
+    enganchar();
+    const nombres = cont.querySelectorAll('[data-rol-nombre]');
+    nombres[nombres.length - 1].focus();
+  };
+  cont.querySelector('#btn-roles-guardar').onclick = async () => {
+    const lista = leerRoles(cont);
+    if (!lista.length && !confirm('¿Guardar sin ningún rol? No se podrán registrar turnos hasta crear uno.')) return;
+    try {
+      const r = await api('/cargos', { method: 'PUT', body: { cargos: lista } });
+      toast(`${r.cargos.length} rol(es) guardado(s)`);
+      if (alGuardar) alGuardar(r.cargos);
+    } catch (e) { toast(e.message, true); }
+  };
+}
+// Tarjeta plegable de roles en la pantalla de nómina
+function pintarRoles(r) {
+  const cont = $('#nom-roles');
+  if (!cont) return;
+  const firma = JSON.stringify(r.cargos);
+  // Con el editor abierto no se redibuja (se perdería lo escrito), salvo que
+  // otro teléfono haya guardado roles distintos
+  if (state.rolesAbierto && cont.dataset.firma === firma) return;
+  cont.dataset.firma = firma;
+  const resumen = r.cargos.length ? r.cargos.map(c => c.nombre).join(', ') : 'ninguno todavía';
+  cont.innerHTML = `
+    <div class="fila" id="nom-roles-cab" style="cursor:pointer"><b class="crece">👔 Roles y valor del turno por día</b><span class="suave" style="font-size:18px">${state.rolesAbierto ? '▾' : '▸'}</span></div>
+    ${state.rolesAbierto ? htmlRoles(r.cargos) : `<div class="suave" style="margin-top:2px">${esc(resumen)}. Toque para crear, borrar o cambiar valores.</div>`}`;
+  $('#nom-roles-cab').onclick = () => { state.rolesAbierto = !state.rolesAbierto; delete cont.dataset.firma; pintarRoles(r); };
+  if (state.rolesAbierto) conectarRoles(cont, () => { state.rolesAbierto = false; cargarNominaDatos(); });
 }
 
 function renderNomina() {
@@ -1526,6 +1625,7 @@ function renderNomina() {
       <h2 style="margin:0">👥 Nómina</h2>
     </div>
     <div class="tarjeta" id="nom-registrar"><span class="suave">Cargando...</span></div>
+    <div class="tarjeta" id="nom-roles"></div>
     <div id="nom-sin-pagar"></div>
     <div id="nom-pendientes"></div>
     <div class="tarjeta">
@@ -1558,44 +1658,45 @@ async function cargarNominaDatos() {
   if (!state.enNomina || !$('#nom-registrar')) return; // la vista cambió
   state.nominaDatos = r;
   pintarRegistrarTurno(r);
+  pintarRoles(r);
   pintarSinPagar(r);
   pintarPendientesNomina(r);
   pintarHistorialNomina(r);
   pintarTotalesNomina(r);
 }
 
-// --- Registrar un turno: quién, qué día, qué hizo ---
+// --- Registrar un turno: quién, qué día, qué rol hizo ---
 function pintarRegistrarTurno(r) {
   const cont = $('#nom-registrar');
   const esAdmin = state.usuario.rol === 'admin';
-  const conValor = r.cargos.filter(c => c.valor > 0);
   if (!r.empleados.length) { cont.innerHTML = '<span class="suave">No hay empleados activos.</span>'; return; }
   if (!r.cargos.length) {
-    cont.innerHTML = '<b>Registrar turno</b><div class="suave" style="margin-top:4px">No hay cargos configurados. El administrador los crea en Admin → 👥 Cargos de nómina.</div>';
+    cont.innerHTML = '<b>📝 Registrar turno</b><div class="suave" style="margin-top:4px">Todavía no hay roles. Créelos abajo en 👔 Roles y valor del turno por día (cajero, auxiliar de caja, auxiliar de cocina...).</div>';
     return;
   }
   const empSel = r.empleados.find(e => e.id === state.nomEmpleado) || r.empleados[0];
   cont.innerHTML = `
     <b>📝 Registrar turno</b>
-    <div class="suave" style="margin:2px 0 6px">Qué día vino y qué hizo. Se paga después, por acumulado.</div>
+    <div class="suave" style="margin:2px 0 6px">Quién vino, qué día y qué rol hizo ese día. Se paga después, por acumulado.</div>
     <div class="fila">
       <div class="crece"><label>Empleado</label>
         <select id="tu-emp">${r.empleados.map(e => `<option value="${e.id}" ${e.id === empSel.id ? 'selected' : ''}>${esc(e.nombre)}</option>`).join('')}</select></div>
       <div class="crece"><label>Día</label><input id="tu-fecha" type="date" value="${r.hoy}" max="${r.hoy}"></div>
     </div>
     <div class="fila" style="margin-top:6px">
-      <div class="crece"><label>Cargo (qué hizo)</label>
-        <select id="tu-cargo">${r.cargos.map(c => `<option value="${esc(c.nombre)}" ${c.valor > 0 ? '' : 'style="color:var(--texto2)"'}>${esc(c.nombre)}${c.valor > 0 ? '' : ' (sin valor)'}</option>`).join('')}</select></div>
-      <div class="crece"><label>Valor del turno${esAdmin ? '' : ' (fijo)'}</label>
+      <div class="crece"><label>Rol que hizo ese día</label>
+        <select id="tu-cargo">${r.cargos.map(c => `<option value="${esc(c.nombre)}">${esc(c.nombre)}</option>`).join('')}</select></div>
+      <div class="crece"><label>Valor del turno${esAdmin ? '' : ' (según rol y día)'}</label>
         <input id="tu-valor" type="text" inputmode="numeric" ${esAdmin ? '' : 'readonly style="opacity:.65"'}></div>
     </div>
+    <div class="suave" id="tu-aviso" style="color:var(--alerta);margin-top:4px" hidden></div>
     <input id="tu-nota" placeholder="Nota (opcional: ej. medio turno, reemplazo)" autocomplete="off" style="margin-top:6px">
-    <button class="btn ok" id="btn-turno" style="margin-top:8px">Registrar turno</button>
-    ${conValor.length < r.cargos.length ? '<div class="suave" style="margin-top:4px">Los cargos "(sin valor)" no se pueden registrar hasta que el administrador les ponga valor.</div>' : ''}`;
+    <button class="btn ok" id="btn-turno" style="margin-top:8px">Registrar turno</button>`;
 
-  const elegirCargoHabitual = () => {
+  // Rol preseleccionado: el habitual del empleado (o el de su acceso en la app)
+  const elegirRolHabitual = () => {
     const emp = r.empleados.find(e => e.id === Number($('#tu-emp').value));
-    if (emp && emp.cargo_habitual && r.cargos.some(c => c.nombre === emp.cargo_habitual)) $('#tu-cargo').value = emp.cargo_habitual;
+    if (emp && emp.cargo_default && r.cargos.some(c => c.nombre === emp.cargo_default)) $('#tu-cargo').value = emp.cargo_default;
   };
   let valorAuto = null;
   const actualizarValor = (forzar) => {
@@ -1605,12 +1706,18 @@ function pintarRegistrarTurno(r) {
       valorAuto = valorCargoCliente(r.cargos, $('#tu-cargo').value, $('#tu-fecha').value);
       campo.value = valorAuto || '';
     }
+    // Un rol sin valor ese día de la semana no se puede registrar: se avisa aquí mismo
+    const aviso = $('#tu-aviso');
+    const dia = new Date(fechaTurnoValida($('#tu-fecha').value) + 'T12:00:00').getDay();
+    aviso.hidden = valorAuto > 0 || (esAdmin && Number(campo.value) > 0);
+    aviso.textContent = aviso.hidden ? '' :
+      `El rol "${$('#tu-cargo').value}" no tiene valor para ${DIAS_PLURAL[dia]}: póngalo abajo en 👔 Roles y valor del turno por día${esAdmin ? ', o escriba aquí el valor a mano' : ''}.`;
   };
-  $('#tu-emp').onchange = () => { state.nomEmpleado = Number($('#tu-emp').value); elegirCargoHabitual(); actualizarValor(true); };
+  $('#tu-emp').onchange = () => { state.nomEmpleado = Number($('#tu-emp').value); elegirRolHabitual(); actualizarValor(true); };
   $('#tu-cargo').onchange = () => actualizarValor(true);
   $('#tu-fecha').onchange = () => actualizarValor(false);
-  if ($('#tu-valor')) $('#tu-valor').oninput = (e) => { const l = e.target.value.replace(/[^0-9]/g, ''); if (e.target.value !== l) e.target.value = l; };
-  elegirCargoHabitual();
+  $('#tu-valor').oninput = (e) => { const l = e.target.value.replace(/[^0-9]/g, ''); if (e.target.value !== l) e.target.value = l; actualizarValor(false); };
+  elegirRolHabitual();
   actualizarValor(true);
 
   $('#btn-turno').onclick = async (ev, repetir) => {
@@ -1655,7 +1762,7 @@ function filaTurno(t, r, opciones = {}) {
       <div class="lt-detalle" style="margin-top:6px">
         <div class="fila">
           <div class="crece"><label>Día</label><input type="date" data-te-fecha="${t.id}" value="${t.jornada}" max="${r.hoy}"></div>
-          <div class="crece"><label>Cargo</label><select data-te-cargo="${t.id}">${r.cargos.map(c => `<option value="${esc(c.nombre)}" ${c.nombre === t.cargo ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></div>
+          <div class="crece"><label>Rol</label><select data-te-cargo="${t.id}">${r.cargos.map(c => `<option value="${esc(c.nombre)}" ${c.nombre === t.cargo ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></div>
         </div>
         <div class="fila" style="margin-top:6px">
           <div class="crece"><label>Valor</label><input type="text" inputmode="numeric" data-te-valor="${t.id}" value="${t.valor}"></div>
@@ -1698,7 +1805,7 @@ function conectarBotonesTurno(cont, r) {
 function pintarSinPagar(r) {
   const cont = $('#nom-sin-pagar');
   const conDeuda = r.empleados.filter(e => e.sinPagar.length);
-  if (!conDeuda.length) { cont.innerHTML = '<div class="tarjeta suave">💵 No hay turnos pendientes de pago.</div>'; return; }
+  if (!conDeuda.length) { cont.innerHTML = '<div class="tarjeta suave">💵 No hay turnos sin pagar. Para pagarle a alguien, primero registre arriba sus turnos (los días que vino y el rol que hizo): aquí aparecen para marcarlos y registrar el pago.</div>'; return; }
   cont.innerHTML = conDeuda.map(e => `
     <div class="tarjeta" style="border-color:var(--alerta)">
       <div class="fila"><b class="crece">💵 ${esc(e.nombre)}: ${e.sinPagar.length} turno(s) sin pagar</b><b>${fmt(e.totalSinPagar)}</b></div>
@@ -2479,15 +2586,6 @@ function imprimirPorRawBT(trabajo) {
 // usarCache: para abrir/cerrar el editor de turnos sin volver a pedir los datos
 // al servidor (así no se pierde lo que esté escrito en el formulario de arriba
 // ni se queda la vista en "Cargando..." si falla una de las tres consultas)
-function filaCargo(c) {
-  return `<div class="fila cargo-fila" style="margin-top:6px;flex-wrap:nowrap">
-    <input data-cargo-nombre value="${esc(c.nombre || '')}" placeholder="Ej: Auxiliar de caja" style="flex:2">
-    <input data-cargo-valor type="text" inputmode="numeric" value="${c.valor || ''}" placeholder="Valor" style="flex:1.2">
-    <input data-cargo-sab type="text" inputmode="numeric" value="${c.sabado || ''}" placeholder="=" style="flex:1">
-    <input data-cargo-dom type="text" inputmode="numeric" value="${c.domingo || ''}" placeholder="=" style="flex:1">
-    <button class="btn-mini peligro" data-cargo-quitar style="width:36px;padding:7px 0">✕</button>
-  </div>`;
-}
 function horasReporte(cfg) {
   try { const h = JSON.parse(cfg.horas_reporte || '[]'); return Array.isArray(h) && h.length === 7 ? h : ['', '', '', '', '', '', '']; }
   catch { return ['', '', '', '', '', '', '']; }
@@ -2501,7 +2599,7 @@ async function renderAdmin(usarCache) {
     ({ cfg, usuarios, sync, cargos } = state.adminCache);
     // Conservar lo que el admin tenga escrito y sin guardar en la configuración
     $('#vista').querySelectorAll('input[id^="cf-"], textarea[id^="cf-"], select[id^="cf-"]')
-      .forEach(el => { escritos[el.id] = el.value; });
+      .forEach(el => { escritos[el.id] = el.type === 'checkbox' ? el.checked : el.value; });
   } else {
     $('#vista').innerHTML = '<h2>Administración</h2><div class="tarjeta suave">Cargando...</div>';
     try { [cfg, usuarios, sync, cargos] = await Promise.all([api('/config'), api('/usuarios'), api('/sync/estado'), api('/cargos')]); }
@@ -2559,8 +2657,8 @@ async function renderAdmin(usarCache) {
     </div>
 
     <div class="tarjeta">
-      <h3 style="margin-top:0">📧 Reporte diario y sincronización</h3>
-      <label>Hora del reporte automático</label>
+      <h3 style="margin-top:0">📧 Reporte diario por correo</h3>
+      <label>Hora general del reporte automático (abajo se puede poner una distinta por día)</label>
       <input id="cf-hora" type="time" value="${esc(cfg.hora_reporte)}">
       <label>Correo del dueño (recibe el reporte)</label>
       <input id="cf-correo" type="email" value="${esc(cfg.correo_dueno)}">
@@ -2568,19 +2666,13 @@ async function renderAdmin(usarCache) {
       <input id="cf-gmail" value="${esc(cfg.gmail_usuario)}">
       <label>Contraseña de aplicación de Gmail</label>
       <input id="cf-gmailpass" type="password" value="${esc(cfg.gmail_app_password)}" placeholder="16 letras, se genera en la cuenta de Google">
-      <label>URL del webhook de Google Sheets (Apps Script)</label>
-      <input id="cf-sheets" value="${esc(cfg.sheets_webhook_url)}" placeholder="https://script.google.com/macros/s/.../exec">
       <div class="suave" style="margin-top:10px">
         ${sync.correo_configurado ? '✅ Correo configurado' : '⚠️ Falta configurar el Gmail que envía'}
-        ${sync.correos_pendientes ? ` · ${sync.correos_pendientes} reporte(s) en cola` : ''}<br>
-        ${sync.sheets_configurado ? '✅ Google Sheets vinculado' : '⚠️ Falta la URL del webhook de Sheets'}
-        ${sync.sheets_pendientes ? ` · ${sync.sheets_pendientes} venta(s) sin subir` : ''}
+        ${sync.correos_pendientes ? ` · ${sync.correos_pendientes} reporte(s) en cola` : ''}
       </div>
       <div class="fila" style="margin-top:10px">
         <button class="btn-mini primario" id="btn-reporte-ahora">📨 Enviar reporte ahora</button>
-        <button class="btn-mini primario" id="btn-sheets-diag">🔎 Revisar Google Sheets</button>
       </div>
-      <div id="sheets-diag"></div>
       <div class="fila" style="margin-top:8px">
         <input id="cf-mes-reporte" type="month" value="${state.jornada.slice(0, 7)}" style="flex:1">
         <button class="btn-mini primario" id="btn-reporte-mes" style="flex:1.4">📅 Enviar reportes del mes</button>
@@ -2589,14 +2681,27 @@ async function renderAdmin(usarCache) {
     </div>
 
     <div class="tarjeta">
-      <h3 style="margin-top:0">👥 Cargos de nómina (valor por turno)</h3>
-      <div class="suave">Qué hace cada quien un día y cuánto vale ese turno. Un mismo empleado puede ser cajero un día y auxiliar de cocina otro. Sábado y domingo vacíos = igual que el valor normal. La cajera solo elige el cargo: el valor sale de aquí.</div>
-      <div class="fila suave" style="margin-top:8px;font-size:12px"><span style="flex:2">Cargo</span><span style="flex:1.2">Valor</span><span style="flex:1">Sábado</span><span style="flex:1">Domingo</span><span style="width:36px"></span></div>
-      <div id="cargos-lista">${(cargos || []).map(c => filaCargo(c)).join('')}</div>
-      <div class="fila" style="margin-top:8px">
-        <button class="btn-mini" id="btn-cargo-agregar">＋ Agregar cargo</button>
-        <button class="btn-mini ok" id="btn-cargos-guardar">💾 Guardar cargos</button>
+      <h3 style="margin-top:0">📊 Excel en tiempo real (Google Sheets) — opcional</h3>
+      <label class="check-linea" style="margin-top:4px"><input type="checkbox" id="cf-sheets-activo" ${cfg.sheets_activo === '1' ? 'checked' : ''}> Activar: cada venta pagada se anota sola en la hoja de Google</label>
+      <label>URL del webhook de Google Sheets (Apps Script)</label>
+      <input id="cf-sheets" value="${esc(cfg.sheets_webhook_url)}" placeholder="https://script.google.com/macros/s/.../exec">
+      <div class="suave" style="margin-top:8px">
+        ${cfg.sheets_activo === '1'
+          ? (sync.sheets_configurado ? '✅ Activado: arriba de la app se ve si está al día o en espera' : '⚠️ Activado, pero falta pegar la URL')
+          : '⏸ Desactivado: no se envía nada ni se avisa nada. El Excel del correo diario y los de Descargar siguen igual.'}
+        ${sync.sheets_pendientes ? ` · ${sync.sheets_pendientes} venta(s) en espera` : ''}
       </div>
+      <div class="suave" style="margin-top:4px">La casilla se guarda con el botón "Guardar configuración" de abajo.</div>
+      <div class="fila" style="margin-top:10px">
+        <button class="btn-mini primario" id="btn-sheets-diag">🔎 Revisar Google Sheets</button>
+      </div>
+      <div id="sheets-diag"></div>
+    </div>
+
+    <div class="tarjeta" id="admin-roles">
+      <h3 style="margin-top:0">👔 Roles de nómina y valor del turno por día</h3>
+      ${htmlRoles(cargos)}
+      <div class="suave" style="margin-top:6px">También se editan desde Caja → Turnos y pagos de nómina (el cajero también puede).</div>
     </div>
 
     <div class="tarjeta">
@@ -2637,9 +2742,9 @@ async function renderAdmin(usarCache) {
           <button class="btn-mini peligro" data-uborrar="${u.id}">🗑</button>
         </div>
         <div class="fila" style="margin-top:6px">
-          <span class="suave">Cargo habitual:</span>
+          <span class="suave">Rol habitual en nómina:</span>
           <select data-cargo-habitual="${u.id}" style="flex:1">
-            <option value="">— sin cargo —</option>
+            <option value="">— según su acceso (${esc(ROL_POR_ACCESO[u.rol] || u.rol)}) —</option>
             ${cargos.map(c => `<option value="${esc(c.nombre)}" ${c.nombre === u.cargo_habitual ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}
           </select>
         </div>
@@ -2652,7 +2757,7 @@ async function renderAdmin(usarCache) {
         ancho_ticket: $('#cf-ancho').value, nombre_restaurante: $('#cf-nombre').value, recargo_empaque: $('#cf-recargo').value,
         hora_reporte: $('#cf-hora').value, correo_dueno: $('#cf-correo').value,
         gmail_usuario: $('#cf-gmail').value, gmail_app_password: $('#cf-gmailpass').value,
-        sheets_webhook_url: $('#cf-sheets').value,
+        sheets_webhook_url: $('#cf-sheets').value, sheets_activo: $('#cf-sheets-activo').checked ? '1' : '0',
         factura_titulo: $('#cf-fac-titulo').value, factura_razon_social: $('#cf-fac-razon').value,
         factura_nit: $('#cf-fac-nit').value, factura_direccion: $('#cf-fac-dir').value,
         factura_telefono: $('#cf-fac-tel').value, factura_leyenda: $('#cf-fac-leyenda').value
@@ -2663,25 +2768,8 @@ async function renderAdmin(usarCache) {
       $('#titulo-app').textContent = state.config.nombre_restaurante;
     } catch (e) { toast(e.message, true); }
   };
-  // Cargos de nómina: filas editables, se guardan todas juntas
-  $('#btn-cargo-agregar').onclick = () => { $('#cargos-lista').insertAdjacentHTML('beforeend', filaCargo({ nombre: '', valor: '', sabado: '', domingo: '' })); conectarFilasCargo(); };
-  const conectarFilasCargo = () => {
-    $('#cargos-lista').querySelectorAll('[data-cargo-quitar]').forEach(b => b.onclick = () => b.closest('.cargo-fila').remove());
-    $('#cargos-lista').querySelectorAll('input[inputmode="numeric"]').forEach(i => i.oninput = () => { const l = i.value.replace(/[^0-9]/g, ''); if (i.value !== l) i.value = l; });
-  };
-  conectarFilasCargo();
-  $('#btn-cargos-guardar').onclick = async () => {
-    const lista = [...$('#cargos-lista').querySelectorAll('.cargo-fila')].map(f => ({
-      nombre: f.querySelector('[data-cargo-nombre]').value, valor: f.querySelector('[data-cargo-valor]').value,
-      sabado: f.querySelector('[data-cargo-sab]').value, domingo: f.querySelector('[data-cargo-dom]').value
-    })).filter(c => c.nombre.trim());
-    try {
-      const r = await api('/cargos', { method: 'PUT', body: { cargos: lista } });
-      state.adminCache = null;
-      toast(`${r.cargos.length} cargo(s) guardado(s)`);
-      renderAdmin();
-    } catch (e) { toast(e.message, true); }
-  };
+  // Roles de nómina: mismo editor que en la pantalla de nómina
+  conectarRoles($('#admin-roles'), () => { state.adminCache = null; renderAdmin(); });
   $('#btn-horas-guardar').onclick = async () => {
     const horas = ['', '', '', '', '', '', ''];
     $('#vista').querySelectorAll('[data-hora-dia]').forEach(i => { horas[Number(i.dataset.horaDia)] = i.value || ''; });
@@ -2740,12 +2828,12 @@ async function renderAdmin(usarCache) {
   // Devolver lo que estuviera escrito y sin guardar en la configuración
   for (const [id, valor] of Object.entries(escritos)) {
     const el = document.getElementById(id);
-    if (el) el.value = valor;
+    if (el) { if (el.type === 'checkbox') el.checked = !!valor; else el.value = valor; }
   }
 
-  // Cargo habitual: lo que suele hacer, para que el turno salga preseleccionado
+  // Rol habitual en nómina: lo que suele hacer, para que el turno salga preseleccionado
   $('#vista').querySelectorAll('[data-cargo-habitual]').forEach(sel => sel.onchange = async () => {
-    try { await api(`/usuarios/${sel.dataset.cargoHabitual}`, { method: 'PUT', body: { cargo_habitual: sel.value } }); toast('Cargo habitual guardado'); }
+    try { await api(`/usuarios/${sel.dataset.cargoHabitual}`, { method: 'PUT', body: { cargo_habitual: sel.value } }); toast('Rol habitual guardado'); }
     catch (e) { toast(e.message, true); }
   });
   $('#vista').querySelectorAll('[data-uborrar]').forEach(b => b.onclick = async () => {

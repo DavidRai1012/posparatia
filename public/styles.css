@@ -17,6 +17,8 @@ body {
 #banner .aviso { padding: 8px 14px; font-size: 14px; font-weight: 600; text-align: center; }
 #banner .aviso.rojo { background: var(--peligro); color: #fff; }
 #banner .aviso.amarillo { background: var(--alerta); color: #201800; }
+#banner .aviso.verde { background: #1e6b3f; color: #eafff0; }
+#banner .aviso.chico { font-size: 12.5px; padding: 5px 10px; font-weight: 600; }
 
 header {
   flex: none; display: flex; align-items: center; gap: 10px;
@@ -383,7 +385,11 @@ td.num, th.num { text-align: right; }
 /* Pantalla de nómina: filas de turnos */
 .turno-fila { padding: 6px 0; border-bottom: 1px dashed var(--borde); font-size: 14px; }
 .turno-fila:last-child { border-bottom: none; }
-.cargo-fila input { padding: 8px 8px; font-size: 14px; }
-/* En el celular, nombre del cargo en su propia línea y los valores debajo */
-.cargo-fila { flex-wrap: wrap !important; }
-.cargo-fila [data-cargo-nombre] { flex: 1 1 100% !important; }
+/* Roles de nómina: nombre + 7 días (4 por fila en el teléfono, 7 en el PC) */
+.rol-fila { padding: 8px 0; border-bottom: 1px dashed var(--borde); }
+.rol-fila:last-child { border-bottom: none; }
+.rol-fila input { padding: 8px 8px; font-size: 14px; }
+.rol-dias { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px 6px; margin-top: 4px; }
+.rol-dias label { margin: 2px 0 1px; font-size: 12px; }
+.rol-dias input { padding: 7px 4px; font-size: 14px; text-align: center; }
+@media (min-width: 700px) { .rol-dias { grid-template-columns: repeat(7, 1fr); } }

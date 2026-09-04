@@ -103,7 +103,7 @@ function seccionesResumen(r, esMes) {
   }
   // Quién vino y qué hizo en el mes, se haya pagado o no
   if (esMes && r.turnosMes && r.turnosMes.length) {
-    S.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por cargo)', filas: r.turnosMes.map(t =>
+    S.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por rol)', filas: r.turnosMes.map(t =>
       [`${t.empleado} · ${t.cargo}`, t.cantidad, `${fmt(t.total)}${t.sinPagar ? ` · sin pagar ${fmt(t.sinPagar)}` : ''}`]) });
   }
 
@@ -281,7 +281,7 @@ function excelResumenMes(mes) {
 }
 
 // Excel de nómina, estilo Kardex: hoja RESUMEN (empleado × mes, lo pagado) +
-// UNA HOJA POR MES con, por empleado, los DÍAS TRABAJADOS (fecha, día, cargo,
+// UNA HOJA POR MES con, por empleado, los DÍAS TRABAJADOS (fecha, día, rol,
 // valor, si ya se pagó) y luego sus PAGOS (fecha, turnos incluidos, descuento,
 // bono, total, confirmación). A cada empleado se le paga distinto (días sin
 // pago, pagos por acumulado), así que se lista lo que realmente pasó.
@@ -329,7 +329,7 @@ function excelNomina(anio, soloMes) {
       const susPagos = pagos.filter(p => p.empleado === emp && p.jornada.slice(0, 7) === mes);
       if (!suyos.length && !susPagos.length) continue;
       filas.push([emp.toUpperCase()]);
-      filas.push(['Días trabajados', 'Día', 'Cargo', 'Valor', 'Nota', 'Pago']);
+      filas.push(['Días trabajados', 'Día', 'Rol', 'Valor', 'Nota', 'Pago']);
       let subtotalTurnos = 0, sinPagar = 0;
       for (const t of suyos) {
         filas.push([t.jornada, diaSemana(t.jornada), t.cargo, t.valor, t.nota || '',
@@ -395,7 +395,7 @@ function correosMensuales(mes) {
   filasNomina.push(['TOTAL NÓMINA DEL MES', fmt(r.totalNomina)]);
   const secN = [{ titulo: `NÓMINA PAGADA EN ${nm.toUpperCase()}`, filas: filasNomina }];
   if (r.turnosMes && r.turnosMes.length) {
-    secN.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por cargo)', filas: r.turnosMes.map(t =>
+    secN.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por rol)', filas: r.turnosMes.map(t =>
       [`${t.empleado} · ${t.cargo}`, t.cantidad, `${fmt(t.total)}${t.sinPagar ? ` · sin pagar ${fmt(t.sinPagar)}` : ''}`]) });
   }
   const xn = excelNomina(mes.slice(0, 4), mes);

@@ -7,7 +7,7 @@ se conservan** (viven en `C:\POS-Restaurante\data`, que ninguna instalación toc
 ## Actualización normal (recomendada, 2 minutos)
 
 1. Copie el `Instalar-POS-Restaurante.exe` nuevo al PC del restaurante (USB).
-2. **Cierre el POS**: en la ventana negra del servidor, ciérrela con la X
+2. **Cierre el POS**: la ventana negra del servidor arranca minimizada; ábrala desde la barra de tareas y ciérrela con la X
    (o reinicie el PC y NO abra el POS).
 3. Doble clic al instalador nuevo → Siguiente → Instalar → Finalizar.
 4. Abra el POS con el icono del Escritorio (o deje que arranque solo al prender el PC).

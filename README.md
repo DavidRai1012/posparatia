@@ -125,9 +125,14 @@ function doPost(e) {
 
 3. Implementar → Nueva implementación → tipo **Aplicación web** →
    Ejecutar como: **yo** · Acceso: **Cualquier persona** → copiar la URL.
-4. Pegar la URL en Admin → "URL del webhook de Google Sheets".
+4. Pegar la URL en Admin → tarjeta "📊 Excel en tiempo real", **marcar la
+   casilla "Activar"** y Guardar configuración.
 
-Sin internet, las ventas quedan en búfer local y se suben en lote al reconectar.
+Viene **desactivado**: mientras la casilla no esté marcada no se envía nada ni
+aparece ningún aviso. Activado, arriba de la app (caja y admin) se ve si está
+al día o cuántas ventas esperan. Sin internet, las ventas quedan en búfer local
+y se suben solas al reconectar (reintentos cada 1, 2, 4... hasta 10 minutos).
+La ventana negra no muestra nada de esto: queda en `dataegistro.log`.
 
 ## 6. Operación diaria
 

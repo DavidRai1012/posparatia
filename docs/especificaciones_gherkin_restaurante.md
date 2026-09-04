@@ -882,3 +882,80 @@ Característica: Hora de cierre por día de la semana
     Entonces debe salir solo el reporte del día
     Y el lunes debe usarse la hora general
 ```
+
+---
+
+```gherkin
+# language: es
+Característica: Roles de nómina con valor del turno por día de la semana
+  Como administrador o cajero
+  Quiero crear roles (cajero, auxiliar de caja, auxiliar de cocina...) con el valor de cada día
+  Para que el turno de cada empleado se pague según el rol que hizo ese día
+
+  Escenario: Crear y borrar roles
+    Dado que Laura es cajera
+    Cuando abre Caja → Turnos y pagos de nómina → Roles y agrega "Auxiliar de cocina" con lunes 300.000 y domingo 400.000
+    Entonces el rol debe quedar guardado con un valor por cada día de la semana
+    Y no debe existir ningún "valor por defecto"
+    Y Laura también debe poder borrar un rol (los turnos ya registrados con él no cambian)
+
+  Escenario: Un mesero no puede tocar los roles
+    Cuando un mesero intenta ver o cambiar los roles
+    Entonces el sistema debe rechazarlo
+
+  Escenario: El valor del turno sale del rol y del día
+    Dado que "Auxiliar de cocina" vale 300.000 los martes
+    Cuando la cajera registra a Pedro el martes como "Auxiliar de cocina" y escribe 999.999
+    Entonces el turno debe quedar en 300.000
+
+  Escenario: Rol sin valor ese día
+    Dado que "Cajero" tiene 0 los domingos
+    Cuando la cajera intenta registrar un turno de "Cajero" un domingo
+    Entonces el sistema debe rechazarlo diciendo que el rol no tiene valor para los domingos
+    Y el administrador sí puede escribir el valor a mano
+
+  Escenario: Rol preseleccionado
+    Dado que Laura tiene acceso de cajero y no tiene rol habitual
+    Cuando se elige a Laura para registrar un turno
+    Entonces debe salir preseleccionado el rol "Cajero"
+    Y si el admin le pone rol habitual "Auxiliar de caja", ese debe mandar
+
+  Escenario: Migración de los cargos anteriores
+    Dado que un cargo tenía valor 450.000, sábado 500.000 y domingo vacío
+    Cuando se instala esta versión
+    Entonces el rol debe quedar con 450.000 de lunes a viernes y domingo, y 500.000 el sábado
+```
+
+---
+
+```gherkin
+# language: es
+Característica: Excel en tiempo real opcional y terminal silenciosa
+  Como dueño
+  Quiero que la hoja de Google en tiempo real sea opcional y que sus fallos no asusten a la cajera
+  Porque un mensaje de error en la ventana negra hizo que dejaran de usar la app
+
+  Escenario: Desactivado por defecto
+    Dado que hay una URL de Google Sheets guardada pero la casilla "Activar" no está marcada
+    Cuando se registra una venta pagada
+    Entonces no debe encolarse ni intentarse ningún envío
+    Y no debe aparecer ningún aviso en la app ni en la terminal
+
+  Escenario: Activado, al día
+    Dado que la casilla está marcada y Google responde
+    Cuando se registra una venta pagada
+    Entonces debe subir a la hoja
+    Y arriba de la app la caja y el admin deben ver "Excel en tiempo real al día"
+
+  Escenario: Activado, sin internet
+    Dado que la casilla está marcada y Google no responde
+    Cuando se registra una venta pagada
+    Entonces debe quedar en espera y el aviso de arriba debe decir cuántas ventas esperan, el motivo y a qué hora se reintenta
+    Y la terminal no debe mostrar nada: el detalle queda en data/registro.log
+    Y los reintentos deben espaciarse (1, 2, 4... hasta 10 minutos), no cada 30 segundos
+    Y al volver internet todo lo pendiente debe subir una sola vez
+
+  Escenario: Arranque
+    Cuando se abre el POS
+    Entonces la ventana negra debe quedar minimizada y el navegador debe abrirse solo con la app
+```

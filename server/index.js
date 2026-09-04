@@ -5,19 +5,29 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns');
+const { exec } = require('child_process');
 const { Server } = require('socket.io');
 
-const { db, ahora, jornadaHoy, horaLocal, getConfig, setConfig, getConfigAll, registrarHistorial, jornadaCerrada } = require('./db');
+const { db, ahora, jornadaHoy, horaLocal, getConfig, setConfig, getConfigAll, registrarHistorial, jornadaCerrada, DATA_DIR } = require('./db');
 const { ticketCocina, ticketNomina, ticketFactura, ticketAccesoQR } = require('./escpos');
 const impresion = require('./printing');
 const reportes = require('./reports');
 const informes = require('./informes');
+const { registrar } = require('./registro');
 
 const PORT = process.env.PORT || 3000;
+
+// Salir a internet por IPv4 primero: colgado del hotspot de un teléfono (redes
+// de celular con IPv6 a medias) Node se quedaba esperando por IPv6 y Google
+// "no respondía", aunque WhatsApp Web en el mismo PC sí funcionara.
+try { dns.setDefaultResultOrder('ipv4first'); } catch { /* Node viejo */ }
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 impresion.setIO(io);
+// El aviso del Excel en tiempo real que ven las pantallas de caja
+reportes.setAvisoSheets(estado => io.emit('sheets:estado', estado));
 
 app.use(express.json());
 
@@ -36,7 +46,7 @@ app.use((req, _res, next) => {
   if (local && local !== ipQueFunciona && esClienteDeLaRed(req)) {
     ipQueFunciona = local;
     setConfig('ip_lan_ok', local); // sobrevive reinicios del PC
-    console.log(`[red] Los teléfonos entran por ${local}: esa es la dirección que se anuncia`);
+    registrar('red', `Los teléfonos entran por ${local}: esa es la dirección que se anuncia`);
   }
   next();
 });
@@ -152,6 +162,8 @@ app.get('/api/estado', requiere(1), (req, res) => {
     pedidos: pedidosDeJornada(jornadaHoy()),
     impresion: impresion.estadoCola(),
     nominaPendienteMia: pendientesNominaDe(req.usuario.usuarioId),
+    // Estado del Excel en tiempo real (aviso de arriba), solo para caja y admin
+    sheets: NIVEL[req.usuario.rol] >= 2 ? reportes.estadoSheets() : null,
     configPublica: {
       nombre_restaurante: getConfig('nombre_restaurante'),
       recargo_empaque: Number(getConfig('recargo_empaque')),
@@ -181,7 +193,7 @@ function precalentarMenu() {
       const nombres = platosActivos().map(p => (p.acronimo || p.nombre).toUpperCase());
       const alto = Math.round(24 * Number(getConfig('tamano_platos') || 3));
       if (alto > 24) require('./texto-bitmap').precalentar(nombres, alto, { centrar: false });
-    } catch (e) { console.error('[raster] precalentamiento falló:', e.message); }
+    } catch (e) { registrar('raster', `precalentamiento falló: ${e.message}`); }
   }, 2000);
 }
 
@@ -323,7 +335,7 @@ function imprimirPedido(pedidoId, tipo) {
   // Armar la comanda debe costar milisegundos; si algún día vuelve a demorarse,
   // que quede en el registro para saberlo sin adivinar
   const ms = Date.now() - inicio;
-  if (ms > 1500) console.warn(`[impresion] la comanda ${pedido.numero_comanda} tardó ${ms} ms en armarse`);
+  if (ms > 1500) registrar('impresion', `la comanda ${pedido.numero_comanda} tardó ${ms} ms en armarse`);
 }
 
 // Recargo por pago con tarjeta: fijo bajo el umbral, porcentaje desde el umbral
@@ -740,7 +752,7 @@ app.post('/api/cierre', requiere(2), async (req, res) => {
     // y, si es fin de mes, los dos correos mensuales (nómina y resumen)
     reportes.encolarReporteDiario(jornadaHoy());
     try { reportes.encolarReportesMensuales(jornadaHoy()); }
-    catch (e) { console.error('[reportes] No se pudieron armar los reportes mensuales:', e.message); }
+    catch (e) { registrar('reportes', `No se pudieron armar los reportes mensuales: ${e.message}`); }
     const envio = await reportes.drenarCorreos();
     // También empuja lo que quede pendiente hacia Google Sheets
     reportes.drenarSheets().catch(() => {});
@@ -755,12 +767,15 @@ app.post('/api/cierre', requiere(2), async (req, res) => {
 // Prueba de la conexión con Google Sheets: encola una fila de prueba y la envía ya
 app.post('/api/sheets/prueba', requiere(3), async (req, res) => {
   reportes.encolarFilaPruebaSheets(reportes.nombreReporte(req.usuario.nombre, req.usuario.rol, true));
-  const r = await reportes.drenarSheets();
+  const r = await reportes.drenarSheets({ forzar: true });
   if (r.ok) res.json({ ok: true, enviados: r.enviados });
   else res.status(502).json({ error: r.error, pendientes: r.pendientes });
 });
 
 app.get('/api/sync/estado', requiere(3), (_req, res) => res.json(reportes.estadoSync()));
+
+// Estado del Excel en tiempo real para el aviso de arriba (caja y admin)
+app.get('/api/sheets/estado', requiere(2), (_req, res) => res.json(reportes.estadoSheets()));
 
 // Solucionador de problemas de Google Sheets: revisa paso por paso y dice
 // exactamente qué corregir (y en qué hoja y fila quedó la fila de prueba).
@@ -935,14 +950,21 @@ app.put('/api/config', requiere(3), (req, res) => {
     'gmail_app_password', 'sheets_webhook_url', 'modo_impresion', 'impresora_share', 'puerto_com', 'ancho_ticket', 'tamano_platos', 'tamano_obs',
     'recargo_tarjeta_fijo', 'recargo_tarjeta_umbral', 'recargo_tarjeta_pct',
     'factura_titulo', 'factura_razon_social', 'factura_nit', 'factura_direccion', 'factura_telefono', 'factura_leyenda',
-    'horas_reporte'];
+    'horas_reporte', 'sheets_activo'];
   for (const [clave, valor] of Object.entries(req.body || {})) {
     if (!permitidas.includes(clave)) continue;
     if (clave === 'gmail_app_password' && valor === '(guardada)') continue;
     // Las URL y credenciales llegan de copiar y pegar: fuera espacios y saltos
-    const limpio = ['sheets_webhook_url', 'gmail_usuario', 'gmail_app_password', 'correo_dueno'].includes(clave)
+    let limpio = ['sheets_webhook_url', 'gmail_usuario', 'gmail_app_password', 'correo_dueno'].includes(clave)
       ? String(valor).trim() : valor;
+    if (clave === 'sheets_activo') limpio = (valor === true || valor === 1 || valor === '1') ? '1' : '0';
     setConfig(clave, limpio);
+  }
+  // El aviso del Excel en tiempo real se actualiza en el acto en todas las
+  // pantallas; si lo acaban de prender, lo que estaba en espera sale ya
+  if ('sheets_activo' in (req.body || {}) || 'sheets_webhook_url' in (req.body || {})) {
+    io.emit('sheets:estado', reportes.estadoSheets());
+    if (reportes.sheetsActivo()) reportes.drenarSheets({ forzar: true }).catch(() => {});
   }
   impresion.procesarCola(); // por si el cambio de modo destraba trabajos pendientes
   impresion.notificarEstado();
@@ -1033,32 +1055,56 @@ function inicioQuincena() {
 function inicioMes() { return jornadaHoy().slice(0, 8) + '01'; }
 const fechaValida = (v, alt) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : alt;
 
-function cargosNomina() {
-  try { return JSON.parse(getConfig('cargos_nomina') || '[]'); } catch { return []; }
+// Roles de nómina (cajero, auxiliar de caja, auxiliar de cocina...) con el
+// valor del turno por DÍA DE LA SEMANA: dias[getDay()], 0 = domingo. Sin
+// valor "por defecto" (confundía): se escribe el de cada día. Los crean,
+// cambian y borran el admin y el cajero (Caja → Turnos y pagos → Roles).
+const DIAS_PLURAL = ['los domingos', 'los lunes', 'los martes', 'los miércoles', 'los jueves', 'los viernes', 'los sábados'];
+function normalizarRol(c) {
+  const n = (v) => Math.max(0, Math.round(Number(v) || 0));
+  let dias;
+  if (Array.isArray(c.dias)) dias = c.dias.map(n);
+  else { // forma vieja: valor normal + sábado + domingo
+    const v = n(c.valor);
+    dias = [n(c.domingo) || v, v, v, v, v, v, n(c.sabado) || v];
+  }
+  while (dias.length < 7) dias.push(0);
+  return { nombre: String(c.nombre || '').trim().slice(0, 30), dias: dias.slice(0, 7) };
 }
-// Valor de un cargo en una fecha: sábado y domingo pueden pagar distinto
+function cargosNomina() {
+  try { return JSON.parse(getConfig('cargos_nomina') || '[]').filter(c => c && c.nombre).map(normalizarRol); }
+  catch { return []; }
+}
+// Valor de un rol en una fecha: cada día de la semana tiene el suyo
 function valorCargo(cargo, jornada) {
   const c = cargosNomina().find(x => x.nombre === cargo);
   if (!c) return null;
-  const dia = new Date(jornada + 'T12:00:00').getDay();
-  const v = dia === 0 ? (c.domingo || c.valor) : dia === 6 ? (c.sabado || c.valor) : c.valor;
-  return Math.max(0, Math.round(Number(v) || 0));
+  return c.dias[new Date(jornada + 'T12:00:00').getDay()] || 0;
+}
+// Rol con el que sale preseleccionado un empleado: el habitual que le puso el
+// admin o, si no tiene, el que corresponde a su acceso en la app
+const ROL_POR_ACCESO = { admin: 'Administrador', cajero: 'Cajero', mesero: 'Mesero', cocinera: 'Cocinera' };
+function cargoPorDefecto(u, roles) {
+  if (u.cargo_habitual && roles.some(r => r.nombre === u.cargo_habitual)) return u.cargo_habitual;
+  const porAcceso = ROL_POR_ACCESO[u.rol];
+  return roles.some(r => r.nombre === porAcceso) ? porAcceso : null;
 }
 
 app.get('/api/cargos', requiere(2), (_req, res) => res.json(cargosNomina()));
 
-app.put('/api/cargos', requiere(3), (req, res) => {
+app.put('/api/cargos', requiere(2), (req, res) => {
   const lista = Array.isArray(req.body.cargos) ? req.body.cargos : null;
   if (!lista) return res.status(400).json({ error: 'Formato no válido' });
   const limpios = [], vistos = new Set();
-  const n = (v) => v === null || v === undefined || String(v).trim() === '' ? null : (aEntero(v) || 0);
   for (const c of lista) {
-    const nombre = String(c.nombre || '').trim().slice(0, 30);
-    if (!nombre || vistos.has(nombre.toLowerCase())) continue;
-    vistos.add(nombre.toLowerCase());
-    limpios.push({ nombre, valor: n(c.valor) || 0, sabado: n(c.sabado), domingo: n(c.domingo) });
+    const rol = normalizarRol(c || {});
+    if (!rol.nombre || vistos.has(rol.nombre.toLowerCase())) continue;
+    vistos.add(rol.nombre.toLowerCase());
+    limpios.push(rol);
   }
   setConfig('cargos_nomina', JSON.stringify(limpios.slice(0, 30)));
+  registrarHistorial(null, req.usuario.usuarioId, 'roles_nomina',
+    limpios.map(r => `${r.nombre}: ${r.dias.join('/')}`).join('; ').slice(0, 300));
   io.emit('nomina:actualizada');
   res.json({ ok: true, cargos: limpios });
 });
@@ -1084,11 +1130,11 @@ app.post('/api/turnos', requiere(2), (req, res) => {
   const jornada = fechaValida(req.body.jornada, jornadaHoy());
   if (jornada > jornadaHoy()) return res.status(400).json({ error: 'No se puede registrar un turno de una fecha futura' });
   const cargo = String(req.body.cargo || '').trim();
-  if (!cargosNomina().some(c => c.nombre === cargo)) return res.status(400).json({ error: 'Elija un cargo (se configuran en Admin → Cargos de nómina)' });
-  // El valor es el del cargo ese día; solo el admin puede poner otro a mano
+  if (!cargosNomina().some(c => c.nombre === cargo)) return res.status(400).json({ error: 'Elija el rol que hizo ese día (los roles se crean en 👔 Roles, en esta misma pantalla)' });
+  // El valor es el del rol ese día de la semana; solo el admin puede poner otro a mano
   let valor = valorCargo(cargo, jornada);
   if (req.usuario.rol === 'admin' && String(req.body.valor ?? '').trim() !== '') valor = aEntero(req.body.valor);
-  if (!(valor > 0)) return res.status(400).json({ error: `El cargo "${cargo}" no tiene valor configurado: el administrador debe ponerlo en Admin → Cargos de nómina` });
+  if (!(valor > 0)) return res.status(400).json({ error: `El rol "${cargo}" no tiene valor para ${DIAS_PLURAL[new Date(jornada + 'T12:00:00').getDay()]}: póngalo en 👔 Roles y valor del turno por día (en esta misma pantalla)` });
   if (!req.body.repetir && db.prepare('SELECT id FROM turnos WHERE empleado_id = ? AND jornada = ? AND cargo = ?').get(empleado.id, jornada, cargo)) {
     return res.status(409).json({ error: `${empleado.nombre} ya tiene un turno de ${cargo} el ${jornada}`, duplicado: true });
   }
@@ -1108,7 +1154,7 @@ app.put('/api/turnos/:id', requiere(3), (req, res) => {
   if (t.pago_id) return res.status(409).json({ error: 'Ese turno ya está pagado: borre primero el pago para poder cambiarlo' });
   const jornada = fechaValida(req.body.jornada, t.jornada);
   const cargo = req.body.cargo !== undefined ? String(req.body.cargo).trim() : t.cargo;
-  if (!cargosNomina().some(c => c.nombre === cargo)) return res.status(400).json({ error: 'Cargo no válido' });
+  if (!cargosNomina().some(c => c.nombre === cargo)) return res.status(400).json({ error: 'Rol no válido' });
   let valor = t.valor;
   if (String(req.body.valor ?? '').trim() !== '') valor = aEntero(req.body.valor);
   else if (cargo !== t.cargo || jornada !== t.jornada) valor = valorCargo(cargo, jornada) || t.valor;
@@ -1237,11 +1283,13 @@ app.get('/api/nomina/resumen', requiere(2), (req, res) => {
   const sumaDesde = db.prepare(
     "SELECT COALESCE(SUM(total), 0) AS t FROM nomina WHERE empleado_id = ? AND estado = 'confirmado' AND jornada >= ? AND jornada <= ?");
   const sinPagarDe = db.prepare('SELECT id, jornada, cargo, valor, nota FROM turnos WHERE empleado_id = ? AND pago_id IS NULL ORDER BY jornada, id');
+  const roles = cargosNomina();
   const empleados = db.prepare('SELECT id, nombre, rol, cargo_habitual FROM usuarios WHERE activo = 1 AND eliminado = 0 ORDER BY nombre').all()
     .map(u => {
       const sinPagar = sinPagarDe.all(u.id);
       return {
-        ...u, sinPagar, totalSinPagar: sinPagar.reduce((s, t) => s + t.valor, 0),
+        ...u, cargo_default: cargoPorDefecto(u, roles),
+        sinPagar, totalSinPagar: sinPagar.reduce((s, t) => s + t.valor, 0),
         dia: sumaDesde.get(u.id, hoy, hoy).t,
         semana: sumaDesde.get(u.id, inicioSemana(), hoy).t,
         quincena: sumaDesde.get(u.id, inicioQuincena(), hoy).t,
@@ -1256,7 +1304,7 @@ app.get('/api/nomina/resumen', requiere(2), (req, res) => {
     `SELECT n.*, u.nombre AS empleado FROM nomina n JOIN usuarios u ON u.id = n.empleado_id
      WHERE n.jornada >= ? AND n.jornada <= ? ORDER BY n.jornada DESC, n.id DESC`).all(mes + '-01', mes + '-31').map(pagoConTurnos);
   const turnosMes = consultaTurnos.all(mes + '-01', mes + '-31');
-  res.json({ hoy, mes, cargos: cargosNomina(), empleados, pendientes, pagosMes, turnosMes });
+  res.json({ hoy, mes, cargos: roles, empleados, pendientes, pagosMes, turnosMes });
 });
 
 // ---------- Impresión ----------
@@ -1375,7 +1423,14 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('Si esa dirección no abre en el teléfono, pruebe:');
     for (const c of otras) console.log(`  http://${c.ip}:${PORT}  (${c.nombre})`);
   }
+  console.log('Puede dejar esta ventana minimizada; NO la cierre durante el servicio.');
+  console.log(`Lo que el sistema hace por dentro queda anotado en ${path.join(DATA_DIR, 'registro.log')}`);
   console.log('==============================================');
+  // La app se abre sola en el navegador de este PC: lo que la cajera ve es el
+  // POS funcionando, no una ventana negra con mensajes
+  if (process.platform === 'win32' && process.env.POS_SIN_NAVEGADOR !== '1') {
+    exec(`start "" "http://localhost:${PORT}"`, () => {});
+  }
   reportes.iniciarPlanificador();
   impresion.procesarCola(); // retomar comandas que quedaron pendientes tras un reinicio
   // Los platos grandes del ticket se dibujan con la letra de Windows. Si no se

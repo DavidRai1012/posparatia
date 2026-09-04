@@ -1,20 +1,29 @@
 // Reportes, cierre de caja, cola de correo del reporte diario y
 // sincronización con Google Sheets (vía webhook de Google Apps Script).
 const { db, ahora, jornadaHoy, getConfig, setConfig } = require('./db');
+const { registrar } = require('./registro');
 
 // Toda salida a internet lleva tope de tiempo. El restaurante navega por el
 // hotspot de un teléfono: cuando los datos se acaban o la señal se cae, la
 // conexión muchas veces NO falla, se queda muda — y sin tope, un fetch espera
 // hasta 5 minutos (y el cierre de caja, hasta 2 minutos por el correo).
 const TIMEOUT_INTERNET_MS = 15000;
-function fetchConTimeout(url, opciones = {}) {
-  return fetch(url, { ...opciones, signal: AbortSignal.timeout(TIMEOUT_INTERNET_MS) });
+// Google Apps Script tarda más que un servidor normal (arranca el script en
+// frío y redirige dos veces): por el hotspot de un teléfono eso pasaba de
+// 15 s y cada venta quedaba "sin conexión" aunque el internet sí servía.
+const TIMEOUT_SHEETS_MS = 45000;
+function fetchConTimeout(url, opciones = {}, ms = TIMEOUT_INTERNET_MS) {
+  return fetch(url, { ...opciones, signal: AbortSignal.timeout(ms) });
 }
 function errorDeRed(err) {
   if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-    return 'Internet no respondió en 15 segundos (¿el teléfono que comparte los datos tiene señal?)';
+    return 'Internet no respondió a tiempo (lento o sin señal en el teléfono que comparte los datos)';
   }
-  return (err && (err.cause && err.cause.message || err.message)) || String(err);
+  const m = (err && (err.cause && err.cause.message || err.message)) || String(err);
+  if (/ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|fetch failed/i.test(m)) {
+    return 'Sin salida a internet en este momento';
+  }
+  return m;
 }
 
 // ---- Qué se vendió, plato por plato y tipo por tipo ----
@@ -377,7 +386,7 @@ function encolarReportesMensuales(jornada, forzarMes) {
       try { reportados = JSON.parse(getConfig('meses_reportados') || '[]'); } catch { }
       if (!reportados.includes(mes)) setConfig('meses_reportados', JSON.stringify([...reportados, mes]));
     }
-    console.log(`[reportes] Reportes mensuales de ${mes} encolados`);
+    registrar('reportes', `Reportes mensuales de ${mes} encolados`);
   }
   return meses;
 }
@@ -414,9 +423,9 @@ async function drenarCorreos() {
       // Los adjuntos ya cumplieron: se sueltan para no engordar la base de datos
       db.prepare("UPDATE cola_correos SET estado = 'enviado', enviado_en = ?, adjuntos = NULL WHERE id = ?").run(ahora(), correo.id);
       enviados++;
-      console.log(`[reportes] Correo enviado: ${correo.asunto}`);
+      registrar('correo', `Correo enviado: ${correo.asunto}`);
     } catch (err) {
-      console.error('[reportes] Fallo al enviar correo (se reintentará):', err.message);
+      registrar('correo', `Fallo al enviar correo (se reintentará): ${err.message}`);
       return { ok: false, enviados, pendientes: pendientes.length - enviados, error: errorDeRed(err) };
     }
   }
@@ -450,7 +459,12 @@ function payloadSheets(f) {
   };
 }
 
+// El Excel en tiempo real es OPCIONAL: apagado, no se encola ni se intenta
+// nada (ni un mensaje). Se prende en Admin con su casilla.
+function sheetsActivo() { return String(getConfig('sheets_activo')) === '1'; }
+
 function encolarVentaSheets(pedidoId) {
+  if (!sheetsActivo()) return;
   const p = pedidosConPago('p.id = ?').get(pedidoId);
   if (!p || !p.metodo) return;
   const fila = filaVenta(p, itemsConTipo.all(p.id), true);
@@ -477,7 +491,7 @@ async function enviarASheets(url, filas) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ filas })
-  });
+  }, TIMEOUT_SHEETS_MS);
   const cuerpo = (await res.text()).trim();
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) {
@@ -502,10 +516,41 @@ async function enviarASheets(url, filas) {
   return { status: res.status, cuerpo, json: jsonOk ? json : null, versionNueva: !!(json && json.hoja) };
 }
 
-async function drenarSheets() {
-  const url = String(getConfig('sheets_webhook_url') || '').trim();
+// Estado del Excel en tiempo real, para el aviso de arriba de la app y el
+// solucionador. Cada vez que cambia se avisa a las pantallas (Socket.IO).
+let alCambiarSheets = null, firmaSheets = '';
+function setAvisoSheets(fn) { alCambiarSheets = fn; }
+// Reintentos espaciados (1, 2, 4... hasta 10 min): sin internet no tiene
+// sentido intentar cada 30 s y llenar el registro de errores iguales
+let retrasoSheets = 0, proximoIntentoSheets = 0;
+function estadoSheets() {
+  const d = new Date(proximoIntentoSheets);
+  return {
+    activo: sheetsActivo(),
+    configurado: !!String(getConfig('sheets_webhook_url') || '').trim(),
+    pendientes: db.prepare("SELECT COUNT(*) AS n FROM cola_sheets WHERE estado = 'pendiente'").get().n,
+    ultimoOk: getConfig('sheets_ultimo_ok') || '',
+    ultimoError: getConfig('sheets_ultimo_error') || '',
+    proximoIntento: proximoIntentoSheets > Date.now()
+      ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : null
+  };
+}
+function avisarSheets() {
+  if (!alCambiarSheets) return;
+  const e = estadoSheets();
+  const firma = JSON.stringify(e);
+  if (firma === firmaSheets) return;
+  firmaSheets = firma;
+  try { alCambiarSheets(e); } catch { /* sin pantallas conectadas */ }
+}
+
+// `forzar`: la prueba y el solucionador envían aunque esté apagado o en espera
+async function drenarSheets({ forzar } = {}) {
   const pendientes = db.prepare("SELECT * FROM cola_sheets WHERE estado = 'pendiente' ORDER BY id LIMIT 100").all();
   if (!pendientes.length) return { ok: true, enviados: 0, pendientes: 0 };
+  if (!forzar && !sheetsActivo()) return { ok: false, enviados: 0, pendientes: pendientes.length, desactivado: true };
+  if (!forzar && Date.now() < proximoIntentoSheets) return { ok: false, enviados: 0, pendientes: pendientes.length, esperando: true };
+  const url = String(getConfig('sheets_webhook_url') || '').trim();
   if (!url) return { ok: false, enviados: 0, pendientes: pendientes.length, error: 'No hay URL del webhook de Google Sheets configurada' };
   try {
     const r = await enviarASheets(url, pendientes.map(p => JSON.parse(p.payload)));
@@ -514,12 +559,17 @@ async function drenarSheets() {
     tx();
     setConfig('sheets_ultimo_ok', ahora() + (r.json && r.json.hoja ? ` (hoja ${r.json.hoja})` : ''));
     setConfig('sheets_ultimo_error', '');
-    console.log(`[sheets] ${pendientes.length} venta(s) sincronizada(s)${r.json && r.json.hoja ? ` en la hoja ${r.json.hoja}` : ''}`);
+    retrasoSheets = 0; proximoIntentoSheets = 0;
+    registrar('sheets', `${pendientes.length} venta(s) sincronizada(s)${r.json && r.json.hoja ? ` en la hoja ${r.json.hoja}` : ''}`);
+    avisarSheets();
     return { ok: true, enviados: pendientes.length, pendientes: 0, hoja: r.json && r.json.hoja };
   } catch (err) {
     const detalle = errorDeRed(err);
     setConfig('sheets_ultimo_error', ahora() + ' — ' + detalle);
-    console.error('[sheets] Sin conexión o error del webhook (quedan en búfer):', detalle);
+    retrasoSheets = Math.min(retrasoSheets ? retrasoSheets * 2 : 60000, 600000);
+    proximoIntentoSheets = Date.now() + retrasoSheets;
+    registrar('sheets', `${pendientes.length} venta(s) quedan en espera: ${detalle}. Reintento en ${Math.round(retrasoSheets / 60000)} min`);
+    avisarSheets();
     return { ok: false, enviados: 0, pendientes: pendientes.length, error: detalle };
   }
 }
@@ -541,6 +591,10 @@ async function diagnosticoSheets(vendedor) {
   const formaOk = /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(url);
   agregar('Enlace configurado', formaOk, url, formaOk ? ''
     : 'No parece el enlace de una implementación de Apps Script. Debe empezar por https://script.google.com/macros/s/ y TERMINAR en /exec. Si termina en /dev o es el enlace de la hoja, está mal.');
+  const activo = sheetsActivo();
+  agregar('Excel en tiempo real activado', activo,
+    activo ? 'Activado: cada venta pagada se envía a la hoja' : 'Desactivado: las ventas NO se envían (el Excel del correo diario sigue igual)',
+    activo ? '' : 'Si quiere la hoja en tiempo real, marque la casilla "Activar" de esta tarjeta y guarde la configuración.');
 
   const net = await hayInternet();
   agregar('Internet en el PC', net, net ? 'Hay salida a internet' : 'El PC no tiene salida a internet',
@@ -578,6 +632,8 @@ async function diagnosticoSheets(vendedor) {
       resumen = '❌ El envío falla: ' + msj;
     }
   }
+  // Si la prueba pasó, lo que estaba en espera se empuja ya mismo
+  if (net && resumen.startsWith('✅')) await drenarSheets({ forzar: true });
   const pend = db.prepare("SELECT COUNT(*) AS n FROM cola_sheets WHERE estado = 'pendiente'").get().n;
   if (pend) agregar('Ventas en espera', false, `${pend} venta(s) sin subir`, 'Se suben solas apenas el envío funcione: no se pierde ninguna.');
   else agregar('Ventas en espera', true, 'Ninguna: todo lo registrado ya se envió');
@@ -589,7 +645,7 @@ async function diagnosticoSheets(vendedor) {
 // sigue normal) de "los teléfonos no alcanzan al PC" (problema del WiFi).
 async function hayInternet() {
   try {
-    const res = await fetch('https://www.gstatic.com/generate_204', { signal: AbortSignal.timeout(4000) });
+    const res = await fetch('https://www.gstatic.com/generate_204', { signal: AbortSignal.timeout(8000) });
     return res.status === 204 || res.ok;
   } catch { return false; }
 }
@@ -600,6 +656,7 @@ function estadoSync() {
     sheets_pendientes: db.prepare("SELECT COUNT(*) AS n FROM cola_sheets WHERE estado = 'pendiente'").get().n,
     correos_pendientes: db.prepare("SELECT COUNT(*) AS n FROM cola_correos WHERE estado = 'pendiente'").get().n,
     sheets_configurado: !!getConfig('sheets_webhook_url'),
+    sheets_activo: sheetsActivo(),
     correo_configurado: !!(getConfig('gmail_usuario') && getConfig('gmail_app_password') && getConfig('correo_dueno'))
   };
 }
@@ -631,12 +688,12 @@ function iniciarPlanificador() {
       if (horaActual >= horaConfig && !yaEncolado && ultimaJornadaReportada !== jornada) {
         ultimaJornadaReportada = jornada;
         encolarReporteDiario(jornada);
-        console.log(`[reportes] Reporte de la jornada ${jornada} encolado (hora configurada: ${horaConfig})`);
+        registrar('reportes', `Reporte de la jornada ${jornada} encolado (hora configurada: ${horaConfig})`);
       }
       await drenarCorreos();
       await drenarSheets();
     } catch (err) {
-      console.error('[planificador]', err.message);
+      registrar('planificador', err.message);
     } finally {
       drenando = false;
     }
@@ -646,5 +703,6 @@ function iniciarPlanificador() {
 module.exports = {
   resumenJornada, resumenMes, ventasPorPlato, filasVentas, nombreReporte, baseCajaDe, ETIQUETAS_METODO,
   ejecutarCierre, encolarReporteDiario, encolarReportesMensuales, mesesPorReportar,
-  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, horaReporteDe, drenarCorreos, drenarSheets, diagnosticoSheets, estadoSync, hayInternet
+  encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, horaReporteDe, drenarCorreos, drenarSheets, diagnosticoSheets, estadoSync, hayInternet,
+  estadoSheets, setAvisoSheets, sheetsActivo
 };

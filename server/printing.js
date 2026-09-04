@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const { db, ahora, getConfig, DATA_DIR } = require('./db');
+const { registrar } = require('./registro');
 
 let io = null;                 // socket.io, inyectado desde index.js
 let procesando = false;
@@ -65,7 +66,7 @@ async function procesarCola() {
           .run(intentos, estado, String(err.message || err), trabajo.id);
         if (modo === 'puente' && !socketPuente) break; // sin puente conectado: retener y no quemar intentos
         if (estado === 'pendiente') await esperar(2000); // pausa breve antes de reintentar
-        else console.error(`[impresion] trabajo ${trabajo.id} en error tras 3 intentos:`, err.message);
+        else registrar('impresion', `trabajo ${trabajo.id} en error tras 3 intentos: ${err.message}`);
       }
       notificarEstado();
     }
@@ -146,7 +147,7 @@ function driverPuente(trabajo) {
 
 function registrarPuente(socket) {
   socketPuente = socket;
-  console.log('[impresion] Estación de impresión conectada:', socket.id);
+  registrar('impresion', `Estación de impresión conectada: ${socket.id}`);
   socket.on('trabajo:resultado', ({ id, ok, error }) => {
     const ack = acksPendientes.get(id);
     if (!ack) return;
@@ -158,7 +159,7 @@ function registrarPuente(socket) {
   socket.on('disconnect', () => {
     if (socketPuente === socket) {
       socketPuente = null;
-      console.log('[impresion] Estación de impresión desconectada');
+      registrar('impresion', 'Estación de impresión desconectada');
       notificarEstado();
     }
   });

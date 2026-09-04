@@ -1,4 +1,13 @@
 @echo off
+rem La ventana negra es solo el motor del POS. Se abre MINIMIZADA para que lo
+rem que se vea sea la app en el navegador (el servidor la abre solo apenas
+rem arranca). Lo que el sistema hace por dentro (envios a Google, correos,
+rem reintentos) NO sale aqui: queda en data\registro.log.
+if not "%POS_MINIMIZADO%"=="1" (
+  set POS_MINIMIZADO=1
+  start /min "POS Restaurante" cmd /c "%~f0"
+  exit /b
+)
 title POS Restaurante
 cd /d "%~dp0"
 
@@ -8,19 +17,15 @@ if exist "%~dp0node.exe" (set NODE="%~dp0node.exe") else (set NODE=node)
 rem Si el POS ya esta corriendo, solo abrir la app en el navegador
 netstat -ano | findstr /r /c:":3000 .*LISTENING" >nul 2>&1
 if %errorlevel%==0 (
-  echo El POS ya esta corriendo. Abriendo la app...
   start "" http://localhost:3000
-  timeout /t 3 >nul
   exit
 )
 
 echo ============================================
-echo   POS Restaurante - iniciando servidor...
-echo   NO CIERRE ESTA VENTANA durante el servicio
+echo   POS Restaurante - motor en marcha
+echo   Puede dejar esta ventana minimizada.
+echo   NO la cierre durante el servicio.
 echo ============================================
-
-rem Abrir el navegador cuando el servidor haya arrancado (4 segundos)
-start /min cmd /c "timeout /t 4 >nul & start http://localhost:3000"
 
 %NODE% server\index.js
 pause

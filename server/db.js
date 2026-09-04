@@ -448,15 +448,20 @@ const CONFIG_DEFAULTS = {
   precio_entrada_sola: '7500',
   // Meses cuyo reporte mensual ya se encoló (para no repetirlo en cada cierre)
   meses_reportados: '[]',
-  // Cargos de nómina con su valor por turno. sabado/domingo vacíos = igual que
-  // el valor normal. El admin pone los valores; la cajera solo elige el cargo.
+  // Roles de nómina (cajero, auxiliar de caja...) con el valor del turno por
+  // DÍA DE LA SEMANA: dias[getDay()], 0 = domingo. Sin valor "por defecto":
+  // se escribe el de cada día, para que nadie se confunda. Los editan el
+  // admin y el cajero.
   cargos_nomina: JSON.stringify([
-    { nombre: 'Cajero', valor: 0, sabado: null, domingo: null },
-    { nombre: 'Auxiliar de caja', valor: 0, sabado: null, domingo: null },
-    { nombre: 'Auxiliar de cocina', valor: 0, sabado: null, domingo: null },
-    { nombre: 'Mesero', valor: 0, sabado: null, domingo: null },
-    { nombre: 'Cocinera', valor: 0, sabado: null, domingo: null }
+    { nombre: 'Cajero', dias: [0, 0, 0, 0, 0, 0, 0] },
+    { nombre: 'Auxiliar de caja', dias: [0, 0, 0, 0, 0, 0, 0] },
+    { nombre: 'Auxiliar de cocina', dias: [0, 0, 0, 0, 0, 0, 0] },
+    { nombre: 'Mesero', dias: [0, 0, 0, 0, 0, 0, 0] },
+    { nombre: 'Cocinera', dias: [0, 0, 0, 0, 0, 0, 0] }
   ]),
+  // Excel en tiempo real (Google Sheets): OPCIONAL, apagado hasta que el
+  // administrador marque su casilla. Apagado no envía nada ni avisa nada.
+  sheets_activo: '0',
   // Hora de cierre (reporte de respaldo) por día de la semana, índice getDay()
   // (0 = domingo). Vacío = usa hora_reporte. No todos los días se cierra igual.
   horas_reporte: '["","","","","","",""]',
@@ -488,6 +493,24 @@ function getConfigAll() {
   for (const row of db.prepare('SELECT clave, valor FROM config').all()) out[row.clave] = row.valor;
   return out;
 }
+
+// Migración: los "cargos" de nómina (valor normal + sábado + domingo) pasan a
+// ROLES con un valor por cada día de la semana: el valor normal se copia de
+// lunes a viernes y sábado/domingo conservan el suyo.
+try {
+  const fila = db.prepare("SELECT valor FROM config WHERE clave = 'cargos_nomina'").get();
+  const lista = fila ? JSON.parse(fila.valor) : null;
+  if (Array.isArray(lista) && lista.some(c => c && !Array.isArray(c.dias))) {
+    const n = (v) => Math.max(0, Math.round(Number(v) || 0));
+    const nuevos = lista.filter(c => c && c.nombre).map(c => {
+      if (Array.isArray(c.dias)) return { nombre: c.nombre, dias: c.dias.map(n) };
+      const v = n(c.valor);
+      return { nombre: c.nombre, dias: [n(c.domingo) || v, v, v, v, v, v, n(c.sabado) || v] };
+    });
+    setConfig('cargos_nomina', JSON.stringify(nuevos));
+    console.log('[db] Migración aplicada: cargos de nómina convertidos en roles con valor por día');
+  }
+} catch (e) { console.error('[db] No se pudieron convertir los cargos de nómina:', e.message); }
 
 // ---- Semilla inicial ----
 const nUsuarios = db.prepare('SELECT COUNT(*) AS n FROM usuarios').get().n;
