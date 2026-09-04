@@ -7,7 +7,8 @@
 // de `reportes.filasVentas()`.
 //
 //   correoDiario(jornada)   → asunto, texto, html, adjuntos [resumen del día (+ nómina si hubo)]
-//   correosMensuales(mes)   → [nómina del mes, resumen del mes] con sus Excel
+//   correoMes(mes)          → reporte del mes: resumen + Excel del mes + Excel de nómina
+//   correoNomina(mes)       → solo la nómina de un mes, con su Excel
 //   excelResumenDia / excelResumenMes / excelNomina → Buffers .xlsx
 const { db, getConfig } = require('./db');
 const reportes = require('./reports');
@@ -361,20 +362,25 @@ function excelNomina(anio, soloMes) {
 }
 
 // ---- Correos ----
+// Cada reporte lleva su mensaje y sus DOS Excel: el resumen (del día o del
+// mes) y la nómina de ese mes. Así el dueño recibe todo de una, y desde Caja
+// se reenvía cualquier día, cualquier mes, o solo la nómina de un mes.
+function adjuntoNomina(mes) {
+  const xn = excelNomina(mes.slice(0, 4), mes);
+  return xn ? { nombre: `nomina-${mes}.xlsx`, base64: xn.toString('base64') } : null;
+}
+
 function correoDiario(jornada) {
   const r = resumenConCierre(jornada);
   const nombre = getConfig('nombre_restaurante');
+  const mes = jornada.slice(0, 7);
   const titulo = `Reporte del ${diaSemana(jornada)} ${jornada} · ${nombre}`;
   const secciones = seccionesResumen(r, false);
   const adjuntos = [{ nombre: `resumen-${jornada}.xlsx`, base64: excelResumenDia(jornada, false).toString('base64') }];
-  let intro = 'Adjunto va el Excel del día: hoja 1 con este mismo resumen y hoja 2 con las ventas una a una.';
-  if (r.nomina.length) {
-    const xn = excelNomina(jornada.slice(0, 4));
-    if (xn) {
-      adjuntos.push({ nombre: `nomina-${jornada.slice(0, 4)}.xlsx`, base64: xn.toString('base64') });
-      intro += ' Hoy se pagó nómina: también va el Excel de nómina, con una hoja por mes.';
-    }
-  }
+  const an = adjuntoNomina(mes);
+  if (an) adjuntos.push(an);
+  let intro = `Adjuntos van los dos Excel: el del día (hoja 1 con este mismo resumen, hoja 2 con las ventas una a una) y el de nómina de ${nombreMes(mes)} (días trabajados y pagos de cada empleado${an ? '' : ': todavía no hay registros ese mes, por eso no va'}).`;
+  if (r.nomina.length) intro += ' Este día se pagó nómina.';
   return {
     asunto: `Reporte diario ${jornada} - ${nombre}`,
     texto: textoDeSecciones(titulo, secciones, intro),
@@ -383,12 +389,12 @@ function correoDiario(jornada) {
   };
 }
 
-function correosMensuales(mes) {
+// Solo la nómina de un mes: lo pagado por empleado, los días trabajados por
+// rol y el Excel de nómina de ese mes (sirve para revisar meses anteriores)
+function correoNomina(mes) {
   const r = reportes.resumenMes(mes);
   const nombre = getConfig('nombre_restaurante');
   const nm = nombreMes(mes);
-
-  // 1. Nómina del mes
   const filasNomina = r.nomina.length
     ? r.nomina.map(n => [n.empleado, fmt(n.total), `${n.pagos || 1} pago(s) por ${n.turnos} turno(s)${n.bonos ? `, bonos +${fmt(n.bonos)}` : ''}${n.descuentos ? `, descuentos -${fmt(n.descuentos)}` : ''}`])
     : [['Sin pagos de nómina confirmados este mes', '']];
@@ -398,31 +404,39 @@ function correosMensuales(mes) {
     secN.push({ titulo: 'DÍAS TRABAJADOS EN EL MES (por rol)', filas: r.turnosMes.map(t =>
       [`${t.empleado} · ${t.cargo}`, t.cantidad, `${fmt(t.total)}${t.sinPagar ? ` · sin pagar ${fmt(t.sinPagar)}` : ''}`]) });
   }
-  const xn = excelNomina(mes.slice(0, 4), mes);
-  const introN = xn
-    ? `Adjunto va el Excel de nómina de ${nm} (hoja RESUMEN del año y la hoja del mes con cada pago por empleado).`
-    : `No hubo pagos de nómina confirmados en ${nm}.`;
-  const correoNomina = {
+  const an = adjuntoNomina(mes);
+  const intro = an
+    ? `Adjunto va el Excel de nómina de ${nm} (hoja RESUMEN del año y la hoja del mes con cada día trabajado y cada pago por empleado).`
+    : `No hay turnos ni pagos de nómina registrados en ${nm}.`;
+  return {
     asunto: `Nómina de ${nm} - ${nombre}`,
-    texto: textoDeSecciones(`Nómina de ${nm} · ${nombre}`, secN, introN),
-    html: htmlDeSecciones(`Nómina de ${nm} · ${nombre}`, secN, introN),
-    adjuntos: xn ? [{ nombre: `nomina-${mes}.xlsx`, base64: xn.toString('base64') }] : []
+    texto: textoDeSecciones(`Nómina de ${nm} · ${nombre}`, secN, intro),
+    html: htmlDeSecciones(`Nómina de ${nm} · ${nombre}`, secN, intro),
+    adjuntos: an ? [an] : []
   };
+}
 
-  // 2. Resumen del mes con todas las ventas
+// El reporte completo de un mes: resumen (con la nómina pagada y los días
+// trabajados incluidos) + Excel del mes + Excel de nómina del mes
+function correoMes(mes) {
+  const r = reportes.resumenMes(mes);
+  const nombre = getConfig('nombre_restaurante');
+  const nm = nombreMes(mes);
   const secR = seccionesResumen(r, true);
   // Si el mes todavía no ha terminado, el reporte es parcial y hay que decirlo
   const hoy = new Date().toLocaleDateString('sv-SE');
   const parcial = mes >= hoy.slice(0, 7) ? ` ATENCIÓN: ${nm} todavía no ha terminado, así que este reporte va hasta el ${hoy}.` : '';
-  const introR = `Adjunto va el Excel del mes: hoja 1 con este resumen (incluida la tabla día por día) y hoja 2 con todas las ventas de ${nm} una a una.${parcial}`;
-  const correoResumen = {
-    asunto: `Resumen mensual ${nm} - ${nombre}`,
-    texto: textoDeSecciones(`Resumen de ${nm} · ${nombre}`, secR, introR),
-    html: htmlDeSecciones(`Resumen de ${nm} · ${nombre}`, secR, introR),
-    adjuntos: [{ nombre: `resumen-${mes}.xlsx`, base64: excelResumenMes(mes).toString('base64') }]
+  const adjuntos = [{ nombre: `resumen-${mes}.xlsx`, base64: excelResumenMes(mes).toString('base64') }];
+  const an = adjuntoNomina(mes);
+  if (an) adjuntos.push(an);
+  const intro = `Adjuntos van los dos Excel de ${nm}: el resumen (hoja 1 con este resumen y la tabla día por día, hoja 2 con todas las ventas una a una, más platos, tipos y gastos) y la nómina (hoja RESUMEN del año y la hoja del mes con cada día trabajado y cada pago por empleado${an ? '' : ': sin registros ese mes, por eso no va'}).${parcial}`;
+  return {
+    asunto: `Reporte del mes ${nm} - ${nombre}`,
+    texto: textoDeSecciones(`Reporte de ${nm} · ${nombre}`, secR, intro),
+    html: htmlDeSecciones(`Reporte de ${nm} · ${nombre}`, secR, intro),
+    adjuntos
   };
-  return [correoNomina, correoResumen];
 }
 
 module.exports = { seccionesResumen, textoDeSecciones, htmlDeSecciones, excelResumenDia, excelResumenMes, excelNomina,
-  correoDiario, correosMensuales, nombreMes, hojaMes, MESES };
+  correoDiario, correoMes, correoNomina, nombreMes, hojaMes, MESES };

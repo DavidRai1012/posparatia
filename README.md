@@ -98,6 +98,10 @@ En Admin → Reporte (solo el administrador puede ver y cambiar esto):
   [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
   (requiere verificación en 2 pasos activa; son 16 letras).
 
+Cada reporte lleva el mensaje y dos Excel: el del día (o del mes) y el de nómina del mes.
+Desde **Caja → 📨 Reenviar reportes** (cajero o admin) se reenvía el reporte de un día, el de
+un mes, o solo la nómina de un mes.
+
 Sin internet a esa hora, el reporte queda en cola y sale cuando vuelva la conexión.
 
 ## 5. Google Sheets (opcional)
@@ -132,7 +136,8 @@ Viene **desactivado**: mientras la casilla no esté marcada no se envía nada ni
 aparece ningún aviso. Activado, arriba de la app (caja y admin) se ve si está
 al día o cuántas ventas esperan. Sin internet, las ventas quedan en búfer local
 y se suben solas al reconectar (reintentos cada 1, 2, 4... hasta 10 minutos).
-La ventana negra no muestra nada de esto: queda en `dataegistro.log`.
+La ventana negra no muestra nada de esto: queda en `data
+egistro.log`.
 
 ## 6. Operación diaria
 

@@ -161,9 +161,9 @@ El formato cambió a **una pestaña por mes**. Hay dos caminos:
 
 | Cuándo | Correo | Adjuntos |
 |---|---|---|
-| Cada **cierre de caja** | Reporte diario (ventas, métodos de pago con almuerzos por método, vendedores, tipos de proteína, gastos, nómina, caja) | `resumen-FECHA.xlsx` (hoja 1: el mismo resumen · hoja 2: ventas una a una). Si ese día se pagó nómina, también `nomina-AÑO.xlsx` (una hoja por mes). |
-| **Último día del mes** (o el primer cierre después, si ese día no abrieron) | Nómina del mes | `nomina-AÑO-MES.xlsx` (hoja RESUMEN + la del mes, por empleado) |
-| Ídem | Resumen mensual | `resumen-AÑO-MES.xlsx` (hoja 1: resumen con tabla día por día · hoja 2: todas las ventas del mes · platos · tipos · gastos) |
+| Cada **cierre de caja** (o a la hora de cierre) | Reporte diario (ventas, métodos de pago con almuerzos por método, vendedores, tipos de proteína, gastos, nómina, caja) | `resumen-FECHA.xlsx` (hoja 1: el mismo resumen · hoja 2: ventas una a una) y `nomina-AÑO-MES.xlsx` (hoja RESUMEN del año + la del mes: días trabajados y pagos por empleado) |
+| **Último día del mes** (o el primer cierre después, si ese día no abrieron) | Reporte del mes, en un solo correo (resumen con tabla día por día, nómina pagada y días trabajados) | `resumen-AÑO-MES.xlsx` (resumen · todas las ventas del mes · platos · tipos · gastos) y `nomina-AÑO-MES.xlsx` |
 
-Desde **Admin** se puede reenviar el reporte de hoy ("📨 Enviar reporte ahora") y los dos
-correos de cualquier mes ("📅 Enviar reportes del mes").
+Para **reenviar** cualquiera: **Caja → 📨 Reenviar reportes al correo del dueño** (cajero o
+administrador). Tres botones: el reporte de un día, el reporte de un mes, o **solo la nómina de
+un mes** (también de meses anteriores). Cada uno dice si salió o si quedó en cola.

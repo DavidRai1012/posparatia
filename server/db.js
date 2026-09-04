@@ -371,6 +371,12 @@ if (!db.prepare('PRAGMA table_info(cola_correos)').all().some(c => c.name === 'a
   db.exec('ALTER TABLE cola_correos ADD COLUMN adjuntos TEXT');
   console.log('[db] Migración aplicada: correos con HTML y adjuntos');
 }
+// Migración: tipo de correo en la cola (diario | mes | reenvio), para que un
+// reenvío pedido a mano no cuente como "el reporte del día ya salió"
+if (!db.prepare('PRAGMA table_info(cola_correos)').all().some(c => c.name === 'tipo')) {
+  db.exec("ALTER TABLE cola_correos ADD COLUMN tipo TEXT NOT NULL DEFAULT 'diario'");
+  console.log('[db] Migración aplicada: tipo de correo en la cola');
+}
 
 // Migración: la corrección de totales por método pasó de reemplazo a diferencia
 if (!db.prepare('PRAGMA table_info(ajustes_metodo)').all().some(c => c.name === 'registrado')) {

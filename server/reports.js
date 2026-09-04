@@ -344,13 +344,21 @@ function ejecutarCierre(jornada, efectivoContado, usuarioId) {
   return { ...resumen, efectivoSistema: resumen.porMetodo.efectivo || 0, efectivoContado, descuadre };
 }
 
-// ---- Correos: reporte diario y reportes mensuales ----
+// ---- Correos: reporte diario, reporte mensual y reenvíos ----
 // El contenido (texto, HTML y los Excel adjuntos) lo arma informes.js; aquí
 // solo se encola. Los adjuntos van en base64 para que esperen sin internet.
-function encolarCorreo(jornada, correo) {
-  db.prepare('INSERT INTO cola_correos (jornada, asunto, cuerpo, html, adjuntos, estado, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?)')
+// `tipo`: 'diario' (el automático del día), 'mes' (el automático de fin de
+// mes) o 'reenvio' (pedido a mano desde Caja). Un reenvío no cuenta como "el
+// reporte del día ya salió", así que el automático sale igual a su hora.
+function encolarCorreo(jornada, correo, tipo = 'diario') {
+  return db.prepare('INSERT INTO cola_correos (jornada, asunto, cuerpo, html, adjuntos, tipo, estado, creado_en) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run(jornada, correo.asunto, correo.texto, correo.html || null,
-         correo.adjuntos && correo.adjuntos.length ? JSON.stringify(correo.adjuntos) : null, 'pendiente', ahora());
+         correo.adjuntos && correo.adjuntos.length ? JSON.stringify(correo.adjuntos) : null, tipo, 'pendiente', ahora()).lastInsertRowid;
+}
+function encolarReenvio(jornada, correo) { return encolarCorreo(jornada, correo, 'reenvio'); }
+function estadoCorreo(id) {
+  const c = db.prepare('SELECT estado FROM cola_correos WHERE id = ?').get(id);
+  return c ? c.estado : null;
 }
 
 function encolarReporteDiario(jornada) {
@@ -359,8 +367,8 @@ function encolarReporteDiario(jornada) {
 }
 
 // El último día del mes (o el primer cierre después, si ese día no abrieron)
-// salen dos correos más: la nómina del mes y el resumen del mes con todas las
-// ventas. Cada mes se reporta una sola vez.
+// sale además el reporte del mes: resumen con todas las ventas + Excel del mes
+// + Excel de nómina del mes, en un solo correo. Cada mes se reporta una vez.
 function mesesPorReportar(jornada) {
   let reportados = [];
   try { reportados = JSON.parse(getConfig('meses_reportados') || '[]'); } catch { }
@@ -380,13 +388,13 @@ function encolarReportesMensuales(jornada, forzarMes) {
   const informes = require('./informes');
   const meses = forzarMes ? [forzarMes] : mesesPorReportar(jornada);
   for (const mes of meses) {
-    for (const correo of informes.correosMensuales(mes)) encolarCorreo(jornada, correo);
+    encolarCorreo(jornada, informes.correoMes(mes), 'mes');
     if (!forzarMes) {
       let reportados = [];
       try { reportados = JSON.parse(getConfig('meses_reportados') || '[]'); } catch { }
       if (!reportados.includes(mes)) setConfig('meses_reportados', JSON.stringify([...reportados, mes]));
     }
-    registrar('reportes', `Reportes mensuales de ${mes} encolados`);
+    registrar('reportes', `Reporte del mes ${mes} encolado`);
   }
   return meses;
 }
@@ -410,7 +418,9 @@ async function drenarCorreos() {
   let enviados = 0;
   for (const correo of pendientes) {
     try {
-      const retraso = correo.jornada !== jornadaHoy() ? `(Enviado con retraso; corresponde a la jornada ${correo.jornada})` : '';
+      // Solo el reporte automático del día avisa si salió tarde: un reenvío de
+      // un día viejo es a propósito
+      const retraso = correo.tipo === 'diario' && correo.jornada !== jornadaHoy() ? `(Enviado con retraso; corresponde a la jornada ${correo.jornada})` : '';
       let adjuntos = [];
       try { adjuntos = JSON.parse(correo.adjuntos || '[]'); } catch { }
       await transporte.sendMail({
@@ -684,7 +694,7 @@ function iniciarPlanificador() {
       const horaConfig = horaReporteDe(jornada); // se lee en cada ciclo: cambia sin reiniciar
       const d = new Date();
       const horaActual = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-      const yaEncolado = db.prepare('SELECT id FROM cola_correos WHERE jornada = ?').get(jornada);
+      const yaEncolado = db.prepare("SELECT id FROM cola_correos WHERE jornada = ? AND tipo = 'diario'").get(jornada);
       if (horaActual >= horaConfig && !yaEncolado && ultimaJornadaReportada !== jornada) {
         ultimaJornadaReportada = jornada;
         encolarReporteDiario(jornada);
@@ -702,7 +712,7 @@ function iniciarPlanificador() {
 
 module.exports = {
   resumenJornada, resumenMes, ventasPorPlato, filasVentas, nombreReporte, baseCajaDe, ETIQUETAS_METODO,
-  ejecutarCierre, encolarReporteDiario, encolarReportesMensuales, mesesPorReportar,
+  ejecutarCierre, encolarReporteDiario, encolarReportesMensuales, mesesPorReportar, encolarReenvio, estadoCorreo,
   encolarVentaSheets, encolarFilaPruebaSheets, iniciarPlanificador, horaReporteDe, drenarCorreos, drenarSheets, diagnosticoSheets, estadoSync, hayInternet,
   estadoSheets, setAvisoSheets, sheetsActivo
 };

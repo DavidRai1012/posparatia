@@ -1266,6 +1266,51 @@ async function descargarArchivo(ruta, nombre) {
 }
 
 // ---------------- Vista: caja ----------------
+// ---- Reenviar reportes al correo del dueño (desde Caja) ----
+const MESES_LARGO = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+const nombreMesCliente = (mes) => `${MESES_LARGO[Number(mes.slice(5, 7)) - 1]} de ${mes.slice(0, 4)}`;
+function conectarReenvios() {
+  const estado = $('#re-estado');
+  if (!estado) return;
+  const enviar = async (boton, cuerpo, pregunta) => {
+    if (!confirm(pregunta + '\n\n(Va al correo del dueño configurado en Admin.)')) return;
+    const botones = ['#btn-re-dia', '#btn-re-mes', '#btn-re-nom'].map(id => $(id)).filter(Boolean);
+    botones.forEach(b => { b.disabled = true; });
+    estado.textContent = '⏳ Armando el reporte y enviando... puede tardar unos segundos.';
+    try {
+      const r = await api('/reportes/reenviar', { method: 'POST', body: cuerpo });
+      estado.innerHTML = r.enviado
+        ? '✅ Enviado al correo del dueño.'
+        : `⏳ Quedó en cola${r.error ? `: ${esc(r.error)}` : ''}. Sale solo apenas se pueda.`;
+      toast(r.enviado ? 'Reporte enviado' : 'Reporte en cola de envío');
+    } catch (e) { estado.textContent = ''; toast(e.message, true); }
+    botones.forEach(b => { b.disabled = false; });
+  };
+  $('#btn-re-dia').onclick = () => {
+    const dia = $('#re-dia').value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia)) return toast('Elija el día', true);
+    if (dia > state.jornada) return toast('Ese día todavía no ha pasado', true);
+    enviar($('#btn-re-dia'), { tipo: 'dia', dia },
+      `¿Enviar el reporte del ${fechaCorta(dia)}/${dia.slice(0, 4)}?\nLleva el mensaje con el resumen del día, el Excel del día y el Excel de nómina de ${nombreMesCliente(dia.slice(0, 7))}.`);
+  };
+  $('#btn-re-mes').onclick = () => {
+    const mes = $('#re-mes').value;
+    if (!/^\d{4}-\d{2}$/.test(mes)) return toast('Escriba el mes como 2026-09', true);
+    if (mes > state.jornada.slice(0, 7)) return toast('Ese mes todavía no ha empezado', true);
+    const enCurso = mes === state.jornada.slice(0, 7);
+    enviar($('#btn-re-mes'), { tipo: 'mes', mes },
+      `¿Enviar el reporte de ${nombreMesCliente(mes)}?\nLleva el mensaje con el resumen del mes, el Excel del mes (todas las ventas) y el Excel de nómina del mes.` +
+      (enCurso ? '\n\nOjo: es el mes en curso, así que va hasta hoy (parcial).' : ''));
+  };
+  $('#btn-re-nom').onclick = () => {
+    const mes = $('#re-nom').value;
+    if (!/^\d{4}-\d{2}$/.test(mes)) return toast('Escriba el mes como 2026-09', true);
+    if (mes > state.jornada.slice(0, 7)) return toast('Ese mes todavía no ha empezado', true);
+    enviar($('#btn-re-nom'), { tipo: 'nomina', mes },
+      `¿Enviar solo la nómina de ${nombreMesCliente(mes)}?\nLleva el mensaje con lo pagado por empleado y el Excel de nómina de ese mes.`);
+  };
+}
+
 function renderCaja() {
   if (state.enRectificar) return renderRectificar();
   if (state.enNomina) return renderNomina();
@@ -1327,6 +1372,24 @@ function renderCaja() {
       </div>
       <button class="btn-mini primario" id="btn-excel-platos" style="margin-top:8px;width:100%">
         📊 Excel de platos y tipos vendidos</button>
+    </div>
+
+    <h3>📨 Reenviar reportes al correo del dueño</h3>
+    <div class="tarjeta">
+      <div class="suave">Cada reporte lleva el mensaje y sus dos Excel (resumen y nómina). Los automáticos salen solos en cada cierre; esto es para volver a mandar uno.</div>
+      <div class="fila" style="margin-top:8px">
+        <input id="re-dia" type="date" value="${state.jornada}" max="${state.jornada}" style="flex:1">
+        <button class="btn-mini primario" id="btn-re-dia" style="flex:1.3">📨 Reporte de un día</button>
+      </div>
+      <div class="fila" style="margin-top:6px">
+        <input id="re-mes" type="month" value="${state.jornada.slice(0, 7)}" max="${state.jornada.slice(0, 7)}" style="flex:1">
+        <button class="btn-mini primario" id="btn-re-mes" style="flex:1.3">📅 Reporte de un mes</button>
+      </div>
+      <div class="fila" style="margin-top:6px">
+        <input id="re-nom" type="month" value="${state.jornada.slice(0, 7)}" max="${state.jornada.slice(0, 7)}" style="flex:1">
+        <button class="btn-mini primario" id="btn-re-nom" style="flex:1.3">👥 Solo la nómina de un mes</button>
+      </div>
+      <div class="suave" id="re-estado" style="margin-top:6px"></div>
     </div>
 
     <button class="btn gris" id="btn-ir-rect" style="margin:8px 0">🔁 Rectificar métodos de pago →</button>
@@ -1405,6 +1468,7 @@ function renderCaja() {
     renderCaja();
   });
   if ($('#btn-ir-rect')) $('#btn-ir-rect').onclick = () => { state.enRectificar = true; renderRectificar(); };
+  conectarReenvios();
   if ($('#btn-reabrir')) $('#btn-reabrir').onclick = async () => {
     if (!confirm('¿Reabrir la jornada de hoy?\nEl cierre se borra y podrán registrarse ventas de nuevo.\n(Ojo: los nombres de clientes borrados por el cierre no se recuperan.)')) return;
     try {
@@ -2670,14 +2734,7 @@ async function renderAdmin(usarCache) {
         ${sync.correo_configurado ? '✅ Correo configurado' : '⚠️ Falta configurar el Gmail que envía'}
         ${sync.correos_pendientes ? ` · ${sync.correos_pendientes} reporte(s) en cola` : ''}
       </div>
-      <div class="fila" style="margin-top:10px">
-        <button class="btn-mini primario" id="btn-reporte-ahora">📨 Enviar reporte ahora</button>
-      </div>
-      <div class="fila" style="margin-top:8px">
-        <input id="cf-mes-reporte" type="month" value="${state.jornada.slice(0, 7)}" style="flex:1">
-        <button class="btn-mini primario" id="btn-reporte-mes" style="flex:1.4">📅 Enviar reportes del mes</button>
-      </div>
-      <div class="suave" style="margin-top:4px">Los dos correos del mes (nómina y resumen con todas las ventas) salen solos en el cierre del último día; con este botón se reenvían cuando quiera.</div>
+      <div class="suave" style="margin-top:8px">El reporte del día sale solo en cada cierre de caja (o a la hora de cierre) con el mensaje y los dos Excel: el del día y el de nómina del mes. El último día del mes sale además el reporte del mes. Para <b>reenviar</b> el de un día, el de un mes o solo la nómina de un mes: <b>Caja → 📨 Reenviar reportes</b>.</div>
     </div>
 
     <div class="tarjeta">
@@ -2782,20 +2839,6 @@ async function renderAdmin(usarCache) {
   };
   $('#btn-qr').onclick = async () => {
     try { const r = await api('/impresion/qr-acceso', { method: 'POST' }); toast(`QR encolado (${r.url})`); }
-    catch (e) { toast(e.message, true); }
-  };
-  $('#btn-reporte-ahora').onclick = async () => {
-    try { await api('/reportes/enviar-ahora', { method: 'POST' }); toast('Reporte encolado para envío (con el Excel del día adjunto)'); }
-    catch (e) { toast(e.message, true); }
-  };
-  $('#btn-reporte-mes').onclick = async () => {
-    const mes = String($('#cf-mes-reporte').value || '').trim();
-    // En navegadores sin selector de mes el campo es texto libre
-    if (!/^\d{4}-\d{2}$/.test(mes)) return toast('Escriba el mes como 2026-09', true);
-    const enCurso = mes === state.jornada.slice(0, 7);
-    if (!confirm(`¿Enviar los dos correos del mes ${mes} (nómina y resumen con todas las ventas)?` +
-      (enCurso ? '\n\nOjo: es el mes en curso, así que el reporte va hasta hoy (parcial).' : ''))) return;
-    try { const r = await api('/reportes/enviar-mes', { method: 'POST', body: { mes } }); toast(`Reportes de ${r.mes} encolados para envío`); }
     catch (e) { toast(e.message, true); }
   };
   // Solucionador: revisa paso por paso y dice qué corregir

@@ -959,3 +959,36 @@ Característica: Excel en tiempo real opcional y terminal silenciosa
     Cuando se abre el POS
     Entonces la ventana negra debe quedar minimizada y el navegador debe abrirse solo con la app
 ```
+
+---
+
+```gherkin
+# language: es
+Característica: Reenviar reportes al correo del dueño desde Caja
+  Como cajero o administrador
+  Quiero reenviar el reporte de un día, el de un mes o solo la nómina de un mes
+  Para que el dueño reciba de nuevo lo que necesite, con su mensaje y sus Excel
+
+  Escenario: Reporte de un día
+    Cuando la cajera elige el 15 de agosto y toca "Reporte de un día"
+    Entonces debe salir un correo con el resumen de ese día, el Excel del día y el Excel de nómina de agosto
+    Y el reporte automático del cierre de hoy debe salir igual a su hora
+
+  Escenario: Reporte de un mes
+    Cuando la cajera elige agosto y toca "Reporte de un mes"
+    Entonces debe salir UN solo correo con el resumen del mes (incluida la nómina), el Excel del mes y el Excel de nómina del mes
+    Y si el mes está en curso debe avisar que va parcial
+
+  Escenario: Solo la nómina de un mes anterior
+    Cuando la cajera elige julio y toca "Solo la nómina de un mes"
+    Entonces debe salir un correo con lo pagado por empleado en julio y el Excel de nómina de julio
+    Y si ese mes no tiene nómina registrada, el correo lo dice y no lleva adjunto
+
+  Escenario: Sin internet o sin Gmail configurado
+    Cuando se pide un reenvío y el correo no puede salir
+    Entonces la app debe decir que quedó en cola y por qué, y el correo debe salir solo apenas se pueda
+
+  Escenario: Un mesero no puede
+    Cuando un mesero intenta reenviar un reporte
+    Entonces el sistema debe rechazarlo
+```

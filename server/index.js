@@ -808,20 +808,31 @@ app.get('/api/red', async (req, res) => {
   res.json(datos);
 });
 
-app.post('/api/reportes/enviar-ahora', requiere(3), (req, res) => {
-  reportes.encolarReporteDiario(jornadaHoy());
-  reportes.drenarCorreos().catch(() => {});
-  res.json({ ok: true });
-});
-
-// (Re)enviar los dos correos mensuales de un mes dado (nómina + resumen)
-app.post('/api/reportes/enviar-mes', requiere(3), (req, res) => {
-  const mes = /^\d{4}-\d{2}$/.test(String(req.body.mes || '')) ? req.body.mes : jornadaHoy().slice(0, 7);
+// Reenviar al correo del dueño, desde Caja (cajero o admin): el reporte de un
+// día, el reporte de un mes o solo la nómina de un mes. Cada uno lleva su
+// mensaje y sus Excel. Se intenta enviar de una; sin internet queda en cola.
+app.post('/api/reportes/reenviar', requiere(2), async (req, res) => {
+  const tipo = String(req.body.tipo || '');
+  const hoy = jornadaHoy();
+  let id, descripcion;
   try {
-    reportes.encolarReportesMensuales(jornadaHoy(), mes);
-    reportes.drenarCorreos().catch(() => {});
-    res.json({ ok: true, mes });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    if (tipo === 'dia') {
+      const dia = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.dia || '')) ? req.body.dia : null;
+      if (!dia) return res.status(400).json({ error: 'Elija el día' });
+      if (dia > hoy) return res.status(400).json({ error: 'Ese día todavía no ha pasado' });
+      id = reportes.encolarReenvio(dia, informes.correoDiario(dia));
+      descripcion = `reporte del día ${dia}`;
+    } else if (tipo === 'mes' || tipo === 'nomina') {
+      const mes = /^\d{4}-\d{2}$/.test(String(req.body.mes || '')) ? req.body.mes : null;
+      if (!mes) return res.status(400).json({ error: 'Elija el mes' });
+      if (mes > hoy.slice(0, 7)) return res.status(400).json({ error: 'Ese mes todavía no ha empezado' });
+      id = reportes.encolarReenvio(hoy, tipo === 'mes' ? informes.correoMes(mes) : informes.correoNomina(mes));
+      descripcion = tipo === 'mes' ? `reporte del mes ${mes}` : `nómina de ${mes}`;
+    } else return res.status(400).json({ error: 'Tipo de reporte no válido' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+  registrarHistorial(null, req.usuario.usuarioId, 'reenvio_reporte', descripcion);
+  const envio = await reportes.drenarCorreos();
+  res.json({ ok: true, enviado: reportes.estadoCorreo(id) === 'enviado', error: envio.error || null });
 });
 
 // ---------- Usuarios (solo admin) ----------
